@@ -1,0 +1,53 @@
+# Everything below is either made by the Makefile or fetched by a script in
+# tools/. What is left over is the part that would actually be lost if this
+# disc died: about 12 MB across roughly 450 files.
+
+# --- the cross-compiler ----------------------------------------------------
+# 5.1 GB of it, and reproducible: toolchain/build.sh builds binutils and GCC
+# from source. The scripts are kept, what they produce is not.
+/toolchain/cross/
+/toolchain/src/
+/toolchain/*.log
+
+# --- build output ----------------------------------------------------------
+/build/
+/disk.img
+# MicroPython builds inside its own port directory, and leaves generated
+# headers and a qstr table there that look nothing like object files.
+/third_party/mpy-xyuos/build/
+*.o
+*.d
+*.a
+*.elf
+*.iso
+*.stripped
+
+# ...with one exception. Nothing in the Makefile knows how to make this again,
+# so despite the extension it is a source file.
+!disk/tcc/runmain.o
+
+# tools/mkicons.py's output from assets/icons/.
+/assets/icons.bin
+
+# --- other people's trees --------------------------------------------------
+# Upstream clones, pinned by commit in tools/vendor.py, which puts them back
+# on a fresh machine. Both are whole git repositories of their own, and git
+# will not look inside one -- it records a link and stops. That is why our
+# own code must never live in there: third_party/mpy-xyuos used to sit at
+# micropython/ports/xyuos and was invisible to version control the whole time.
+/third_party/doomgeneric/
+/third_party/micropython/
+
+# --- what is not here at all -----------------------------------------------
+# The NetSurf sources and the eight libraries it needs live outside the
+# project, in ~/src/ns, and tools/nsfetch.py downloads them from nothing.
+# The port's own code is third_party/nsxyuos and IS kept; only the linked
+# binary is not, and *.elf above already covers it.
+
+# --- odds and ends ---------------------------------------------------------
+__pycache__/
+*.pyc
+*.swp
+*~
+.vscode/
+.idea/

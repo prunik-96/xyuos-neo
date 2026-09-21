@@ -1,0 +1,111 @@
+#!/usr/bin/env python3
+"""Drive the browser: start page, follow a link, go back."""
+import os, socket, subprocess, sys, time
+
+HOME = "/home/roman/xyuos-neo"
+OUT  = "/tmp/webtest"
+SER  = OUT + "/serial.log"
+MON  = OUT + "/mon.sock"
+os.makedirs(OUT, exist_ok=True)
+for f in (SER, MON):
+    try: os.unlink(f)
+    except OSError: pass
+subprocess.run(["cp", HOME + "/disk.img", OUT + "/disk.img"], check=True)
+
+proc = subprocess.Popen(
+    ["qemu-system-x86_64", "-enable-kvm", "-cpu", "host",
+     "-cdrom", HOME + "/build/xyuos_neo.iso",
+     "-serial", "file:" + SER, "-m", "512M", "-display", "none",
+     "-drive", "file=%s/disk.img,if=none,id=d0,format=raw" % OUT,
+     "-device", "virtio-blk-pci,drive=d0",
+     "-device", "qemu-xhci,id=xhci",
+     "-device", "usb-kbd,bus=xhci.0", "-device", "usb-mouse,bus=xhci.0",
+     "-netdev", "user,id=n0", "-device", "e1000,netdev=n0",
+     "-monitor", "unix:%s,server,nowait" % MON],
+    stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+
+def serial():
+    try:
+        with open(SER, "rb") as f: return f.read().decode("utf-8", "replace")
+    except OSError: return ""
+
+t0 = time.time()
+while "wm: double-buffer" not in serial():
+    if time.time() - t0 > 120 or proc.poll() is not None:
+        proc.kill(); sys.exit("no WM")
+    time.sleep(0.25)
+print("wm up"); time.sleep(4)
+
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+for _ in range(60):
+    try: s.connect(MON); break
+    except OSError: time.sleep(0.25)
+s.settimeout(0.3)
+
+def drain():
+    try:
+        while True:
+            if not s.recv(65536): break
+    except socket.timeout: pass
+
+def cmd(c, settle=0.08):
+    s.sendall((c + "\n").encode()); time.sleep(settle); drain()
+
+KEYS = {' ': 'spc', '.': 'dot', '/': 'slash', '-': 'minus', '\n': 'ret',
+        ':': 'shift-semicolon', '_': 'shift-minus', '?': 'shift-slash',
+        '=': 'equal', '+': 'shift-equal', ',': 'comma', ';': 'semicolon',
+        "'": 'apostrophe', '"': 'shift-apostrophe', '(': 'shift-9',
+        ')': 'shift-0', '&': 'shift-7', '%': 'shift-5', '!': 'shift-1',
+        '#': 'shift-3', '~': 'shift-grave_accent', '*': 'shift-8'}
+def keyname(ch):
+    if ch in KEYS: return KEYS[ch]
+    if 'A' <= ch <= 'Z': return 'shift-' + ch.lower()
+    return ch
+def typ(t):
+    for ch in t: cmd("sendkey " + keyname(ch), 0.05)
+def shot(n):
+    cmd("screendump %s/%s.ppm" % (OUT, n), 0.9)
+
+def home():
+    for _ in range(24): cmd("mouse_move -100 -100", 0.02)
+
+def goto(x, y):
+    home()
+    dx, dy = x, y
+    while dx > 0 or dy > 0:
+        sx, sy = min(dx, 100), min(dy, 100)
+        cmd("mouse_move %d %d" % (sx, sy), 0.02)
+        dx -= sx; dy -= sy
+    time.sleep(0.3)
+
+def click(x, y):
+    goto(x, y)
+    cmd("mouse_button 1", 0.15)
+    cmd("mouse_button 0", 0.25)
+
+typ("web\n")
+time.sleep(5)
+shot("01_home")
+
+if len(sys.argv) > 2:
+    print("clicking link at", sys.argv[1], sys.argv[2])
+    click(int(sys.argv[1]), int(sys.argv[2]))
+    time.sleep(12)
+    shot("02_page")
+    cmd("sendkey backspace", 1.0)
+    time.sleep(3)
+    shot("03_back")
+
+log = serial()
+bad = [l for l in log.splitlines() if "PANIC" in l or "FAULT" in l]
+print("panics/faults:", bad if bad else "(none)")
+for l in log.splitlines():
+    if "tls:" in l: print("   ", l)
+
+cmd("quit", 0.3); time.sleep(1); proc.kill()
+for f in sorted(os.listdir(OUT)):
+    if f.endswith(".ppm"):
+        subprocess.run(["convert", OUT + "/" + f, OUT + "/" + f[:-4] + ".png"], check=False)
+        os.unlink(OUT + "/" + f)
+subprocess.run("cp %s/*.png /mnt/c/PC_WORK/nettest/" % OUT, shell=True)
+print("shots in", OUT)

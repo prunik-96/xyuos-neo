@@ -1,0 +1,2 @@
+xyuOS Neo -- a from-scratch x86_64 kernel.
+This is a second file to make `ls` output more interesting.

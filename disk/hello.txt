@@ -1,0 +1,2 @@
+Hello from ext2! This file lives on the virtio-blk disk, not in a GRUB module.
+xyuOS Neo Phase 3: virtio-blk + ext2 + VFS.

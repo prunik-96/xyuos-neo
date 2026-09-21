@@ -1,0 +1,75 @@
+<!doctype html>
+<html>
+<head>
+  <title>Scripting check</title>
+  <style>.hidden { display: none } .tag { color: #2a6fd6 }</style>
+</head>
+<body>
+  <h1 id="heading">Before</h1>
+  <p id="para">This paragraph is <b>untouched</b>.</p>
+  <ul id="list">
+    <li class="item">one</li>
+    <li class="item">two</li>
+    <li class="item">three</li>
+  </ul>
+  <button id="go">Press me</button>
+  <div id="count">0</div>
+  <div id="built"></div>
+  <div id="later">waiting</div>
+
+<script>
+  // Reading the tree.
+  console.log("title is: " + document.title);
+  console.log("heading says: " + document.getElementById("heading").textContent);
+  console.log("items: " + document.querySelectorAll(".item").length);
+  console.log("first item: " + document.querySelector(".item").textContent);
+  console.log("tag of the list: " + document.getElementById("list").tagName);
+
+  // Changing it.
+  document.getElementById("heading").textContent = "After";
+
+  // Building some.
+  var out = [];
+  var items = document.querySelectorAll("#list .item");
+  for (var i = 0; i < items.length; i++) out.push(items[i].textContent.toUpperCase());
+  document.getElementById("built").innerHTML = "<b>" + out.join(" / ") + "</b>";
+
+  // Attributes and classes.
+  var p = document.getElementById("para");
+  p.setAttribute("data-seen", "yes");
+  p.className = "tag";
+  console.log("class is now: " + p.className + ", attribute: " + p.getAttribute("data-seen"));
+  p.classList.add("extra");
+  console.log("after classList.add: " + p.className);
+  console.log("contains extra: " + p.classList.contains("extra"));
+  p.classList.remove("tag");
+  console.log("after classList.remove: " + p.className);
+
+  // Style.
+  document.getElementById("heading").style.color = "#1a7f37";
+
+  // Events.
+  var n = 0;
+  document.getElementById("go").addEventListener("click", function () {
+      n++;
+      document.getElementById("count").textContent = String(n);
+  });
+
+  // Bubbling: a handler on the list hears a click on any item.
+  document.getElementById("list").addEventListener("click", function (e) {
+      console.log("the list heard a click on " + e.target.tagName);
+  });
+
+  // A timer.
+  setTimeout(function () {
+      document.getElementById("later").textContent = "the timer ran";
+  }, 10);
+
+  // Something a page would actually do.
+  function makeTable(rows) {
+      return rows.map(function (r) { return r.join(","); }).join(" | ");
+  }
+  console.log(makeTable([[1, 2], [3, 4]]));
+</script>
+</body>
+</html>
