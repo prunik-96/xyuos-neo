@@ -3,6 +3,15 @@
 import hashlib
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa, padding, ec
+import os
+
+# Where things are. The project is found from this file's own location, so a
+# checkout anywhere works; the scratch area where NetSurf and Lexbor sources
+# are unpacked defaults to ~/src. Both can be overridden by environment.
+XYUOS = os.environ.get(
+    "XYUOS", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+XYUOS_SRC = os.environ.get(
+    "XYUOS_SRC", os.path.join(os.path.expanduser("~"), "src"))
 
 def carr(name, b):
     toks = ["0x%02x" % c for c in b]
@@ -53,7 +62,7 @@ out.append(carr("v_rsa_pss2",
                                      salt_length=32),
                          hashes.SHA256())))
 
-path = "/home/roman/xyuos-neo/kernel/crypto/vectors.h"
+path = XYUOS + "/kernel/crypto/vectors.h"
 s = open(path).read()
 marker = "/* --- signatures --- */"
 if marker in s:

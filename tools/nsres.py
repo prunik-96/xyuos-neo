@@ -14,8 +14,16 @@ need perl.
 """
 import os, shutil, subprocess, sys
 
-NS = "/home/roman/src/ns/netsurf-3.9/resources"
-OUT = "/home/roman/xyuos-neo/third_party/nsxyuos/res"
+# Where things are. The project is found from this file's own location, so a
+# checkout anywhere works; the scratch area where NetSurf and Lexbor sources
+# are unpacked defaults to ~/src. Both can be overridden by environment.
+XYUOS = os.environ.get(
+    "XYUOS", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+XYUOS_SRC = os.environ.get(
+    "XYUOS_SRC", os.path.join(os.path.expanduser("~"), "src"))
+
+NS = XYUOS_SRC + "/ns/netsurf-3.9/resources"
+OUT = XYUOS + "/third_party/nsxyuos/res"
 
 if not os.path.isdir(NS):
     sys.exit("no NetSurf resources at " + NS)

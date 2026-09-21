@@ -12,11 +12,19 @@ port directory would have to answer for.
 """
 import os, re, subprocess, sys, collections
 
-HOME = "/home/roman/xyuos-neo"
-LX = "/home/roman/src/lexbor-2.4.0"
+# Where things are. The project is found from this file's own location, so a
+# checkout anywhere works; the scratch area where NetSurf and Lexbor sources
+# are unpacked defaults to ~/src. Both can be overridden by environment.
+XYUOS = os.environ.get(
+    "XYUOS", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+XYUOS_SRC = os.environ.get(
+    "XYUOS_SRC", os.path.join(os.path.expanduser("~"), "src"))
+
+HOME = XYUOS
+LX = XYUOS_SRC + "/lexbor-2.4.0"
 CC = HOME + "/toolchain/cross/bin/x86_64-elf-gcc"
 AR = HOME + "/toolchain/cross/bin/x86_64-elf-ar"
-OUT = "/home/roman/src/lx-obj"
+OUT = XYUOS_SRC + "/lx-obj"
 
 FLAGS = ["-ffreestanding", "-fno-stack-protector", "-fno-pic", "-fno-pie",
          "-mno-red-zone", "-msse", "-msse2", "-std=gnu11", "-O2", "-w",
@@ -92,7 +100,7 @@ if errors:
 if bad:
     sys.exit(1)
 
-lib = "/home/roman/src/liblexbor.a"
+lib = XYUOS_SRC + "/liblexbor.a"
 if os.path.exists(lib):
     os.remove(lib)
 subprocess.run([AR, "rcs", lib] + objs, check=True)

@@ -7,11 +7,19 @@ libparserutils' own codecs joined back to back through UCS-4.
 """
 import os, subprocess, sys
 
-HOME = "/home/roman/xyuos-neo"
+# Where things are. The project is found from this file's own location, so a
+# checkout anywhere works; the scratch area where NetSurf and Lexbor sources
+# are unpacked defaults to ~/src. Both can be overridden by environment.
+XYUOS = os.environ.get(
+    "XYUOS", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+XYUOS_SRC = os.environ.get(
+    "XYUOS_SRC", os.path.join(os.path.expanduser("~"), "src"))
+
+HOME = XYUOS
 CC = HOME + "/toolchain/cross/bin/x86_64-elf-gcc"
 AR = HOME + "/toolchain/cross/bin/x86_64-elf-ar"
 SHIM = HOME + "/third_party/shim"
-OUT = "/home/roman/src/ns/shim-obj"
+OUT = XYUOS_SRC + "/ns/shim-obj"
 
 FLAGS = ["-ffreestanding", "-fno-stack-protector", "-fno-pic", "-fno-pie",
          "-mno-red-zone", "-msse", "-msse2", "-std=gnu11", "-O2",

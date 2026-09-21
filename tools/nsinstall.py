@@ -12,8 +12,16 @@ module, and an ISO built before this step does not have it.
 """
 import os, subprocess, sys
 
-HOME = "/home/roman/xyuos-neo"
-ELF = "/home/roman/src/ns/link/netsurf.elf"
+# Where things are. The project is found from this file's own location, so a
+# checkout anywhere works; the scratch area where NetSurf and Lexbor sources
+# are unpacked defaults to ~/src. Both can be overridden by environment.
+XYUOS = os.environ.get(
+    "XYUOS", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+XYUOS_SRC = os.environ.get(
+    "XYUOS_SRC", os.path.join(os.path.expanduser("~"), "src"))
+
+HOME = XYUOS
+ELF = XYUOS_SRC + "/ns/link/netsurf.elf"
 RES = HOME + "/third_party/nsxyuos/res"
 IMG = HOME + "/disk.img"
 STRIP = HOME + "/toolchain/cross/bin/x86_64-elf-strip"

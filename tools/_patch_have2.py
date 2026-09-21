@@ -14,7 +14,16 @@ It leaves strcasestr and strchrnul to _GNU_SOURCE, which is not claimed,
 because this libc genuinely does not have them and NetSurf's own are wanted.
 That is the whole point of not simply defining every HAVE_ in sight.
 """
-R = "/home/roman/xyuos-neo/"
+import os
+
+# Where things are. The project is found from this file's own location, so a
+# checkout anywhere works; the scratch area where NetSurf and Lexbor sources
+# are unpacked defaults to ~/src. Both can be overridden by environment.
+XYUOS = os.environ.get(
+    "XYUOS", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+XYUOS_SRC = os.environ.get(
+    "XYUOS_SRC", os.path.join(os.path.expanduser("~"), "src"))
+R = XYUOS + "/"
 p = R + "tools/nscore.py"
 s = open(p).read()
 

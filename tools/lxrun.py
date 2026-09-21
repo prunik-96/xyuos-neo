@@ -2,9 +2,17 @@
 """Run the Lexbor test program on xyuOS and photograph what it prints."""
 import os, socket, subprocess, sys, time
 
-HOME = "/home/roman/xyuos-neo"
-ELF = "/home/roman/src/lxprog/lxtest"
-OUT = "/home/roman/src/lxrun"
+# Where things are. The project is found from this file's own location, so a
+# checkout anywhere works; the scratch area where NetSurf and Lexbor sources
+# are unpacked defaults to ~/src. Both can be overridden by environment.
+XYUOS = os.environ.get(
+    "XYUOS", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+XYUOS_SRC = os.environ.get(
+    "XYUOS_SRC", os.path.join(os.path.expanduser("~"), "src"))
+
+HOME = XYUOS
+ELF = XYUOS_SRC + "/lxprog/lxtest"
+OUT = XYUOS_SRC + "/lxrun"
 SER = OUT + "/serial.log"
 MON = OUT + "/mon.sock"
 

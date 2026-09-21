@@ -7,11 +7,19 @@ they do not, the undefined symbols are the remaining work, named.
 """
 import os, re, subprocess, sys, collections
 
-HOME = "/home/roman/xyuos-neo"
-NS = "/home/roman/src/ns/netsurf-3.9"
+# Where things are. The project is found from this file's own location, so a
+# checkout anywhere works; the scratch area where NetSurf and Lexbor sources
+# are unpacked defaults to ~/src. Both can be overridden by environment.
+XYUOS = os.environ.get(
+    "XYUOS", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+XYUOS_SRC = os.environ.get(
+    "XYUOS_SRC", os.path.join(os.path.expanduser("~"), "src"))
+
+HOME = XYUOS
+NS = XYUOS_SRC + "/ns/netsurf-3.9"
 BIN = HOME + "/toolchain/cross/bin/x86_64-elf-"
-CORE_OBJ = "/home/roman/src/ns/core-obj"
-OUT = "/home/roman/src/ns/link"
+CORE_OBJ = XYUOS_SRC + "/ns/core-obj"
+OUT = XYUOS_SRC + "/ns/link"
 
 os.makedirs(OUT, exist_ok=True)
 

@@ -9,8 +9,16 @@ with xyuOS's cross toolchain against xyuOS's own libc.
 """
 import os, subprocess, sys
 
-HOME = "/home/roman/xyuos-neo"
-NS = "/home/roman/src/ns"
+# Where things are. The project is found from this file's own location, so a
+# checkout anywhere works; the scratch area where NetSurf and Lexbor sources
+# are unpacked defaults to ~/src. Both can be overridden by environment.
+XYUOS = os.environ.get(
+    "XYUOS", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+XYUOS_SRC = os.environ.get(
+    "XYUOS_SRC", os.path.join(os.path.expanduser("~"), "src"))
+
+HOME = XYUOS
+NS = XYUOS_SRC + "/ns"
 CC = HOME + "/toolchain/cross/bin/x86_64-elf-gcc"
 AR = HOME + "/toolchain/cross/bin/x86_64-elf-ar"
 OUT = HOME + "/third_party/netsurf"
@@ -89,7 +97,7 @@ def generate():
     # and never goes near the target.
     cs = NS + "/libcss-0.9.1"
     pdir = cs + "/src/parse/properties"
-    genexe = "/home/roman/src/ns/gen_parser"
+    genexe = XYUOS_SRC + "/ns/gen_parser"
     if not os.path.exists(genexe):
         run("cc -O1 -w -o %s %s/css_property_parser_gen.c" % (genexe, pdir))
 
@@ -183,7 +191,7 @@ def includes(lib):
 def build(lib):
     inc = includes(lib)
     root = "%s/%s" % (NS, lib)
-    objdir = "/home/roman/src/ns/obj/" + lib
+    objdir = XYUOS_SRC + "/ns/obj/" + lib
     os.makedirs(objdir, exist_ok=True)
 
     srcs = []

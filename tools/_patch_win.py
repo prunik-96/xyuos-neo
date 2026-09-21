@@ -5,7 +5,16 @@ Everything here used to be a note taken and nothing else, because the loop
 redrew the world every time round regardless. Now the loop asks first, so
 each of these has to say when it has made the picture wrong.
 """
-R = "/home/roman/xyuos-neo/"
+import os
+
+# Where things are. The project is found from this file's own location, so a
+# checkout anywhere works; the scratch area where NetSurf and Lexbor sources
+# are unpacked defaults to ~/src. Both can be overridden by environment.
+XYUOS = os.environ.get(
+    "XYUOS", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+XYUOS_SRC = os.environ.get(
+    "XYUOS_SRC", os.path.join(os.path.expanduser("~"), "src"))
+R = XYUOS + "/"
 
 
 def edit(path, tag, a, b, marker=None):

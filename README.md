@@ -44,13 +44,18 @@ python3 tools/nslink.py
 python3 tools/nsinstall.py && make
 ```
 
-### The path matters
+### Where things are found
 
-`toolchain/build.sh` installs into `$HOME/xyuos-neo/toolchain/cross`, and the
-scripts under `tools/` currently spell `/home/roman/xyuos-neo` out in full.
-So on another machine, either the account is also `roman`, or those paths
-need fixing first. Worth doing properly at some point; until then it is the
-one thing standing between this repository and a clean clone elsewhere.
+Nothing is hardcoded to one account. Each script in `tools/` locates the
+project from its own position on disk, and the scratch area where the
+NetSurf and Lexbor sources are unpacked defaults to `~/src`. Both can be
+pointed elsewhere:
+
+    XYUOS=/path/to/checkout  XYUOS_SRC=/path/to/sources  python3 tools/...
+
+`toolchain/build.sh` is the one exception: it still installs into
+`$HOME/xyuos-neo/toolchain/cross`, so clone to `~/xyuos-neo` or edit the two
+`PREFIX` lines.
 
 ## Layout
 

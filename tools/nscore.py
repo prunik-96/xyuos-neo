@@ -11,11 +11,19 @@ xyuOS regardless, and counting GTK's failures would say nothing.
 """
 import os, re, subprocess, sys, collections
 
-HOME = "/home/roman/xyuos-neo"
-NS = "/home/roman/src/ns/netsurf-3.9"
+# Where things are. The project is found from this file's own location, so a
+# checkout anywhere works; the scratch area where NetSurf and Lexbor sources
+# are unpacked defaults to ~/src. Both can be overridden by environment.
+XYUOS = os.environ.get(
+    "XYUOS", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+XYUOS_SRC = os.environ.get(
+    "XYUOS_SRC", os.path.join(os.path.expanduser("~"), "src"))
+
+HOME = XYUOS
+NS = XYUOS_SRC + "/ns/netsurf-3.9"
 CC = HOME + "/toolchain/cross/bin/x86_64-elf-gcc"
 STAGE = HOME + "/third_party/netsurf/include"
-OUT = "/home/roman/src/ns/core-obj"
+OUT = XYUOS_SRC + "/ns/core-obj"
 
 # The same flags its own libraries were built with, plus what NetSurf's build
 # would have defined for a build with no optional extras.
@@ -68,7 +76,7 @@ inc = ["-I" + HOME + "/libc/include", "-I" + STAGE, "-I" + HOME + "/third_party/
        "-I" + NS, "-I" + NS + "/include",
        "-I" + NS + "/content/handlers",
        "-I" + NS + "/frontends",
-       "-I/home/roman/src/ns",                      # where testament.h was generated
+       "-I" + XYUOS_SRC + "/ns",                      # where testament.h was generated
        # Two directories that exist to let files be read, not to add
        # behaviour: nocurl names one type so that content/fetch.c parses (see
        # the header), and the javascript/none directory is NetSurf own set of

@@ -7,8 +7,16 @@ iconv produced it. Nothing is asserted from memory.
 """
 import os, subprocess, sys, gzip, random
 
-HOME = "/home/roman/xyuos-neo"
-PU = "/home/roman/src/ns/libparserutils-0.2.4"
+# Where things are. The project is found from this file's own location, so a
+# checkout anywhere works; the scratch area where NetSurf and Lexbor sources
+# are unpacked defaults to ~/src. Both can be overridden by environment.
+XYUOS = os.environ.get(
+    "XYUOS", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+XYUOS_SRC = os.environ.get(
+    "XYUOS_SRC", os.path.join(os.path.expanduser("~"), "src"))
+
+HOME = XYUOS
+PU = XYUOS_SRC + "/ns/libparserutils-0.2.4"
 OUT = "/tmp/shimcheck"
 os.makedirs(OUT, exist_ok=True)
 

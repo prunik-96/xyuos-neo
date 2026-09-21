@@ -144,9 +144,18 @@ void sha384(const void *data, uint32_t len, uint8_t out[48]) {
 }
 """ % (table("K512", K), table("H512", H512), table("H384", H384))
 
-open("/home/roman/xyuos-neo/kernel/crypto/sha512.c", "w").write(body)
+open(XYUOS + "/kernel/crypto/sha512.c", "w").write(body)
 print("wrote sha512.c")
 
 # A quick sanity check against the host's own implementation.
 import hashlib
+import os
+
+# Where things are. The project is found from this file's own location, so a
+# checkout anywhere works; the scratch area where NetSurf and Lexbor sources
+# are unpacked defaults to ~/src. Both can be overridden by environment.
+XYUOS = os.environ.get(
+    "XYUOS", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+XYUOS_SRC = os.environ.get(
+    "XYUOS_SRC", os.path.join(os.path.expanduser("~"), "src"))
 print("sha384('abc') =", hashlib.sha384(b"abc").hexdigest()[:32], "...")

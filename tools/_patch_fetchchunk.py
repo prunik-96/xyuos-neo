@@ -6,8 +6,17 @@ header afterwards, so there is one answer where there used to be two. The
 walk that tried to tell them apart by reading the bytes goes away with them.
 """
 import re, sys
+import os
 
-PATH = "/home/roman/xyuos-neo/third_party/nsxyuos/fetch_xyuos.c"
+# Where things are. The project is found from this file's own location, so a
+# checkout anywhere works; the scratch area where NetSurf and Lexbor sources
+# are unpacked defaults to ~/src. Both can be overridden by environment.
+XYUOS = os.environ.get(
+    "XYUOS", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+XYUOS_SRC = os.environ.get(
+    "XYUOS_SRC", os.path.join(os.path.expanduser("~"), "src"))
+
+PATH = XYUOS + "/third_party/nsxyuos/fetch_xyuos.c"
 
 with open(PATH) as f:
     s = f.read()

@@ -2,7 +2,16 @@
 """Declare what libc/src/timecal.c now defines, and add the small POSIX
 pieces NetSurf's core reaches for. One-off; kept only so the change is
 readable."""
-R = "/home/roman/xyuos-neo/"
+import os
+
+# Where things are. The project is found from this file's own location, so a
+# checkout anywhere works; the scratch area where NetSurf and Lexbor sources
+# are unpacked defaults to ~/src. Both can be overridden by environment.
+XYUOS = os.environ.get(
+    "XYUOS", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+XYUOS_SRC = os.environ.get(
+    "XYUOS_SRC", os.path.join(os.path.expanduser("~"), "src"))
+R = XYUOS + "/"
 
 
 def edit(path, tag, a, b, marker):

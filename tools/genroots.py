@@ -5,9 +5,18 @@ A certificate is only worth checking against something you already trust, and
 that "something" has to come from somewhere. It comes from here: the same list
 of root authorities the host system uses, frozen into the kernel image."""
 import base64, re, sys
+import os
+
+# Where things are. The project is found from this file's own location, so a
+# checkout anywhere works; the scratch area where NetSurf and Lexbor sources
+# are unpacked defaults to ~/src. Both can be overridden by environment.
+XYUOS = os.environ.get(
+    "XYUOS", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+XYUOS_SRC = os.environ.get(
+    "XYUOS_SRC", os.path.join(os.path.expanduser("~"), "src"))
 
 src = "/etc/ssl/certs/ca-certificates.crt"
-out = "/home/roman/xyuos-neo/kernel/net/roots.h"
+out = XYUOS + "/kernel/net/roots.h"
 
 pem = open(src).read()
 blocks = re.findall(r"-----BEGIN CERTIFICATE-----(.*?)-----END CERTIFICATE-----", pem, re.S)

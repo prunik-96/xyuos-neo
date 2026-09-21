@@ -6,12 +6,20 @@ sources live outside this tree. Run tools/lxbuild.py first.
 """
 import os, subprocess, sys
 
-HOME = "/home/roman/xyuos-neo"
-LX = "/home/roman/src/lexbor-2.4.0"
-LIB = "/home/roman/src/liblexbor.a"
+# Where things are. The project is found from this file's own location, so a
+# checkout anywhere works; the scratch area where NetSurf and Lexbor sources
+# are unpacked defaults to ~/src. Both can be overridden by environment.
+XYUOS = os.environ.get(
+    "XYUOS", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+XYUOS_SRC = os.environ.get(
+    "XYUOS_SRC", os.path.join(os.path.expanduser("~"), "src"))
+
+HOME = XYUOS
+LX = XYUOS_SRC + "/lexbor-2.4.0"
+LIB = XYUOS_SRC + "/liblexbor.a"
 CC = HOME + "/toolchain/cross/bin/x86_64-elf-gcc"
 LD = HOME + "/toolchain/cross/bin/x86_64-elf-ld"
-OUT = "/home/roman/src/lxprog"
+OUT = XYUOS_SRC + "/lxprog"
 
 if not os.path.exists(LIB):
     sys.exit("no liblexbor.a -- run tools/lxbuild.py first")

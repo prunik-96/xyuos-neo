@@ -4,12 +4,20 @@ frontend. These are xyuOS's own files, not NetSurf's, and they live outside
 its tree so that nothing here is a patch to somebody else's source."""
 import os, subprocess, sys
 
-HOME = "/home/roman/xyuos-neo"
-NS = "/home/roman/src/ns/netsurf-3.9"
+# Where things are. The project is found from this file's own location, so a
+# checkout anywhere works; the scratch area where NetSurf and Lexbor sources
+# are unpacked defaults to ~/src. Both can be overridden by environment.
+XYUOS = os.environ.get(
+    "XYUOS", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+XYUOS_SRC = os.environ.get(
+    "XYUOS_SRC", os.path.join(os.path.expanduser("~"), "src"))
+
+HOME = XYUOS
+NS = XYUOS_SRC + "/ns/netsurf-3.9"
 CC = HOME + "/toolchain/cross/bin/x86_64-elf-gcc"
 AR = HOME + "/toolchain/cross/bin/x86_64-elf-ar"
 GLUE = HOME + "/third_party/nsxyuos"
-OUT = "/home/roman/src/ns/glue-obj"
+OUT = XYUOS_SRC + "/ns/glue-obj"
 
 FLAGS = ["-ffreestanding", "-fno-stack-protector", "-fno-pic", "-fno-pie",
          "-mno-red-zone", "-msse", "-msse2", "-std=gnu11", "-O2",
@@ -29,7 +37,7 @@ INC = ["-I" + HOME + "/libc/include",
        "-I" + NS, "-I" + NS + "/include",
        "-I" + NS + "/content/handlers",
        "-I" + NS + "/frontends",
-       "-I/home/roman/src/ns"]                        # testament.h
+       "-I" + XYUOS_SRC + "/ns"]                        # testament.h
 
 os.makedirs(OUT, exist_ok=True)
 

@@ -7,7 +7,15 @@ source, built for the host, against the host's own gmtime and mktime.
 """
 import os, subprocess, sys, random, datetime
 
-HOME = "/home/roman/xyuos-neo"
+# Where things are. The project is found from this file's own location, so a
+# checkout anywhere works; the scratch area where NetSurf and Lexbor sources
+# are unpacked defaults to ~/src. Both can be overridden by environment.
+XYUOS = os.environ.get(
+    "XYUOS", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+XYUOS_SRC = os.environ.get(
+    "XYUOS_SRC", os.path.join(os.path.expanduser("~"), "src"))
+
+HOME = XYUOS
 OUT = "/tmp/timecheck"
 os.makedirs(OUT, exist_ok=True)
 
