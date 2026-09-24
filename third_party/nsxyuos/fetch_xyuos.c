@@ -73,15 +73,18 @@ struct fetch_xyuos_context {
     bool   only_2xx;
     bool   aborted;
     bool   locked;
-    bool   sent;              /* handed to the kernel */
+    int    slot;              /* the kernel slot it is in, or -1 */
+    bool   done;              /* that slot has an answer waiting */
+    int    result;            /* what the slot said */
     int    reported;          /* bytes the last progress message named */
 
     struct fetch_xyuos_context *r_next, *r_prev;
 };
 
 static struct fetch_xyuos_context *ring = NULL;
-static struct fetch_xyuos_context *inflight = NULL;
-static char *rxbuf = NULL;          /* one response at a time, one buffer */
+/* One buffer still: responses are taken out of the kernel one at a time and
+ * handed straight on, so it is never held across two of them. */
+static char *rxbuf = NULL;
 
 /* --- small helpers ------------------------------------------------------- */
 
@@ -227,6 +230,7 @@ static void *fetch_xyuos_setup(struct fetch *parent_fetch, nsurl *url,
         return NULL;
     }
 
+    ctx->slot = -1;
     RING_INSERT(ring, ctx);
     return ctx;
 }
@@ -249,7 +253,10 @@ static void fetch_xyuos_abort(void *ctx) {
 
 static void fetch_xyuos_free(void *ctx) {
     struct fetch_xyuos_context *c = ctx;
-    if (inflight == c) inflight = NULL;
+    /* Never leave the kernel holding a fetch for a context that is going
+     * away: a suspended fetch has a saved return into this program's kernel
+     * stack, and that stack is about to stop existing. */
+    if (c->slot >= 0) { net_fetch_cancel(c->slot); c->slot = -1; }
     nsurl_unref(c->url);
     free(c->host);
     free(c->path);
@@ -428,78 +435,140 @@ static void finish(struct fetch_xyuos_context *c, int n) {
 
 /* --- the poll ------------------------------------------------------------ */
 
-/* Whoever is in the kernel is done with: report it and let it go. */
+/* This one is done with: report it and let it go. */
 static void retire(struct fetch_xyuos_context *c) {
-    inflight = NULL;
     fetch_remove_from_queues(c->parent_fetch);
     fetch_free(c->parent_fetch);
 }
 
-static void fetch_xyuos_poll(lwc_string *scheme) {
-    (void)scheme;
+/* How many of the kernel's slots we are holding. */
+static int running_count(void) {
+    int n = 0;
+    struct fetch_xyuos_context *c = ring;
+    if (c == NULL) return 0;
+    do {
+        if (c->slot >= 0) n++;
+        c = c->r_next;
+    } while (c != ring);
+    return n;
+}
 
-    if (inflight != NULL) {
-        int progress = 0;
-        int r;
-
-        /* Each check hands the kernel's fetch task one four-millisecond
-         * slice and comes back. NetSurf asks fetchers to poll every ten
-         * milliseconds, so one slice per call would leave the network idle
-         * most of the time and a page would take as long to arrive as the
-         * polling allowed rather than as long as the network needed.
-         *
-         * So take several slices while the fetch is still running, bounded
-         * by a frame's worth of time: long enough to keep the connection
-         * busy, short enough that a key press is still answered promptly. */
-        unsigned deadline = uptime_ms() + 16;
+/* Hand every running fetch a slice, round and round, for about a frame's
+ * worth of time.
+ *
+ * Each net_fetch_check hands the kernel's task for that slot one four-
+ * millisecond slice and comes back. NetSurf asks fetchers to poll every ten
+ * milliseconds, so a single slice per call would leave the network idle most
+ * of the time and a page would take as long as the polling allowed rather
+ * than as long as the network needed. Going round the running fetches means
+ * all of them make progress within one poll instead of the first one
+ * starving the rest.
+ *
+ * Bounded by a frame: long enough to keep four connections busy, short
+ * enough that a key press is still answered promptly. */
+static void run_slices(void) {
+    unsigned deadline = uptime_ms() + 16;
+    int alive;
+    do {
+        alive = 0;
+        struct fetch_xyuos_context *c = ring, *next;
+        if (c == NULL) return;
         do {
-            r = net_fetch_check(&progress);
-        } while (r == NET_FETCH_PENDING && uptime_ms() < deadline);
-
-        if (r == NET_FETCH_PENDING) {
-            if (!inflight->aborted && progress > inflight->reported + 4096) {
-                char note[64];
-                snprintf(note, sizeof note, "%d bytes", progress);
-                fetch_msg msg;
-                msg.type = FETCH_PROGRESS;
-                msg.data.progress = note;
-                send_msg(&msg, inflight);
-                inflight->reported = progress;
+            next = c->r_next;
+            if (c->slot >= 0 && !c->done) {
+                int progress = 0;
+                int r = net_fetch_check(c->slot, &progress);
+                if (r == NET_FETCH_PENDING) {
+                    alive = 1;
+                    if (!c->aborted && progress > c->reported + 4096) {
+                        char note[64];
+                        snprintf(note, sizeof note, "%d bytes", progress);
+                        fetch_msg msg;
+                        msg.type = FETCH_PROGRESS;
+                        msg.data.progress = note;
+                        send_msg(&msg, c);
+                        c->reported = progress;
+                    }
+                } else {
+                    /* Finished. The bytes stay in the kernel until they are
+                     * taken, which happens below, one at a time, because
+                     * there is one buffer to take them into. */
+                    c->done = true;
+                    c->result = r;
+                }
             }
-            return;
-        }
+            c = next;
+        } while (c != ring && ring != NULL);
+    } while (alive && uptime_ms() < deadline);
+}
 
-        int n = (r >= 0) ? net_fetch_done(rxbuf, XY_MAX) : -1;
-        struct fetch_xyuos_context *c = inflight;
-        if (c->aborted) {
-            /* Asked for, arrived, no longer wanted. */
-            retire(c);
-        } else {
-            finish(c, n);
-            retire(c);
-        }
-        /* One kernel slot: whoever is next waits for the next poll. */
-        return;
+/* Collect whatever finished. One at a time: rxbuf is shared, and a context
+ * is retired the moment its bytes have been handed on, so nothing here holds
+ * the buffer across two of them. */
+static void harvest(void) {
+    for (;;) {
+        struct fetch_xyuos_context *c = ring, *found = NULL;
+        if (c == NULL) return;
+        do {
+            if (c->slot >= 0 && c->done) { found = c; break; }
+            c = c->r_next;
+        } while (c != ring);
+        if (found == NULL) return;
+
+        int n = (found->result >= 0)
+              ? net_fetch_done(found->slot, rxbuf, XY_MAX) : -1;
+        found->slot = -1;
+        found->done = false;
+
+        /* Asked for, arrived, no longer wanted: the kernel had to finish it
+         * anyway -- there is no calling one off once it has been handed
+         * over -- so the bytes are simply dropped. */
+        if (!found->aborted) finish(found, n);
+        retire(found);
     }
+}
 
-    /* Nothing running. Take the first in the queue that still wants to go. */
-    if (ring == NULL) return;
-
+/* Start as many of the waiting ones as the kernel will take. */
+static void start_waiting(void) {
+    int slots = net_fetch_slots();
     struct fetch_xyuos_context *c = ring, *next;
+    if (c == NULL) return;
     do {
         next = c->r_next;
-        if (c->aborted && !c->sent) {
+        if (c->aborted && c->slot < 0) {
             retire(c);
-        } else if (!c->sent) {
-            int ok = net_fetch_begin(c->host, c->path, c->port, c->tls,
-                                     1,            /* headers as well */
-                                     c->body, (int)c->bodylen,
-                                     c->xhdr);
-            if (!ok) return;                       /* busy: try again later */
-            c->sent = true;
-            inflight = c;
-            return;
+        } else if (c->slot < 0) {
+            if (running_count() >= slots) return;
+            int slot = net_fetch_begin(c->host, c->path, c->port, c->tls,
+                                       1,          /* headers as well */
+                                       c->body, (int)c->bodylen,
+                                       c->xhdr);
+            /* A slot, not a yes: zero is one of them. */
+            if (slot < 0) return;                  /* busy: again next time */
+            c->slot = slot;
+            c->reported = 0;
         }
+        c = next;
+    } while (c != ring && ring != NULL);
+}
+
+static void fetch_xyuos_poll(lwc_string *scheme) {
+    (void)scheme;
+    if (ring == NULL) return;
+    run_slices();
+    harvest();
+    start_waiting();
+}
+
+/* Called when the window is closing. NetSurf's own finalise runs per scheme
+ * and does not walk the queue, so this is the one place that can be sure no
+ * slot is still held. */
+void fetch_xyuos_shutdown(void) {
+    struct fetch_xyuos_context *c = ring, *next;
+    if (c == NULL) return;
+    do {
+        next = c->r_next;
+        if (c->slot >= 0) { net_fetch_cancel(c->slot); c->slot = -1; }
         c = next;
     } while (c != ring && ring != NULL);
 }

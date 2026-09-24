@@ -310,15 +310,31 @@ int net_fetch_begin(const char *host, const char *path, int port, int tls,
     return rq.result;
 }
 
-int net_fetch_check(int *progress) {
-    struct net_req rq = { NET_FPOLL, 0, 0, 0, 0, 0, -1 };
+void net_fetch_cancel(int slot) {
+    struct net_req rq = { .op = NET_FCANCEL, .arg = (unsigned)slot,
+                          .result = -1 };
+    xyuos_syscall3(SYS_NET, (long)&rq, 0, 0);
+}
+
+int net_fetch_slots(void) {
+    struct net_req rq = { .op = NET_FSLOTS, .result = -1 };
+    xyuos_syscall3(SYS_NET, (long)&rq, 0, 0);
+    return rq.result > 0 ? rq.result : 1;
+}
+
+int net_fetch_check(int slot, int *progress) {
+    /* The slot travels in `len` and the progress comes back in `arg`: a poll
+     * uses neither for anything else. */
+    struct net_req rq = { .op = NET_FPOLL, .len = (unsigned)slot,
+                          .result = -1 };
     xyuos_syscall3(SYS_NET, (long)&rq, 0, 0);
     if (progress) *progress = (int)rq.arg;
     return rq.result;
 }
 
-int net_fetch_done(void *buf, int max) {
-    struct net_req rq = { NET_FTAKE, 0, 0, buf, (unsigned)max, 0, -1 };
+int net_fetch_done(int slot, void *buf, int max) {
+    struct net_req rq = { .op = NET_FTAKE, .buf = buf, .len = (unsigned)max,
+                          .arg = (unsigned)slot, .result = -1 };
     xyuos_syscall3(SYS_NET, (long)&rq, 0, 0);
     return rq.result;
 }

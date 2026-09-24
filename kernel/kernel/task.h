@@ -3,7 +3,9 @@
 
 #include <stdint.h>
 
-typedef enum { TASK_READY, TASK_TERMINATED } task_state_t;
+/* TASK_COROUTINE is READY as far as task_resume is concerned and invisible
+ * to yield(): it runs when, and only when, somebody resumes it. */
+typedef enum { TASK_READY, TASK_TERMINATED, TASK_COROUTINE } task_state_t;
 
 typedef struct task {
     uint64_t rsp;
@@ -28,6 +30,13 @@ void task_exit(void);
  * straight-line code and still be interruptible -- it does not have to become
  * a state machine to be put down and picked up again. */
 void task_resume(task_t *t);
+
+/* Make a task that ONLY task_resume can start. Use this and not
+ * task_create_sized for anything that calls task_yield_back(): a task in the
+ * scheduler's rotation can be started by yield(), and then there is nobody
+ * to yield back to. */
+task_t *task_create_coroutine(const char *name, void (*entry)(void),
+                              int stack_bytes);
 void task_yield_back(void);
 
 #endif

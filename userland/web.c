@@ -3239,16 +3239,18 @@ static int fetch_pump(const char *host, const char *path, int port, int tls,
     char ck[1600];
     cookie_header(host, path, tls, ck, (int)sizeof ck);
 
-    if (!net_fetch_begin(host, path, port, tls, 1,
-                         blen ? post_body : 0, blen,
-                         ck[0] ? ck : 0)) return -1;
+    /* The slot, not a yes: zero is one of them. */
+    int slot = net_fetch_begin(host, path, port, tls, 1,
+                               blen ? post_body : 0, blen,
+                               ck[0] ? ck : 0);
+    if (slot < 0) return -1;
 
     unsigned last_draw = 0;
     for (;;) {
         int got = 0;
-        int r = net_fetch_check(&got);
+        int r = net_fetch_check(slot, &got);
         if (r != NET_FETCH_PENDING)
-            return r < 0 ? -1 : net_fetch_done(buf, max);
+            return r < 0 ? -1 : net_fetch_done(slot, buf, max);
 
         /* Twenty-five frames a second is plenty; any more and the redrawing
          * would be taking the time back off the transfer. */

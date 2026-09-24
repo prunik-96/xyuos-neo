@@ -506,13 +506,21 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3) {
                                              body, blen, xhdr,
                                              (int)(xhdr ? rq->hdrlen : 0));
             } else if (rq->op == NET_FPOLL) {
+                // The slot travels in `len`, the progress comes back in
+                // `arg`: a poll uses neither for anything else.
                 int got = 0;
-                rq->result = net_fetch_poll(&got);
+                rq->result = net_fetch_poll((int)rq->len, &got);
                 rq->arg = (unsigned)got;
             } else if (rq->op == NET_FTAKE) {
                 if (!vmm_user_range_ok((uint64_t)(uintptr_t)rq->buf, rq->len))
                     return (uint64_t)-1;
-                rq->result = net_fetch_take((char *)rq->buf, (int)rq->len);
+                rq->result = net_fetch_take((int)rq->arg,
+                                            (char *)rq->buf, (int)rq->len);
+            } else if (rq->op == NET_FCANCEL) {
+                net_fetch_cancel((int)rq->arg);
+                rq->result = 0;
+            } else if (rq->op == NET_FSLOTS) {
+                rq->result = net_fetch_slots();
             } else if (rq->op == NET_HTTPGET) {
                 if (!vmm_user_range_ok((uint64_t)(uintptr_t)rq->a, 1)) return (uint64_t)-1;
                 if (!vmm_user_range_ok((uint64_t)(uintptr_t)rq->b, 1)) return (uint64_t)-1;

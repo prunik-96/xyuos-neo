@@ -255,10 +255,20 @@ int net_https_get(const char *host, const char *path, int port,
 int net_fetch_begin(const char *host, const char *path, int port, int tls,
                     int keep_headers, const char *body, int blen,
                     const char *hdr);
+/* net_fetch_begin returns the SLOT the fetch was given, or -1 if every slot
+ * is busy; the other two name that slot. Four may be in flight at once, each
+ * on its own connection -- which is what lets a page load its pictures
+ * alongside one another instead of one after the next. */
 /* PENDING while it runs, else the byte count or -1. *progress, if given, is
  * how much has arrived so far. */
-int net_fetch_check(int *progress);
-int net_fetch_done(void *buf, int max);
+int net_fetch_check(int slot, int *progress);
+int net_fetch_done(int slot, void *buf, int max);
+/* How many may be in flight. Asked rather than assumed, so there is one
+ * number and not two that drift apart. */
+int net_fetch_slots(void);
+/* Give up on a fetch. Every slot a program holds must be cancelled before it
+ * exits -- the kernel cannot clean up after a program that simply leaves. */
+void net_fetch_cancel(int slot);
 
 int net_fetch(const char *host, const char *path, int port, int tls,
               void *buf, int max);

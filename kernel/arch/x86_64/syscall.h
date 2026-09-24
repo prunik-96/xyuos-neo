@@ -179,6 +179,8 @@ struct net_req {
 #define NET_FPOLL   8    // result = -2 pending, else bytes or -1
                          // arg (OUT) = bytes arrived so far
 #define NET_FTAKE   9    // buf <- the body; result = bytes
+#define NET_FSLOTS  10   // result = how many fetches may run at once
+#define NET_FCANCEL 11   // arg = slot; give it up
 /* Set in `arg` alongside the port to fetch over TLS. A flag rather than a
  * separate op, because everything else about the request is identical. */
 #define NET_HTTPGET_TLS 0x10000

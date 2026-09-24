@@ -125,25 +125,35 @@ uint32_t net_ms(void);
 // now and hands the processor back every few milliseconds, and the caller asks
 // again in a moment. Everything else on the machine runs in between.
 //
-// One at a time, because there is one TCP connection.
+// Four at a time, each on its own TCP connection and its own TLS session.
+// Every call names the one it means by the slot that start returned.
 
 #define NET_FETCH_PENDING (-2)
 
-// Begin a fetch. Returns 1 if it was accepted, 0 if one is already running.
-// `body` is a form being posted, or 0 for an ordinary GET.
+// Begin a fetch. Returns the slot it was given, or -1 if all of them are
+// busy. `body` is a form being posted, or 0 for an ordinary GET.
 int net_fetch_start(const char *host, const char *path, uint16_t port,
                     int tls, int keep_headers, const char *body, int blen,
                     const char *xhdr, int xhdrlen);
 
-// Let it run for a few milliseconds. Returns NET_FETCH_PENDING while it is
-// still going, otherwise the byte count (or -1). *progress, if given, is how
-// many bytes have arrived so far.
-int net_fetch_poll(int *progress);
+// Let that slot run for a few milliseconds. Returns NET_FETCH_PENDING while
+// it is still going, otherwise the byte count (or -1). *progress, if given,
+// is how many bytes have arrived so far.
+int net_fetch_poll(int slot, int *progress);
 
 // Copy the finished result out and free the slot. Returns the byte count.
-int net_fetch_take(char *dst, int max);
+int net_fetch_take(int slot, char *dst, int max);
 
-// True while a fetch is in flight.
+// True while any fetch is in flight.
 int net_fetch_busy(void);
+
+// How many slots there are.
+int net_fetch_slots(void);
+
+// Give up on a fetch and free its slot. MUST be called for every slot a
+// program still holds before it exits: a fetch left suspended has a saved
+// return into that program's kernel stack, and when the stack is freed the
+// next switch onto it takes the machine down with no way to report it.
+void net_fetch_cancel(int slot);
 
 #endif
