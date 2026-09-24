@@ -40,6 +40,7 @@ static int tstrlen(const char *s) { int n = 0; while (s[n]) n++; return n; }
 
 static struct {
     int  open;
+    int  sock;               /* the connection this session runs on */
     const char *err;
 
     sha256_t tr;                 /* transcript hash, handshake messages only */
@@ -88,15 +89,15 @@ static int fail(const char *why) { T.err = why; return 0; }
  * a clean close. Encrypted records are decrypted in place and their real
  * content type recovered from the last non-zero byte. */
 static int record_read(void) {
-    int avail = net_tcp_fill(5, 10000);
+    int avail = net_tcp_fill(T.sock, 5, 10000);
     if (avail < 5) {
         /* A server that has said everything it intends to may simply close.
          * That is the end of the conversation, not a failure of it. */
-        if (avail == 0 && net_tcp_closed()) { T.peer_closed = 1; return 0; }
+        if (avail == 0 && net_tcp_closed(T.sock)) { T.peer_closed = 1; return 0; }
         return fail("no reply from the server");
     }
 
-    const uint8_t *h = net_tcp_peek();
+    const uint8_t *h = net_tcp_peek(T.sock);
     uint8_t type = h[0];
     int len = ((int)h[3] << 8) | h[4];
     if (len < 0 || len > REC_MAX) return fail("record too large");
@@ -104,9 +105,9 @@ static int record_read(void) {
     uint8_t hdr[5];
     tmemcpy(hdr, h, 5);
 
-    if (net_tcp_fill(5 + len, 10000) < 5 + len) return fail("truncated record");
-    tmemcpy(T.rec, net_tcp_peek() + 5, len);
-    net_tcp_consume(5 + len);
+    if (net_tcp_fill(T.sock, 5 + len, 10000) < 5 + len) return fail("truncated record");
+    tmemcpy(T.rec, net_tcp_peek(T.sock) + 5, len);
+    net_tcp_consume(T.sock, 5 + len);
     T.rec_len = len;
     T.rec_type = type;
 
@@ -155,7 +156,7 @@ static int record_write(uint8_t type, const void *data, int len) {
         out[1] = 0x03; out[2] = 0x01;       /* legacy version on the wire */
         out[3] = (uint8_t)(len >> 8); out[4] = (uint8_t)len;
         tmemcpy(out + 5, data, len);
-        return net_tcp_write(out, len + 5) == len + 5;
+        return net_tcp_write(T.sock, out, len + 5) == len + 5;
     }
 
     /* Protected: the plaintext gains its real type as a trailing byte, and the
@@ -175,7 +176,7 @@ static int record_write(uint8_t type, const void *data, int len) {
     T.c_seq++;
 
     aes128gcm_seal(&T.c_key, nonce, out, 5, out + 5, inner, out + 5 + inner);
-    return net_tcp_write(out, 5 + total) == 5 + total;
+    return net_tcp_write(T.sock, out, 5 + total) == 5 + total;
 }
 
 /* --- the key schedule (RFC 8446 7.1) -------------------------------------- */
@@ -517,6 +518,7 @@ int tls_connect(uint32_t ip, uint16_t port, const char *host) {
     uint8_t shared[32];
 
     tmemset(&T, 0, sizeof T);
+    T.sock = -1;
     T.err = 0;
     sha256_init(&T.tr);
 
@@ -529,7 +531,11 @@ int tls_connect(uint32_t ip, uint16_t port, const char *host) {
     crypto_random(T.priv, 32);
     x25519_base(T.pub, T.priv);
 
-    if (!net_tcp_open(ip, port)) return fail("could not connect");
+    /* 32 KiB is two full TLS records and a little room: every record
+     * is drained into T.app as it lands, so the socket never has to
+     * hold a whole response the way the plain-HTTP path does. */
+    T.sock = net_tcp_open(ip, port, 32768);
+    if (T.sock < 0) return fail("could not connect");
 
     if (!send_client_hello(host)) return fail("could not send the hello");
     if (!read_server_hello(shared)) return 0;
@@ -594,7 +600,7 @@ int tls_read(void *buf, int max) {
         } else {
             return -1;
         }
-        if (net_tcp_closed() && net_tcp_avail() == 0 && T.app_len == 0)
+        if (net_tcp_closed(T.sock) && net_tcp_avail(T.sock) == 0 && T.app_len == 0)
             return 0;
     }
 
@@ -610,7 +616,10 @@ void tls_close(void) {
         uint8_t alert[2] = { 1, 0 };          /* warning, close_notify */
         record_write(21, alert, 2);
     }
-    net_tcp_shutdown();
+    /* The handle goes back here and nowhere else: this is the single
+     * teardown path, which is why the pool can be as simple as it is. */
+    net_tcp_release(T.sock);
+    T.sock = -1;
     T.open = 0;
 }
 
@@ -672,7 +681,7 @@ static int host_same(const char *a, const char *b) {
 /* 1 if an open connection to this exact place is available. Anything else
  * open is closed here, since only one can be held. */
 static int pool_take(uint32_t ip, uint16_t port, const char *host) {
-    if (pool.live && T.open && !T.peer_closed && !net_tcp_closed() &&
+    if (pool.live && T.open && !T.peer_closed && !net_tcp_closed(T.sock) &&
         pool.ip == ip && pool.port == port && host_same(pool.host, host))
         return 1;
     if (pool.live || T.open) { tls_close(); pool.live = 0; }

@@ -50,20 +50,34 @@ int net_http_get(const char *host, uint32_t ip, uint16_t port,
                  const char *path, char *buf, int max, int keep_headers,
                  const char *body, int blen, const char *xhdr);
 
-// --- TCP as a byte stream (used by the TLS layer) ------------------------
-// One connection at a time, the same one net_http_get uses. open/write/close
-// are what they look like; fill waits for at least `want` bytes to have
-// arrived (or the timeout, or the peer closing) and returns how many are
-// there, peek looks at them without removing them, and consume drops the
-// leading n once they have been used.
-int  net_tcp_open(uint32_t ip, uint16_t port);
-int  net_tcp_write(const void *data, int len);
-int  net_tcp_fill(int want, uint32_t timeout_ms);
-int  net_tcp_avail(void);
-const uint8_t *net_tcp_peek(void);
-void net_tcp_consume(int n);
-int  net_tcp_closed(void);
-void net_tcp_shutdown(void);
+// --- TCP as a byte stream ------------------------------------------------
+//
+// Up to eight connections at once. Every call names one by the handle that
+// open returned, and there is no current connection and no default -- an
+// implicit one is exactly how this came to be single-connection before.
+//
+// open/write are what they look like; fill waits for at least `want` bytes
+// to have arrived (or the timeout, or the peer closing) and returns how many
+// are there, peek looks at them without removing them, and consume drops the
+// leading n once they have been used. `rx_cap` is how much of the stream may
+// sit unread before the peer is told to stop: a path that accumulates a whole
+// response wants a great deal, one that drains as it goes wants very little.
+//
+// shutdown sends the FIN but leaves what already arrived readable; release
+// gives the handle back and frees the buffer, and must be called or the
+// eight run out.
+int  net_tcp_open(uint32_t ip, uint16_t port, int rx_cap);
+int  net_tcp_write(int h, const void *data, int len);
+int  net_tcp_fill(int h, int want, uint32_t timeout_ms);
+int  net_tcp_avail(int h);
+const uint8_t *net_tcp_peek(int h);
+void net_tcp_consume(int h, int n);
+int  net_tcp_closed(int h);
+void net_tcp_shutdown(int h);
+void net_tcp_release(int h);
+
+// How many of the eight are currently held. For the status line and tests.
+int  net_tcp_open_count(void);
 
 // Parse "a.b.c.d" into a host-order address. Returns 1 on success.
 int net_parse_ip(const char *s, uint32_t *out);
