@@ -4,7 +4,6 @@
 #include "../crypto/crypto.h"
 #include "x509.h"
 #include "../kernel/kio.h"
-#include "../mm/heap.h"
 #include <stddef.h>
 
 /* TLS 1.3 (RFC 8446), client side.
@@ -38,9 +37,8 @@ static int tstrlen(const char *s) { int n = 0; while (s[n]) n++; return n; }
 #define REC_MAX   17408          /* 2^14 plaintext + content type + tag + slack */
 #define HS_MAX    32768          /* a certificate chain, reassembled */
 #define APP_MAX   16384
-#define TLS_RESP_MAX (1024 * 1024)   /* one assembled response */
 
-typedef struct {
+static struct {
     int  open;
     int  sock;               /* the connection this session runs on */
     const char *err;
@@ -78,69 +76,10 @@ typedef struct {
     int      have_leaf;
     int      verified;           /* the identity was checked and it held up */
     char     host[160];
+} T;
 
-    /* The response being assembled. A megabyte, and one per session, which
-     * is why the whole thing comes off the heap rather than out of BSS. */
-    uint8_t  *resp;
-} tls_state_t;
-
-/* --- which session is in play ----------------------------------------------
- *
- * See the note at the top of the file: the pointer is moved by tls_use(),
- * called from net.c immediately before a fetch task is resumed, and the
- * cooperative scheduling is what makes that safe. Sessions are allocated on
- * first use because most of the time only one of them is ever needed, and
- * each is the better part of a hundred kilobytes before the response buffer.
- */
-#define TLS_SESSIONS 4
-
-typedef struct {
-    int      live;
-    uint32_t ip;
-    uint16_t port;
-    char     host[160];
-} tls_pool_t;
-
-static tls_state_t *sessions[TLS_SESSIONS];
-static tls_pool_t   pools[TLS_SESSIONS];
-static tls_state_t *Tp;
-static tls_pool_t  *Pp;
-
-#define T    (*Tp)
-#define pool (*Pp)
-
-int tls_use(int slot) {
-    if (slot < 0 || slot >= TLS_SESSIONS) return 0;
-    if (!sessions[slot]) {
-        tls_state_t *n = kmalloc(sizeof *n);
-        if (!n) return 0;
-        tmemset(n, 0, sizeof *n);
-        n->sock = -1;
-        n->resp = kmalloc(TLS_RESP_MAX);
-        if (!n->resp) { kfree(n); return 0; }   /* nothing half-built is kept */
-        sessions[slot] = n;
-    }
-    Tp = sessions[slot];
-    Pp = &pools[slot];
-    return 1;
-}
-
-int tls_session_count(void) { return TLS_SESSIONS; }
-
-/* A default, so the first caller of any entry point cannot find no session
- * at all. Slot zero is what the single-fetch path has always used.
- *
- * It CAN fail -- a session is the better part of a megabyte -- and the answer
- * has to be carried out to every entry point. Ignoring it once cost a morning:
- * Tp stayed NULL, T.resp with it, and the next response was written from
- * address zero upwards across the bottom of the heap. */
-static int tls_need_session(void) { return Tp != NULL || tls_use(0); }
-
-const char *tls_error(void) {
-    if (!tls_need_session()) return "out of memory for a TLS session";
-    return T.err ? T.err : "no error";
-}
-int tls_verified(void) { return tls_need_session() && T.verified; }
+const char *tls_error(void) { return T.err ? T.err : "no error"; }
+int tls_verified(void) { return T.verified; }
 
 static int fail(const char *why) { T.err = why; return 0; }
 
@@ -576,7 +515,6 @@ static int send_finished(void) {
 /* --- the public face ------------------------------------------------------ */
 
 int tls_connect(uint32_t ip, uint16_t port, const char *host) {
-    if (!tls_need_session()) return 0;
     uint8_t shared[32];
 
     tmemset(&T, 0, sizeof T);
@@ -631,7 +569,6 @@ int tls_connect(uint32_t ip, uint16_t port, const char *host) {
 }
 
 int tls_write(const void *data, int len) {
-    if (!Tp) return -1;
     if (!T.open) return -1;
     const uint8_t *p = data;
     int left = len;
@@ -644,7 +581,6 @@ int tls_write(const void *data, int len) {
 }
 
 int tls_read(void *buf, int max) {
-    if (!Tp) return -1;
     if (!T.open) return -1;
 
     while (T.app_off >= T.app_len) {
@@ -676,7 +612,6 @@ int tls_read(void *buf, int max) {
 }
 
 void tls_close(void) {
-    if (!Tp) return;
     if (T.open) {
         uint8_t alert[2] = { 1, 0 };          /* warning, close_notify */
         record_write(21, alert, 2);
@@ -730,6 +665,13 @@ static void trace(const char *tag, const char *host, long a, long b, long c) {
 #define trace(a,b,c,d,e) ((void)0)
 #endif
 
+static struct {
+    int      live;
+    uint32_t ip;
+    uint16_t port;
+    char     host[160];
+} pool;
+
 static int host_same(const char *a, const char *b) {
     int i = 0;
     while (a[i] && a[i] == b[i]) i++;
@@ -758,16 +700,15 @@ static void pool_drop(void) {
     pool.live = 0;
 }
 
-void tls_pool_flush(void) { if (tls_need_session()) pool_drop(); }
+void tls_pool_flush(void) { pool_drop(); }
 
 int tls_https_get(const char *host, uint32_t ip, uint16_t port,
                   const char *path, char *buf, int max, int keep_headers,
                   const char *body, int blen, const char *xhdr) {
-    if (!tls_need_session()) return -1;
     /* Big enough for a photograph. The page itself is small; what is
      * fetched next to it is not. */
-    uint8_t *resp = T.resp;
-    const int cap = TLS_RESP_MAX;
+    static uint8_t resp[1024 * 1024];
+    const int cap = (int)sizeof resp;
 
     /* Twice at most: a connection we kept may have been closed by the server
      * while it sat idle, and that only shows up when we try to use it. The

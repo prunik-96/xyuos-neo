@@ -5,7 +5,7 @@
 
 /* A TLS 1.3 client, and only a client.
  *
- * Several sessions, each on its own TCP connection, with
+ * One connection at a time, on top of the single TCP connection in net.c, with
  * one cipher suite (TLS_AES_128_GCM_SHA256) and one key exchange group
  * (X25519). Those are the ones RFC 8446 requires every implementation to
  * support, so a client that speaks exactly them can reach every server -- and
@@ -41,14 +41,5 @@ int tls_https_get(const char *host, uint32_t ip, uint16_t port,
 
 /* Close the kept-open connection, if there is one. */
 void tls_pool_flush(void);
-
-/* Choose which session every other call in this file acts on. Returns 0 if
- * the slot is out of range or its memory could not be had. Sessions are
- * independent: their keys, their buffers, their kept-open connection.
- *
- * Call it immediately before handing control to the code that will use the
- * session, and not earlier -- see the note at the top of tls.c. */
-int tls_use(int slot);
-int tls_session_count(void);
 
 #endif
