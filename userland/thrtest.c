@@ -12,20 +12,30 @@
 #include <thread.h>
 #include <unistd.h>
 
-#define THREADS 4
-#define ROUNDS  100000
+static int THREADS = 4;               /* -- overridable, to push the limit */
+static int ROUNDS = 100000;           /* -- fewer when there are many */
 
 static mutex_t lock = MUTEX_INIT;
 static volatile long guarded;       /* only ever touched under `lock` */
 static volatile long unguarded;     /* deliberately not */
 
 /* What each thread saw, written only by that thread. */
-static int  saw_tid[THREADS];
-static void *saw_stack[THREADS];
-static volatile int finished[THREADS];
+#define THREADS_MAX 40
+static int  saw_tid[THREADS_MAX];
+static void *saw_stack[THREADS_MAX];
+static volatile int finished[THREADS_MAX];
 
 static int shared_value = 1234;     /* in the program's memory, not a copy */
-static int shared_seen[THREADS];
+static int shared_seen[THREADS_MAX];
+
+/* Nobody finishes until everybody has started.
+ *
+ * Without this the test asks the wrong question. Early threads finish while
+ * later ones are still being created, their stacks go back, and the next
+ * thread is quite correctly given the same address. Two threads sharing an
+ * address is only wrong if they were ever alive at the same time -- so this
+ * makes sure they all are. */
+static volatile int all_started;
 
 static void worker(void *p) {
     int me = (int)(long)p;
@@ -34,6 +44,8 @@ static void worker(void *p) {
     saw_tid[me] = thread_self();
     saw_stack[me] = (void *)&on_my_stack;
     shared_seen[me] = shared_value;
+
+    while (!all_started) { __asm__ volatile ("pause" ::: "memory"); }
 
     for (int i = 0; i < ROUNDS; i++) {
         mutex_lock(&lock);
@@ -44,8 +56,13 @@ static void worker(void *p) {
     finished[me] = 1;
 }
 
-int main(void) {
-    int tid[THREADS];
+int main(int argc, char **argv) {
+    if (argc > 1) THREADS = atoi(argv[1]);
+    if (THREADS < 1) THREADS = 1;
+    if (THREADS > THREADS_MAX) THREADS = THREADS_MAX;
+    if (argc > 2) ROUNDS = atoi(argv[2]);
+    if (ROUNDS < 1) ROUNDS = 1;
+    int tid[THREADS_MAX];
     int bad = 0;
 
     printf("main thread is %d\n", thread_self());
@@ -55,6 +72,11 @@ int main(void) {
         tid[i] = thread_create(worker, (void *)(long)i);
         if (tid[i] < 0) { printf("FAILED: could not start thread %d\n", i); return 1; }
     }
+
+    /* Everyone is started; now they may all finish. Until this line every one
+     * of them is alive at once, which is the only condition under which "they
+     * must not share a stack" means anything. */
+    all_started = 1;
 
     for (int i = 0; i < THREADS; i++)
         if (thread_join(tid[i]) != 0) { printf("FAILED: join %d\n", i); return 1; }
@@ -93,7 +115,7 @@ int main(void) {
     printf("all four read the same shared variable\n");
 
     /* --- the count ------------------------------------------------------- */
-    long want = (long)THREADS * ROUNDS;
+    long want = (long)THREADS * (long)ROUNDS;
     printf("guarded:   %ld  (should be %ld)\n", guarded, want);
     printf("unguarded: %ld\n", unguarded);
     if (guarded != want) { printf("FAILED: the lock did not hold\n"); bad++; }

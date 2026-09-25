@@ -59,10 +59,12 @@
 #define VM_WRITE  2
 #define VM_EXEC   4
 
-// Mappings per process. Small on purpose: this is a fixed array inside the
-// process, and a program with more than a handful of mappings is not one this
-// system is being built for yet.
-#define VM_REGIONS_MAX 32
+// Mappings per address space. Every thread stack is one of these, so the
+// number is really "mappings plus threads": thirty threads and a handful of
+// mappings would not have fitted in thirty-two. The array lives in the
+// address space, one per program rather than one per thread, and at
+// twenty-four bytes each the whole table is under two kilobytes.
+#define VM_REGIONS_MAX 64
 
 typedef struct {
     uint64_t base;          // page-aligned; 0 when the slot is free

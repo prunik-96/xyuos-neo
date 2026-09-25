@@ -30,7 +30,12 @@ extern void sched_resume(uint64_t rsp) __attribute__((noreturn));
 
 // A single `run` in one pane is already a chain of four (sh -> run -> cc ->
 // tcc), and each extra pane adds a shell, so 8 was uncomfortably tight.
-#define MAX_PROCESSES 16
+// Sixteen was comfortable while a slot meant a program. A thread takes one
+// too, so a browser with four fetch threads and a couple of panes was
+// suddenly close to the edge. Each slot is under a kilobyte and the table is
+// only ever walked, never searched, so the cost of more is a few tens of
+// kilobytes and nothing else.
+#define MAX_PROCESSES 64
 #define MAX_ARGS 32
 #define MAX_ARG_LEN 256
 #define KSTACK_SIZE 16384
