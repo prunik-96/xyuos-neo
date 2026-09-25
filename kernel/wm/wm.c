@@ -1100,6 +1100,17 @@ static void draw_taskbar(void) {
     int tray_x = clk_x - pos * (int)GW - 18;
     draw_text_t(tray_x, ty, tray, T->bar_dim);
     draw_text_t(clk_x, ty, clk, T->bar_text);
+
+    // The whole bar, because the whole bar was just repainted.
+    //
+    // Most of what is drawn above marks its own rectangle, but fill_vgrad
+    // writes the buffer directly and marks nothing -- so what reached the
+    // screen was only the parts under the glyphs and the hairlines. That is
+    // invisible until a button gets SHORTER: the new label was pushed over
+    // the first few letters of the old one and the rest of it stayed on the
+    // screen for ever, because from then on the buffer and the screen agreed
+    // everywhere the new frame touched. "shgchild" is what that looks like.
+    fb_mark_rows((uint32_t)by, TASKBAR_H);
 }
 
 // Refresh the clock + CPU/memory history, at most once a second. Called from
