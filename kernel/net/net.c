@@ -372,6 +372,10 @@ typedef struct {
 
 static tcp_conn_t conns[TCP_CONNS];
 
+// Remember which fetch opened a connection, so an abandoned one can be
+// shut without guessing. Defined with the fetch slots.
+static void af_note_socket(int h);
+
 // Bytes that have arrived on any connection since boot. Only ever used to
 // show that something is happening while a fetch runs -- a progress bar has
 // no business knowing which socket the bytes came in on.
@@ -548,7 +552,7 @@ static int tcp_open(uint32_t ip, uint16_t port, int rx_cap) {
         uint64_t deadline = now_ms() + 600;
         while (now_ms() < deadline) {
             net_poll();
-            if (c->state == TCP_ESTABLISHED) return h;
+            if (c->state == TCP_ESTABLISHED) { af_note_socket(h); return h; }
             if (c->state == TCP_CLOSED) { tcp_release(c); return -1; }
         }
         c->snd_nxt = isn;                    // retransmit with the same ISN
@@ -596,6 +600,7 @@ int net_tcp_open(uint32_t ip, uint16_t port, int rx_cap) {
 }
 
 int net_tcp_write(int h, const void *data, int len) {
+    af_note_socket(h);
     tcp_conn_t *c = conn_of(h);
     if (!c || c->state != TCP_ESTABLISHED) return -1;
     tcp_send_data(c, data, len);
@@ -627,6 +632,7 @@ void net_tcp_consume(int h, int n) {
 }
 
 int net_tcp_fill(int h, int want, uint32_t timeout_ms) {
+    af_note_socket(h);
     tcp_conn_t *c = conn_of(h);
     if (!c) return 0;
     uint64_t deadline = now_ms() + timeout_ms;
@@ -715,10 +721,16 @@ int net_resolve(const char *name, uint32_t *ip) {
     return 1;
 }
 
+// A source port and a transaction id that do not repeat while anything is
+// still waiting on the last ones. Several lookups may now be outstanding at
+// once, and the only thing telling their answers apart is this pair.
+static uint16_t dns_seq;
+
 static int dns_query(const char *name, uint32_t *ip) {
 
     uint8_t q[512];
-    uint16_t txid = (uint16_t)(now_ms() & 0xFFFF) ^ 0xA5A5;
+    uint16_t tick = ++dns_seq;
+    uint16_t txid = (uint16_t)((now_ms() & 0xFFFF) ^ 0xA5A5) + tick;
     int n = 0;
     uint16_t v;
     v = htons(txid);      nmemcpy(q + n, &v, 2); n += 2;
@@ -742,7 +754,7 @@ static int dns_query(const char *name, uint32_t *ip) {
     v = htons(1); nmemcpy(q + n, &v, 2); n += 2;           // QTYPE A
     v = htons(1); nmemcpy(q + n, &v, 2); n += 2;           // QCLASS IN
 
-    uint16_t sport = 50000 + (uint16_t)(now_ms() & 0x1FFF);
+    uint16_t sport = (uint16_t)(50000 + (tick % 8000));
     for (int tries = 0; tries < 3; tries++) {
         udp_have = 0;
         if (udp_send(dns_ip, sport, 53, q, n) != 0) return 0;
@@ -754,6 +766,9 @@ static int dns_query(const char *name, uint32_t *ip) {
                 uint8_t *r = udp_data;
                 int rl = udp_dlen;
                 if (rl < 12) break;
+                // Somebody else's answer, arriving on a port we happen to
+                // have been given after theirs was released.
+                if (ntohs(*(uint16_t *)r) != txid) break;
                 uint16_t ancount = ntohs(*(uint16_t *)(r + 6));
                 int off = 12;
                 // skip QNAME
@@ -784,129 +799,244 @@ static int dns_query(const char *name, uint32_t *ip) {
 // ==========================================================================
 //  fetching on its own stack
 // ==========================================================================
+//
+// A fetch is seconds of waiting. Done inside one system call it stopped the
+// machine for all of them, so each one runs as a coroutine on its own stack
+// and hands the processor back every few milliseconds.
+//
+// There are four of them now. A page is a document and then twenty files, and
+// with one slot those twenty went in single file -- twenty-one round trips
+// end to end, most of the time spent with nothing on the wire at all. Four
+// slots means four TCP connections, four TLS sessions and four stacks, and
+// the twenty files overlap.
+//
+// What makes this safe without a single lock is that the tasks are
+// cooperative: a slot only ever gives up the processor inside net_poll(),
+// and only because the slice ran out. Between resuming a slot and it coming
+// back, nothing else in the kernel runs. That is also why tls_use() is called
+// exactly where it is -- one instruction before the resume, which is the only
+// moment at which "the session in play" can be set and stay true.
 
 enum { AF_IDLE, AF_RUN, AF_DONE };
 
-// How long the fetch task may hold the processor before handing it back. Short
+// How long a fetch may hold the processor before handing it back. Short
 // enough that a window redrawing at 60Hz does not visibly stutter.
 #define AF_SLICE_US 4000
 #define AF_STACK    (64 * 1024)
+#define AF_SLOTS    4
+#define AF_BUF_MAX  (1024 * 1024)
 
-// Set while the fetch task is the one holding the processor, and the moment
-// it has to hand it back.
+// Set while a fetch task is the one holding the processor, and the moment it
+// has to hand it back. Only one slot runs at a time, so one pair does.
 static int      af_running;
 static uint64_t af_slice_end;
 
-static struct {
+typedef struct {
     int      state;
     char     host[160];
     char     path[1024];
     uint16_t port;
     int      tls, raw;
-    int      result;          // bytes, or -1
-    char     body[4096];      // a form being posted; empty for a GET
+    int      result;            // bytes, or -1
+    char     body[4096];        // a form being posted; empty for a GET
     int      blen;
-    char     xhdr[2048];      // headers the browser wrote, Cookie among them
+    char     xhdr[2048];        // headers the browser wrote, Cookie among them
     task_t  *task;
-} af;
+    uint8_t *buf;               // the answer; a megabyte, on first use
+    int      bytes0;            // tcp_bytes_in when this fetch began
+    int      progress;
+    int      sock;              // the connection it opened last, or -1
+} af_slot_t;
 
-static uint8_t af_buf[1024 * 1024];
+static af_slot_t afs[AF_SLOTS];
 
-// How much of the answer is in hand. Bytes off the wire are the honest
-// measure while it is still arriving; the final count replaces it at the end.
-// af_bytes0 is the running total at the moment this fetch began, so the
-// difference is this fetch's own.
-static int af_progress;
-static int af_bytes0;
+// The slot whose coroutine is running right now, so that a connection it
+// opens can be attributed to it. -1 when the processor is not inside one.
+static int af_current = -1;
+
+// Which slot the task about to be started for the first time belongs to.
+// A task entry function takes no arguments, and each task has its own stack,
+// so it reads this once on the way in and keeps it in a local from then on.
+static int af_spawning;
 
 static void af_entry(void) {
+    const int me = af_spawning;
+    af_slot_t *a = &afs[me];
     for (;;) {
         uint32_t ip;
         int r = -1;
-        if (net_resolve(af.host, &ip)) {
-            r = af.tls
-              ? tls_https_get(af.host, ip, af.port, af.path,
-                              (char *)af_buf, (int)sizeof af_buf, af.raw,
-                              af.blen ? af.body : 0, af.blen,
-                              af.xhdr[0] ? af.xhdr : 0)
-              : net_http_get(af.host, ip, af.port, af.path,
-                             (char *)af_buf, (int)sizeof af_buf, af.raw,
-                             af.blen ? af.body : 0, af.blen,
-                             af.xhdr[0] ? af.xhdr : 0);
+        if (net_resolve(a->host, &ip)) {
+            r = a->tls
+              ? tls_https_get(a->host, ip, a->port, a->path,
+                              (char *)a->buf, AF_BUF_MAX, a->raw,
+                              a->blen ? a->body : 0, a->blen,
+                              a->xhdr[0] ? a->xhdr : 0)
+              : net_http_get(a->host, ip, a->port, a->path,
+                             (char *)a->buf, AF_BUF_MAX, a->raw,
+                             a->blen ? a->body : 0, a->blen,
+                             a->xhdr[0] ? a->xhdr : 0);
         }
-        af.result = r;
-        af.state = AF_DONE;
+        a->result = r;
+        a->state = AF_DONE;
         // Nothing more to do until somebody sets up the next one.
         task_yield_back();
     }
 }
 
-int net_fetch_busy(void) { return af.state == AF_RUN; }
+static void af_note_socket(int h) {
+    if (af_current >= 0) afs[af_current].sock = h;
+}
 
+int net_fetch_slots(void) { return AF_SLOTS; }
+
+int net_fetch_busy(void) {
+    for (int i = 0; i < AF_SLOTS; i++)
+        if (afs[i].state == AF_RUN) return 1;
+    return 0;
+}
+
+static void af_copy(char *dst, int cap, const char *src) {
+    int i = 0;
+    if (src) while (src[i] && i < cap - 1) { dst[i] = src[i]; i++; }
+    dst[i] = 0;
+}
+
+// Returns the slot this fetch was given, or -1 if all of them are busy or
+// the memory for one could not be had.
 int net_fetch_start(const char *host, const char *path, uint16_t port,
                     int tls, int keep_headers, const char *body, int blen,
                     const char *xhdr, int xhdrlen) {
-    if (af.state == AF_RUN) return 0;
-    if (!af.task) {
-        af.task = task_create_sized("fetch", af_entry, AF_STACK);
-        if (!af.task) return 0;
+    int slot = -1;
+    for (int i = 0; i < AF_SLOTS; i++)
+        if (afs[i].state == AF_IDLE) { slot = i; break; }
+    if (slot < 0) return -1;
+
+    af_slot_t *a = &afs[slot];
+
+    // The answer buffer and the stack are made on first use and then kept:
+    // most of the time one slot does all the work, and four megabytes for
+    // the other three would be four megabytes wasted.
+    if (!a->buf) {
+        a->buf = kmalloc(AF_BUF_MAX);
+        if (!a->buf) return -1;
     }
-    int i = 0;
-    for (; host[i] && i < (int)sizeof af.host - 1; i++) af.host[i] = host[i];
-    af.host[i] = 0;
-    for (i = 0; path[i] && i < (int)sizeof af.path - 1; i++) af.path[i] = path[i];
-    af.path[i] = 0;
-    af.port = port;
-    af.tls = tls;
-    af.raw = keep_headers;
-    af.xhdr[0] = 0;
+    if (!a->task) {
+        af_spawning = slot;
+        a->task = task_create_coroutine("fetch", af_entry, AF_STACK);
+        if (!a->task) return -1;
+    }
+
+    af_copy(a->host, (int)sizeof a->host, host);
+    af_copy(a->path, (int)sizeof a->path, path);
+    a->port = port;
+    a->tls = tls;
+    a->raw = keep_headers;
+
+    a->xhdr[0] = 0;
     if (xhdr && xhdrlen > 0) {
-        if (xhdrlen > (int)sizeof af.xhdr - 1) xhdrlen = (int)sizeof af.xhdr - 1;
-        for (int k = 0; k < xhdrlen; k++) af.xhdr[k] = xhdr[k];
-        af.xhdr[xhdrlen] = 0;
+        if (xhdrlen > (int)sizeof a->xhdr - 1) xhdrlen = (int)sizeof a->xhdr - 1;
+        for (int k = 0; k < xhdrlen; k++) a->xhdr[k] = xhdr[k];
+        a->xhdr[xhdrlen] = 0;
     }
-    af.blen = 0;
+    a->blen = 0;
     if (body && blen > 0) {
-        if (blen > (int)sizeof af.body) blen = (int)sizeof af.body;
-        for (int k = 0; k < blen; k++) af.body[k] = body[k];
-        af.blen = blen;
+        if (blen > (int)sizeof a->body) blen = (int)sizeof a->body;
+        for (int k = 0; k < blen; k++) a->body[k] = body[k];
+        a->blen = blen;
     }
-    af.result = -1;
-    af_progress = 0;
-    af_bytes0 = (int)tcp_bytes_in;
-    af.state = AF_RUN;
-    return 1;
+
+    a->result = -1;
+    a->progress = 0;
+    a->sock = -1;
+    a->bytes0 = (int)tcp_bytes_in;
+    a->state = AF_RUN;
+    return slot;
 }
 
-int net_fetch_poll(int *progress) {
-    if (af.state == AF_IDLE) return -1;
-    if (af.state == AF_RUN) {
+int net_fetch_poll(int slot, int *progress) {
+    if (slot < 0 || slot >= AF_SLOTS) return -1;
+    af_slot_t *a = &afs[slot];
+    if (a->state == AF_IDLE) return -1;
+
+    if (a->state == AF_RUN) {
+        // The session this slot owns, chosen at the last possible moment --
+        // see the note at the top of this section and at the top of tls.c.
+        if (a->tls && !tls_use(slot)) { a->result = -1; a->state = AF_DONE; }
+    }
+
+    if (a->state == AF_RUN) {
+        af_spawning = slot;
         af_slice_end = now_us() + AF_SLICE_US;
         af_running = 1;
-        task_resume(af.task);
+        af_current = slot;
+        task_resume(a->task);
+        af_current = -1;
         af_running = 0;
-        if (af.state == AF_RUN) {
-            // Whatever has come in on any socket: a progress bar has no
-            // business knowing which one it was.
+        if (a->state == AF_RUN) {
+            // Bytes off the wire since this fetch began. With four of them
+            // running the figure is shared, which is honest enough for a
+            // progress bar and cheaper than counting per socket.
             if (progress) {
-                int n = (int)tcp_bytes_in - af_bytes0;
-                if (n < af_progress) n = af_progress;
+                int n = (int)tcp_bytes_in - a->bytes0;
+                if (n < a->progress) n = a->progress;
                 *progress = n;
             }
             return NET_FETCH_PENDING;
         }
     }
-    af_progress = af.result > 0 ? af.result : 0;
-    if (progress) *progress = af_progress;
-    return af.result;
+    a->progress = a->result > 0 ? a->result : 0;
+    if (progress) *progress = a->progress;
+    return a->result;
 }
 
-int net_fetch_take(char *dst, int max) {
-    int n = af.result;
+/* Finish an abandoned fetch here and now.
+ *
+ * "Here" is the point: this runs inside the system call of the program that
+ * is giving up, so the coroutine still has a live stack to return to. Leaving
+ * it suspended instead is what reset the machine -- see the note at the top of
+ * this section.
+ *
+ * The connection is shut first so the fetch fails out of its read in a slice
+ * or two rather than sitting out a ten-second timeout, and then it is run to
+ * completion. The answer, if one arrives anyway, is thrown away. */
+void net_fetch_cancel(int slot) {
+    if (slot < 0 || slot >= AF_SLOTS) return;
+    af_slot_t *a = &afs[slot];
+    if (a->state == AF_IDLE) return;
+
+    if (a->state == AF_RUN) {
+        if (a->sock >= 0) {
+            tcp_conn_t *c = conn_of(a->sock);
+            if (c) { c->remote_closed = 1; c->state = TCP_CLOSED; }
+        }
+        /* Bounded by the clock: what matters is how long the program is
+         * held up leaving, not how many turns the fetch was given. With its
+         * connection shut it comes home in a slice or two; the three seconds
+         * are for the case where it does not, and a lost slot is in any case
+         * better than a reset machine. */
+        uint64_t give_up = now_ms() + 3000;
+        while (a->state == AF_RUN && now_ms() < give_up) {
+            if (a->tls && !tls_use(slot)) break;
+            af_spawning = slot;
+            af_slice_end = now_us() + AF_SLICE_US;
+            af_running = 1;
+            af_current = slot;
+            task_resume(a->task);
+            af_current = -1;
+            af_running = 0;
+        }
+    }
+    if (a->state != AF_RUN) a->state = AF_IDLE;
+}
+
+int net_fetch_take(int slot, char *dst, int max) {
+    if (slot < 0 || slot >= AF_SLOTS) return -1;
+    af_slot_t *a = &afs[slot];
+    int n = a->result;
     if (n > max) n = max;
-    if (n > 0) nmemcpy(dst, af_buf, n);
-    af.state = AF_IDLE;
-    return af.result;
+    if (n > 0) nmemcpy(dst, a->buf, n);
+    a->state = AF_IDLE;
+    return a->result;
 }
 
 // ==========================================================================

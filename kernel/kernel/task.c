@@ -53,6 +53,13 @@ task_t *task_create_sized(const char *name, void (*entry)(void), int stack_bytes
     return t;
 }
 
+task_t *task_create_coroutine(const char *name, void (*entry)(void),
+                              int stack_bytes) {
+    task_t *t = task_create_sized(name, entry, stack_bytes);
+    if (t) t->state = TASK_COROUTINE;
+    return t;
+}
+
 void yield(void) {
     task_t *old = current_task;
     task_t *next = old->next;
@@ -76,7 +83,7 @@ void yield(void) {
 static task_t *resumer = NULL;
 
 void task_resume(task_t *t) {
-    if (!t || t->state != TASK_READY || t == current_task) return;
+    if (!t || t->state == TASK_TERMINATED || t == current_task) return;
     task_t *me = current_task;
     task_t *saved = resumer;
     resumer = me;
@@ -101,3 +108,5 @@ void task_exit(void) {
         yield();
     }
 }
+
+

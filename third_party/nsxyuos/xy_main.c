@@ -342,6 +342,8 @@ static void run(void) {
     }
 }
 
+void fetch_xyuos_shutdown(void);
+
 int main(int argc, char **argv) {
     struct netsurf_table xyuos_table = {
         .misc   = &xy_misc_table,
@@ -398,6 +400,11 @@ int main(int argc, char **argv) {
     run();
 
     while (xy_ntabs > 0) xy_tab_close(xy_ntabs - 1);
+    /* Before anything else: the kernel must not be left
+     * holding a fetch for a program that is about to stop
+     * existing. */
+    fetch_xyuos_shutdown();
+
     netsurf_exit();
     nsoption_finalise(nsoptions, nsoptions_default);
     gui_close(&xy_gui);
