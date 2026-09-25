@@ -599,10 +599,15 @@ int tls_connect(uint32_t ip, uint16_t port, const char *host) {
     crypto_random(T.priv, 32);
     x25519_base(T.pub, T.priv);
 
-    /* 32 KiB is two full TLS records and a little room: every record
-     * is drained into T.app as it lands, so the socket never has to
-     * hold a whole response the way the plain-HTTP path does. */
-    T.sock = net_tcp_open(ip, port, 32768);
+    /* This buffer IS the receive window -- that is what makes the number
+     * matter. It was 32 KiB for a while, on the reasoning that every record
+     * is drained into T.app as it lands so the socket need not hold much.
+     * True, and beside the point: with a 32 KiB window the sender stops
+     * every 32 KiB and waits to be told there is room, and the answer only
+     * goes out when this fetch next gets a turn. Measured on github.com,
+     * that took a 209 KB image FIFTY-FIVE SECONDS. At 256 KiB the same
+     * image arrives in 160 ms -- better than a megabyte a second. */
+    T.sock = net_tcp_open(ip, port, 262144);
     if (T.sock < 0) return fail("could not connect");
 
     if (!send_client_hello(host)) return fail("could not send the hello");
