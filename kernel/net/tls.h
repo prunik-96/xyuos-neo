@@ -42,4 +42,9 @@ int tls_https_get(const char *host, uint32_t ip, uint16_t port,
 /* Close the kept-open connection, if there is one. */
 void tls_pool_flush(void);
 
+// Make session `slot` (0..TLS_SESSIONS-1) the one every call above works on,
+// creating it on first use. Returns 1, or 0 if the slot is out of range or
+// there is no memory for it.
+int tls_use(int slot);
+
 #endif
