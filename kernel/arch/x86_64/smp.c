@@ -7,13 +7,13 @@
 #include "pit.h"
 #include <stddef.h>
 
-#define SMP_WAKE_VECTOR 240
+// syscall_entry.S and this_cpu() read these by hard-coded offset -- keep
+// them true.
+_Static_assert(offsetof(struct percpu, kstack_top)   == 8,  "PERCPU_KSTACK");
+_Static_assert(offsetof(struct percpu, user_rsp)     == 16, "PERCPU_USERRSP");
+_Static_assert(offsetof(struct percpu, current_proc) == 24, "current_proc");
+_Static_assert(offsetof(struct percpu, self)         == 32, "this_cpu()");
 
-// syscall_entry.S / isr.S read these by hard-coded offset -- keep them true.
-_Static_assert(offsetof(struct percpu, kstack_top) == 8,  "PERCPU_KSTACK");
-_Static_assert(offsetof(struct percpu, user_rsp)   == 16, "PERCPU_USERRSP");
-
-#define MAX_CPUS 32
 #define TRAMPOLINE_ADDR 0x8000
 #define AP_STACK_SIZE   (16 * 1024)
 
@@ -42,17 +42,26 @@ static inline void set_kernel_gs_base(uint64_t base) {
     __asm__ volatile ("wrmsr" : : "c"(IA32_KERNEL_GS_BASE),
                       "a"((uint32_t)base), "d"((uint32_t)(base >> 32)));
 }
-static inline uint64_t get_gs_base(void) {
-    uint32_t lo, hi;
-    __asm__ volatile ("rdmsr" : "=a"(lo), "=d"(hi) : "c"(IA32_GS_BASE));
-    return ((uint64_t)hi << 32) | lo;
-}
 static inline uint64_t read_cr3(void) {
     uint64_t v; __asm__ volatile ("mov %%cr3, %0" : "=r"(v)); return v;
 }
 
-struct percpu *this_cpu(void) { return (struct percpu *)get_gs_base(); }
 int smp_cpu_count(void) { return ncpu; }
+
+// How many cores have answered the current TLB shootdown. Counted by the
+// assembly handler in isr.S, which is why it is a plain global.
+volatile int tlb_acks;
+
+void smp_early_init(void) {
+    cpus[0].cpu_index = 0;
+    cpus[0].kstack_top = 0;
+    cpus[0].self = &cpus[0];
+    // The bootstrap core holds the kernel lock from the moment it starts:
+    // everything before the scheduler is its alone. See bkl.h.
+    cpus[0].bkl_depth = 1;
+    set_gs_base((uint64_t)(uintptr_t)&cpus[0]);
+    set_kernel_gs_base((uint64_t)(uintptr_t)&cpus[0]);
+}
 
 // --- SMP compute pool -----------------------------------------------------
 // The APs are a pool of kernel-mode workers. smp_run() publishes a task, wakes
@@ -185,12 +194,9 @@ static void mdelay(uint64_t ms) {
 }
 
 int smp_init(void) {
-    // BSP is cpu 0; give it a per-CPU block and GS base too.
-    cpus[0].cpu_index = 0;
+    // The BSP's block was set up by smp_early_init; only the APIC id was not
+    // known that early.
     cpus[0].apic_id = apic_bsp_id();
-    cpus[0].kstack_top = 0;
-    set_gs_base((uint64_t)(uintptr_t)&cpus[0]);
-    set_kernel_gs_base((uint64_t)(uintptr_t)&cpus[0]);
 
     int n = apic_cpu_count();
     if (n <= 1) { kprintf("smp: 1 core\n"); return 1; }
@@ -220,6 +226,8 @@ int smp_init(void) {
         cpus[idx].cpu_index = (uint32_t)idx;
         cpus[idx].apic_id = ids[i];
         cpus[idx].kstack_top = stack_top;
+        cpus[idx].self = &cpus[idx];
+        cpus[idx].bkl_depth = 0;
         ap_next = &cpus[idx];
         *(volatile uint64_t *)(dst + off_stack) = stack_top;
 

@@ -9,9 +9,11 @@ gdt_flush:
     mov $0x10, %ax
     mov %ax, %ds
     mov %ax, %es
-    mov %ax, %fs
-    mov %ax, %gs
     mov %ax, %ss
+    # NOT fs and gs. In long mode, loading a selector into either of them
+    # also loads its base from the descriptor -- zero -- and the GS base is
+    # this core's per-CPU block, set before this runs. Nothing here uses FS
+    # or GS as a segment, so there is nothing to refresh and a lot to lose.
 
     # reload CS via a far return, required since lgdt alone does not
     # refresh CS's cached descriptor attributes.

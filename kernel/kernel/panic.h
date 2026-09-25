@@ -8,4 +8,10 @@
 // the framebuffer and presents it; the caller halts afterwards.
 void panic_screen(const char *reason, struct interrupt_frame *frame);
 
+// Stop the machine over a broken kernel invariant -- something that must never
+// happen and that no user program can cause. Says what went wrong on the
+// serial port and the kernel log, and halts this core for good. There is no
+// frame to show, which is why it is not panic_screen.
+void panic(const char *msg) __attribute__((noreturn));
+
 #endif

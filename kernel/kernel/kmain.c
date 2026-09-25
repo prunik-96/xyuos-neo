@@ -255,6 +255,10 @@ static void map_high_memory(void) {
 }
 
 void kernel_main(uint32_t multiboot_addr) {
+    // Before anything else, the bootstrap core's per-CPU block: interrupt
+    // handlers and the kernel lock find the core they are on through it, and
+    // the first interrupt can come sooner than one might think.
+    smp_early_init();
     serial_init();
     map_high_memory();       // before the first framebuffer write
     find_framebuffer(multiboot_addr);

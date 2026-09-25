@@ -75,6 +75,11 @@ static const struct sdt_header *find_madt(uint32_t multiboot_addr) {
 #define MAX_CPUS 32
 
 static volatile uint8_t *lapic = NULL;
+
+// The EOI register itself, for the two interrupt handlers written in assembly
+// (isr.S: the wake-up and the TLB shootdown), which acknowledge the interrupt
+// without going anywhere near C.
+volatile uint32_t *lapic_eoi_reg;
 static volatile uint8_t *ioapic = NULL;
 static uint32_t ioapic_gsi_base = 0;
 static uint32_t bsp_id = 0;
@@ -165,6 +170,7 @@ int apic_init(uint32_t multiboot_addr) {
     paging_map_mmio(lapic_phys, 0x1000);
     paging_map_mmio(ioapic_phys, 0x1000);
     lapic = (volatile uint8_t *)(uintptr_t)lapic_phys;
+    lapic_eoi_reg = (volatile uint32_t *)(lapic + LAPIC_EOI);
     ioapic = (volatile uint8_t *)(uintptr_t)ioapic_phys;
 
     // If the board booted in PIC mode (PCAT_COMPAT), flip the IMCR so the

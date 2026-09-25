@@ -73,14 +73,48 @@ IRQ 13, 45
 IRQ 14, 46
 IRQ 15, 47
 
-# SMP wake IPI (vector 240): an application processor takes this to leave its
-# idle hlt and check the work queue. It flows through the normal IRQ path,
-# which EOIs the local APIC and (for a non-zero irq) just returns the frame.
+# The timer, passed on to the application processors by the bootstrap core
+# (SMP_TICK_VECTOR, 0xE0). The same path as a device interrupt: it takes the
+# kernel lock, and may switch to another process on the way out.
+.global smp_tick_isr
+smp_tick_isr:
+    push $0
+    push $0xE0
+    jmp irq_common_stub
+
+# The two interrupts that must NOT go near the kernel lock, and so do not go
+# near C either. Neither touches GS, so neither needs swapgs, whether it
+# caught ring 3 or ring 0; each saves the one register it uses.
+#
+# SMP_WAKE_VECTOR (0xF0): "look at the work queues". The waking is the whole
+# of it -- the core comes out of hlt and its loop looks for itself. Going
+# through the lock here would be worse than pointless: the core that sends a
+# wake-up is often the one holding the lock, waiting for the woken core to
+# pick up work that needs no lock at all.
 .global smp_wake_isr
 smp_wake_isr:
-    push $0
-    push $240
-    jmp irq_common_stub
+    push %rax
+    mov lapic_eoi_reg(%rip), %rax
+    movl $0, (%rax)
+    pop %rax
+    iretq
+
+# SMP_TLB_VECTOR (0xF3): "your cached translations may be stale". Reloading
+# CR3 with itself drops every one of them (nothing here is mapped global), and
+# only then is the flush counted as done. The core that asked is holding the
+# kernel lock and waiting for this count, so it must be possible to get here
+# from anywhere -- including from a core that is itself waiting for the lock,
+# which is why that wait keeps interrupts open.
+.global smp_tlb_isr
+smp_tlb_isr:
+    push %rax
+    mov %cr3, %rax
+    mov %rax, %cr3
+    lock incl tlb_acks(%rip)
+    mov lapic_eoi_reg(%rip), %rax
+    movl $0, (%rax)
+    pop %rax
+    iretq
 
 # Spurious-interrupt vector (255): the Local APIC's SVR points here. It must NOT
 # send an EOI, so it simply returns.
@@ -129,6 +163,7 @@ spurious_isr:
 # must swapgs to bring the kernel's per-CPU block into GS, and swap back before
 # returning. A trap that caught the kernel already has the kernel GS.
 .extern isr_handler
+.extern bkl_exit
 isr_common_stub:
     testb $3, 24(%rsp)
     jz .Lisr_kernel_in
@@ -137,6 +172,9 @@ isr_common_stub:
     PUSH_REGS
     mov %rsp, %rdi
     call isr_handler
+    # isr_handler took the kernel lock; this is where it is given back, still
+    # on the stack the fault was taken on.
+    call bkl_exit
     POP_REGS
     add $16, %rsp
     testb $3, 8(%rsp)          # CS of the frame we are returning to
@@ -158,6 +196,13 @@ irq_common_stub:
     # ordinary case, or another process's saved frame when the scheduler
     # decided to rotate. Adopting it here IS the context switch.
     mov %rax, %rsp
+    # And only NOW let go of the kernel lock -- after the switch, not before
+    # it. The process being switched away from is runnable again the moment
+    # the lock is free, and another core may pick it up at once; until this
+    # instruction's predecessor ran, this core was still standing on its
+    # kernel stack. (The frame at %rsp is 16-byte aligned, so this is a
+    # well-formed call.)
+    call bkl_exit
     POP_REGS
     add $16, %rsp
     testb $3, 8(%rsp)          # CS we are returning to (may be a different process)

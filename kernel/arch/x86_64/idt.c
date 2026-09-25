@@ -10,6 +10,9 @@
 #include "../../wm/wm.h"
 #include <stddef.h>
 #include "../../mm/vmm.h"
+#include "../../kernel/bkl.h"
+#include "smp.h"
+#include "pit.h"
 
 struct idt_entry {
     uint16_t offset_low;
@@ -100,11 +103,19 @@ void idt_init(void) {
     for (int i = 0; i < 32; i++) {
         idt_set_gate(i, isr_stub_table[i], 0, 0x8E);
     }
-    // Double fault (8) and page fault (14) run on IST1, a private stack, so a
-    // kernel-stack overflow still lands in the panic handler instead of tripping
-    // a triple fault and silently resetting the machine.
+    // The double fault (8) runs on IST1, a private stack, so a kernel-stack
+    // overflow still lands in the panic handler instead of tripping a triple
+    // fault and silently resetting the machine: the page fault that cannot
+    // push its frame becomes a double fault, and that one has a stack.
+    //
+    // The page fault itself used to run there too, and no longer does. IST1
+    // is one stack per core, and it is jumped to from the top every time --
+    // so a second page fault taken while the first is still on it overwrites
+    // the first. On one core nothing interrupted a page fault. With several,
+    // a page fault from ring 3 waits for the kernel lock with interrupts open,
+    // and that is not a place to be standing on a stack the next fault will
+    // clobber.
     idt_set_gate(8,  isr_stub_table[8],  1, 0x8E);
-    idt_set_gate(14, isr_stub_table[14], 1, 0x8E);
 
     pic_remap(32, 40);
 
@@ -113,10 +124,15 @@ void idt_init(void) {
         irq_handlers[i] = NULL;
     }
 
-    // SMP inter-processor vectors: the wake IPI and the LAPIC spurious vector.
+    // SMP inter-processor vectors, and the LAPIC spurious vector. See smp.h
+    // for why each sits in the priority class it does.
+    extern void smp_tick_isr(void);
     extern void smp_wake_isr(void);
+    extern void smp_tlb_isr(void);
     extern void spurious_isr(void);
-    idt_set_gate(240, smp_wake_isr, 0, 0x8E);
+    idt_set_gate(SMP_TICK_VECTOR, smp_tick_isr, 0, 0x8E);
+    idt_set_gate(SMP_WAKE_VECTOR, smp_wake_isr, 0, 0x8E);
+    idt_set_gate(SMP_TLB_VECTOR,  smp_tlb_isr,  0, 0x8E);
     idt_set_gate(255, spurious_isr, 0, 0x8E);
 
     idtr.limit = sizeof(idt) - 1;
@@ -189,6 +205,11 @@ static void fmt_fault_detail(char *out, int max, const char *name, int pid,
 }
 
 void isr_handler(struct interrupt_frame *frame) {
+    // Every fault is handled under the kernel lock -- a page fault builds
+    // page tables and takes frames, which is kernel state like any other.
+    // The stub lets go of it after this returns.
+    bkl_enter();
+
     const char *name = "Unknown";
     if (frame->int_no < 32) {
         name = exception_names[frame->int_no];
@@ -301,7 +322,18 @@ void isr_handler(struct interrupt_frame *frame) {
 // but the timer may hand back another process's saved frame instead, which is
 // how preemption happens. See irq_common_stub in isr.S.
 uint64_t irq_handler(struct interrupt_frame *frame) {
-    uint64_t irq = frame->int_no - 32;
+    uint64_t vec = frame->int_no;
+    uint64_t irq = vec - 32;
+
+    // The part of a timer tick that must not wait for anybody: the clock
+    // itself, and passing the tick on to the other cores. Kernel code on
+    // another core may be spinning on pit_get_ticks() while it holds the
+    // lock -- a delay loop, a timeout -- and if time only moved forward under
+    // the lock, it would wait for ever for a clock that was waiting for it.
+    if (vec == 32) pit_tick_fast();
+
+    bkl_enter();          // given back by the stub, after any stack switch
+
     if (irq < 16 && irq_handlers[irq]) {
         irq_handlers[irq](frame);
     }
@@ -310,7 +342,9 @@ uint64_t irq_handler(struct interrupt_frame *frame) {
     if (apic_active()) lapic_eoi();
     else pic_send_eoi((uint8_t)irq);
 
-    if (irq == 0) {
+    // The bootstrap core's own timer, and the tick it hands on to the rest:
+    // either way, this core's chance to take its process off the processor.
+    if (vec == 32 || vec == SMP_TICK_VECTOR) {
         return sched_on_tick((uint64_t)(uintptr_t)frame, frame->cs);
     }
     return (uint64_t)(uintptr_t)frame;
