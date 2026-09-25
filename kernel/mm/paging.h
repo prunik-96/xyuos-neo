@@ -93,4 +93,9 @@ void paging_protect(uint64_t pml4_phys, uint64_t vaddr, uint64_t bytes,
 // that were actually there.
 int paging_unmap(uint64_t pml4_phys, uint64_t vaddr, uint64_t bytes);
 
+// Remove the mapping and LEAVE the frame alone. For memory this address space
+// was only borrowing -- shared segments, whose frames belong to the segment
+// and not to whoever happens to have it mapped.
+int paging_detach(uint64_t pml4_phys, uint64_t vaddr, uint64_t bytes);
+
 #endif

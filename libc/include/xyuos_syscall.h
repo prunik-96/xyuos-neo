@@ -137,6 +137,20 @@ struct msgbox_req {
 #define SIGMASK_BLOCK   1
 #define SIGMASK_UNBLOCK 2
 
+// Shared memory. op=a1; see sys/shm.h.
+#define SYS_SHM       49
+#define SHMOP_GET     0
+#define SHMOP_ATTACH  1
+#define SHMOP_DETACH  2
+#define SHMOP_CTL     3
+#define SHMOP_SIZE    4
+
+struct shm_req {
+    int key;
+    int flags;
+    unsigned long size;
+};
+
 /* SYS_SETTING operations. */
 #define SETOP_GET        0   /* a2 = SET_*                    -> value        */
 #define SETOP_SET        1   /* a2 = SET_*, a3 = value        -> the value set*/

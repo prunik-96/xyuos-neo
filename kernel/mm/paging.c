@@ -252,6 +252,20 @@ void paging_protect(uint64_t pml4_phys, uint64_t vaddr, uint64_t bytes,
     }
 }
 
+int paging_detach(uint64_t pml4_phys, uint64_t vaddr, uint64_t bytes) {
+    uint64_t start = vaddr & ~0xFFFULL;
+    uint64_t end = (vaddr + bytes + 0xFFF) & ~0xFFFULL;
+    int n = 0;
+    for (uint64_t v = start; v < end; v += PAGE_SIZE) {
+        uint64_t *e = pte_of(pml4_phys, v);
+        if (!e || !(*e & PAGE_PRESENT)) continue;
+        *e = 0;
+        invlpg(v);
+        n++;
+    }
+    return n;
+}
+
 int paging_unmap(uint64_t pml4_phys, uint64_t vaddr, uint64_t bytes) {
     uint64_t start = vaddr & ~0xFFFULL;
     uint64_t end = (vaddr + bytes + 0xFFF) & ~0xFFFULL;

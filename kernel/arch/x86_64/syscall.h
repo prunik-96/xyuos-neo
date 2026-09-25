@@ -90,6 +90,27 @@
 
 #define SYS_SIGNAL    48  // op=a1; the ops are SIGOP_* in kernel/kernel/signal.h
 
+// Shared memory. op=a1; see kernel/kernel/shm.h for what a segment is.
+//   GET     a2 = a user pointer to struct shm_req  -> the id, or -1
+//   ATTACH  a2 = id, a3 = flags   -> the address it landed at, or 0
+//   DETACH  a2 = address          -> 0 / -1
+//   CTL     a2 = id, a3 = cmd     -> 0 / -1
+//   SIZE    a2 = id               -> bytes, or 0
+#define SYS_SHM       49
+#define SHMOP_GET     0
+#define SHMOP_ATTACH  1
+#define SHMOP_DETACH  2
+#define SHMOP_CTL     3
+#define SHMOP_SIZE    4
+
+// Three arguments will not fit beside the op, so they travel in memory --
+// the same trick SYS_SPAWN2 uses.
+struct shm_req {
+    int key;
+    int flags;
+    unsigned long size;
+};
+
 // SYS_SETTING operations.
 #define SETOP_GET        0   // a2 = SET_*                     -> value
 #define SETOP_SET        1   // a2 = SET_*, a3 = value          -> the value set

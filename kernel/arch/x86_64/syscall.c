@@ -1,6 +1,7 @@
 #include "syscall.h"
 #include "../../kernel/kio.h"
 #include "../../kernel/process.h"
+#include "../../kernel/shm.h"
 #include "../../kernel/devices.h"
 #include "../../mm/vmm.h"
 #include "../../mm/pmm.h"
@@ -190,6 +191,28 @@ static uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                     return (uint64_t)(int64_t)signal_alarm(a2);
                 case SIGOP_MASK:
                     return (uint64_t)signal_mask((int)a2, (uint32_t)a3);
+                default: return (uint64_t)-1;
+            }
+        }
+        case SYS_SHM: {
+            switch (a1) {
+                case SHMOP_GET: {
+                    if (!vmm_user_range_ok(a2, sizeof(struct shm_req)))
+                        return (uint64_t)-1;
+                    const struct shm_req *rq =
+                        (const struct shm_req *)(uintptr_t)a2;
+                    // Read out before anything else runs: they are the
+                    // caller's memory and must not be looked at twice.
+                    int key = rq->key, flags = rq->flags;
+                    uint64_t size = rq->size;
+                    return (uint64_t)(int64_t)shm_get(key, size, flags);
+                }
+                case SHMOP_ATTACH: return shm_attach((int)a2, (int)a3);
+                case SHMOP_DETACH:
+                    return (uint64_t)(int64_t)shm_detach(a2);
+                case SHMOP_CTL:
+                    return (uint64_t)(int64_t)shm_ctl((int)a2, (int)a3);
+                case SHMOP_SIZE:   return shm_size((int)a2);
                 default: return (uint64_t)-1;
             }
         }

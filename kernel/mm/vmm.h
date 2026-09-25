@@ -71,7 +71,10 @@ typedef struct {
     uint64_t base;          // page-aligned; 0 when the slot is free
     uint64_t len;           // whole pages
     uint32_t prot;          // VM_READ / VM_WRITE / VM_EXEC
-    uint32_t pad;
+    // 0 for an ordinary mapping. Otherwise the id of the shared segment
+    // behind it, plus one -- which also says "the frames here are not this
+    // address space's to free". See shm.h.
+    uint32_t shm;
 } vm_region_t;
 
 // --- the memory of a process, as a thing in itself -------------------------
@@ -141,6 +144,22 @@ int      vmm_mprotect(uint64_t addr, uint64_t len, uint32_t prot);
 // The lowest address any mapping occupies, or USER_MMAP_TOP when there are
 // none. This is where the heap has to stop.
 uint64_t vmm_mmap_floor(void);
+
+// --- room for memory somebody else owns ------------------------------------
+// Shared memory is placed like a mapping and filled by its owner, so the two
+// halves of vmm_mmap are needed separately: take the address range, and give
+// it back if the filling fails. `shm_id` is what ends up in the region.
+uint64_t vmm_reserve(uint64_t len, uint32_t prot, int shm_id);
+void     vmm_release(uint64_t addr);
+
+// The page-table flags a protection asks for -- shm maps its own pages and
+// has to ask for them the same way an ordinary mapping would.
+uint64_t vmm_page_flags(uint32_t prot);
+
+// Take a shared mapping out: the page table entries go, the frames stay, and
+// the segment is told it has one fewer holder. -1 if `addr` is not the start
+// of an attached segment.
+int vmm_munmap_shared(uint64_t addr);
 
 // Make every page of [addr, addr + len) exist, building the ones that are
 // declared-and-not-built exactly as a touch from ring 3 would. Returns 1 if

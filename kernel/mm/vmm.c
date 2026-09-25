@@ -2,6 +2,7 @@
 #include "paging.h"
 #include "pmm.h"
 #include "../kernel/process.h"
+#include "../kernel/shm.h"
 #include "heap.h"
 
 #define PAGE 4096ULL
@@ -39,6 +40,20 @@ void vmm_space_ref(addr_space_t *as) {
 void vmm_space_unref(addr_space_t *as) {
     if (!as) return;
     if (--as->refs > 0) return;
+
+    /* Shared memory first, and this is not a tidiness measure. The teardown
+     * below frees every page it finds in the tables, and the frames of a
+     * shared segment are not this address space's to free -- another program
+     * may be reading them right now. Taking the entries out first is what
+     * makes them invisible to it. */
+    for (int i = 0; i < VM_REGIONS_MAX; i++) {
+        vm_region_t *r = &as->vm[i];
+        if (!r->base || !r->shm) continue;
+        paging_detach(as->pml4, r->base, r->len);
+        shm_dropped((int)r->shm - 1);
+        r->base = 0; r->len = 0; r->shm = 0;
+    }
+
     paging_free_address_space(as->pml4);
     kfree(as);
 }
@@ -54,6 +69,8 @@ static uint64_t flags_of(uint32_t prot) {
     if (!(prot & VM_EXEC)) f |= PAGE_NX;
     return f;
 }
+
+uint64_t vmm_page_flags(uint32_t prot) { return flags_of(prot); }
 
 /* --- the list ------------------------------------------------------------- */
 
@@ -107,7 +124,7 @@ static uint64_t place(process_t *p, uint64_t len) {
     return 0;
 }
 
-uint64_t vmm_mmap(uint64_t len, uint32_t prot) {
+uint64_t vmm_reserve(uint64_t len, uint32_t prot, int shm_id) {
     process_t *p = process_current();
     if (!p || !p->as || len == 0) return 0;
 
@@ -124,9 +141,25 @@ uint64_t vmm_mmap(uint64_t len, uint32_t prot) {
     slot->base = at;
     slot->len = len;
     slot->prot = prot;
+    slot->shm = (shm_id >= 0) ? (uint32_t)(shm_id + 1) : 0;
+    return at;
+}
+
+void vmm_release(uint64_t addr) {
+    process_t *p = process_current();
+    if (!p || !p->as) return;
+    for (int i = 0; i < VM_REGIONS_MAX; i++) {
+        vm_region_t *r = &p->as->vm[i];
+        if (r->base != addr) continue;
+        r->base = 0; r->len = 0; r->shm = 0;
+        return;
+    }
+}
+
+uint64_t vmm_mmap(uint64_t len, uint32_t prot) {
     /* No pages. They are built by vmm_fault() as the program reaches them,
      * which is the point of asking for a big mapping and using a little. */
-    return at;
+    return vmm_reserve(len, prot, -1);
 }
 
 int vmm_munmap(uint64_t addr, uint64_t len) {
@@ -141,10 +174,30 @@ int vmm_munmap(uint64_t addr, uint64_t len) {
     vm_region_t *r = region_exact(p, addr, len);
     if (!r) return -1;
 
+    /* Shared memory is not unmapped, it is let go of: the frames belong to
+     * the segment, which may well still be in use somewhere else. */
+    if (r->shm) return vmm_munmap_shared(addr);
+
     paging_unmap(p->pml4, r->base, r->len);
     r->base = 0;
     r->len = 0;
     return 0;
+}
+
+int vmm_munmap_shared(uint64_t addr) {
+    process_t *p = process_current();
+    if (!p || !p->as) return -1;
+
+    for (int i = 0; i < VM_REGIONS_MAX; i++) {
+        vm_region_t *r = &p->as->vm[i];
+        if (r->base != addr || !r->shm) continue;
+        paging_detach(p->pml4, r->base, r->len);
+        int id = (int)r->shm - 1;
+        r->base = 0; r->len = 0; r->shm = 0;
+        shm_dropped(id);
+        return 0;
+    }
+    return -1;
 }
 
 int vmm_mprotect(uint64_t addr, uint64_t len, uint32_t prot) {
@@ -225,6 +278,11 @@ int vmm_fault(uint64_t addr, uint64_t err) {
     } else {
         vm_region_t *r = region_at(p, page);
         if (!r) return 0;
+        /* A shared segment is built in full when it is attached, so a missing
+         * page inside one is not a page waiting to be made -- it is a bug,
+         * and putting a fresh private page there would silently give this
+         * program a copy nobody else can see. */
+        if (r->shm) return 0;
         /* Asking of a mapping what it was not asked to allow is the
          * program's mistake, not a page that is missing. */
         if (write && !(r->prot & VM_WRITE)) return 0;

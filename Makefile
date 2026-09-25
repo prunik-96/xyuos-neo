@@ -38,7 +38,7 @@ LIBC_C_PROGS    := files note view taskmgr play hello_c fstest spin parent keywa
                    ls cat echo wc grep head tail sort uniq tee hexdump \
                    cp mv touch stat ps free uname sleep kill loop bigfile yes count crash \
                    plasma devmgr control web ftest netlog memtest vmtest thrtest \
-                   sigtest sigchild
+                   sigtest sigchild shmtest shmchild
 LIBC_CXX_PROGS  := hello_cpp
 # The interactive shell / file manager / editor now live in the kernel WM pane
 # engine (kernel/wm/), so there are no separate userland shell binaries; these
@@ -51,7 +51,7 @@ LIBC_SRCS := libc/src/syscalls.c libc/src/stdio.c libc/src/stdlib.c libc/src/str
              libc/src/math.c libc/src/readline.c libc/src/dirstat.c \
              libc/src/inet.c libc/src/regex.c libc/src/thread.c \
              libc/src/timecal.c libc/src/posixbits.c libc/src/mman.c \
-             libc/src/signal.c
+             libc/src/signal.c libc/src/shm.c
 LIBC_OBJS := $(patsubst libc/src/%.c,build/libc_%.o,$(LIBC_SRCS))
 LIBC_CXX_OBJS := build/libc_cxxabi_stubs.o
 LIBC_A    := build/libc.a
