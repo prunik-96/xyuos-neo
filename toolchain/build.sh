@@ -1,6 +1,9 @@
 #!/bin/bash
 set -e
 
+# Where this script lives, taken before anything below changes directory.
+HERE="$(cd "$(dirname "$0")" && pwd)"
+
 export PREFIX="$HOME/xyuos-neo/toolchain/cross"
 export TARGET=x86_64-elf
 export PATH="$PREFIX/bin:$PATH"
@@ -53,6 +56,12 @@ make -j"$(nproc)" all-gcc
 make -j"$(nproc)" all-target-libgcc
 make install-gcc
 make install-target-libgcc
+
+# The C++ runtime (libsupc++ and the freestanding libstdc++) is built in a tree
+# of its own, against the compiler just installed -- see the script for why.
+# Without it C++ programs still compile but cannot throw, catch or ask typeid.
+echo "=== Building the C++ runtime ==="
+bash "$HERE/build_libstdcxx.sh"
 
 echo "=== DONE ==="
 "$PREFIX/bin/$TARGET-gcc" --version

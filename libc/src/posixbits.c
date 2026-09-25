@@ -42,16 +42,41 @@ char *strtok(char *s, const char *sep) {
 
 /* --- leaving ------------------------------------------------------------- */
 
-/* The standard asks for at least 32. Library tidy-up routines register here
- * and there is no reason to be stingy. */
-#define ATEXIT_MAX 32
+/* The standard asks for at least 32. Library tidy-up routines register here,
+ * and so does every C++ object with a destructor at file scope, so there is
+ * even less reason to be stingy than there was. */
+#define ATEXIT_MAX 64
 
-static void (*atexit_fns[ATEXIT_MAX])(void);
-static int   atexit_n;
+/* Two kinds of handler share one list, because they have to run interleaved
+ * in the order they were registered: atexit() takes nothing, and the C++ ABI's
+ * __cxa_atexit takes the object to destroy. */
+struct atexit_entry {
+    void (*fn)(void *);
+    void  *arg;
+    int    with_arg;
+};
+
+static struct atexit_entry atexit_fns[ATEXIT_MAX];
+static int atexit_n;
 
 int atexit(void (*fn)(void)) {
     if (fn == NULL || atexit_n >= ATEXIT_MAX) return -1;
-    atexit_fns[atexit_n++] = fn;
+    atexit_fns[atexit_n].fn = (void (*)(void *))(void *)fn;
+    atexit_fns[atexit_n].arg = NULL;
+    atexit_fns[atexit_n].with_arg = 0;
+    atexit_n++;
+    return 0;
+}
+
+/* What __cxa_atexit becomes. A file-scope C++ object registers its destructor
+ * here when it is constructed, which is how it gets destroyed on the way out
+ * in the reverse of the order things were built. */
+int __libc_atexit_arg(void (*fn)(void *), void *arg) {
+    if (fn == NULL || atexit_n >= ATEXIT_MAX) return -1;
+    atexit_fns[atexit_n].fn = fn;
+    atexit_fns[atexit_n].arg = arg;
+    atexit_fns[atexit_n].with_arg = 1;
+    atexit_n++;
     return 0;
 }
 
@@ -61,8 +86,9 @@ int atexit(void (*fn)(void)) {
  * rather than starting it over. */
 void __libc_run_atexit(void) {
     while (atexit_n > 0) {
-        void (*fn)(void) = atexit_fns[--atexit_n];
-        fn();
+        struct atexit_entry e = atexit_fns[--atexit_n];
+        if (e.with_arg) e.fn(e.arg);
+        else            ((void (*)(void))(void *)e.fn)();
     }
 }
 

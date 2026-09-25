@@ -20,9 +20,21 @@ USER_LDFLAGS := -T userland/link.ld -ffreestanding -nostdlib -no-pie -static -O2
 
 # libc itself, and libc-based userland programs.
 LIBC_CFLAGS   := $(USER_CFLAGS) -Ilibc/include
+# C++ with the language switched all the way on. -fno-exceptions and
+# -fno-rtti were here because there was nothing to link against; libsupc++ is
+# built now (toolchain/build_libstdcxx.sh), so throw, catch, typeid and
+# dynamic_cast all work. The freestanding C++ headers come from the toolchain's
+# own include path, which the compiler already knows about.
 LIBC_CXXFLAGS := -ffreestanding -fno-stack-protector -fno-pic -fno-pie \
                  -mno-red-zone -mgeneral-regs-only -Wall -Wextra -std=gnu++17 \
-                 -fno-exceptions -fno-rtti -O2 -g -Ilibc/include
+                 -O2 -g -Ilibc/include
+
+# libsupc++ is the C++ half of exceptions (__cxa_throw, the personality
+# routine, typeinfo); the machine half -- the stack unwinder itself -- is
+# already inside libgcc. libstdc++ here is the freestanding one: containers
+# and algorithms that need no operating system, no iostreams.
+CXX_RUNTIME := $(shell $(CXX) -print-file-name=libstdc++.a) \
+               $(shell $(CXX) -print-file-name=libsupc++.a)
 LIBC_LDFLAGS  := -T userland/link.ld -ffreestanding -nostdlib -no-pie -static -O2
 
 SRC_C := $(shell find kernel -name '*.c')
@@ -39,7 +51,7 @@ LIBC_C_PROGS    := files note view taskmgr play hello_c fstest spin parent keywa
                    cp mv touch stat ps free uname sleep kill loop bigfile yes count crash \
                    plasma devmgr control web ftest netlog memtest vmtest thrtest \
                    sigtest sigchild shmtest shmchild
-LIBC_CXX_PROGS  := hello_cpp
+LIBC_CXX_PROGS  := hello_cpp cpptest
 # The interactive shell / file manager / editor now live in the kernel WM pane
 # engine (kernel/wm/), so there are no separate userland shell binaries; these
 # remaining userland programs are just the boot demos.
@@ -51,7 +63,7 @@ LIBC_SRCS := libc/src/syscalls.c libc/src/stdio.c libc/src/stdlib.c libc/src/str
              libc/src/math.c libc/src/readline.c libc/src/dirstat.c \
              libc/src/inet.c libc/src/regex.c libc/src/thread.c \
              libc/src/timecal.c libc/src/posixbits.c libc/src/mman.c \
-             libc/src/signal.c libc/src/shm.c
+             libc/src/signal.c libc/src/shm.c libc/src/start.c
 LIBC_OBJS := $(patsubst libc/src/%.c,build/libc_%.o,$(LIBC_SRCS))
 LIBC_CXX_OBJS := build/libc_cxxabi_stubs.o
 LIBC_A    := build/libc.a
@@ -167,7 +179,17 @@ define LIBC_LINK_RULE
 build/$(1).elf: build/$(1)_libcuser.o $(CRT0) $(LIBC_A) userland/link.ld
 	$(LD) $(LIBC_LDFLAGS) $(CRT0) build/$(1)_libcuser.o $(LIBC_A) -o $$@ -lgcc
 endef
-$(foreach p,$(LIBC_C_PROGS) $(LIBC_CXX_PROGS),$(eval $(call LIBC_LINK_RULE,$(p))))
+$(foreach p,$(LIBC_C_PROGS),$(eval $(call LIBC_LINK_RULE,$(p))))
+
+# C++ programs get the C++ runtime as well, AFTER libc: libsupc++ calls malloc
+# and abort, and an archive only hands over what is still missing when the
+# linker reaches it.
+define LIBC_CXX_LINK_RULE
+build/$(1).elf: build/$(1)_libcuser.o $(CRT0) $(LIBC_A) userland/link.ld
+	$(LD) $(LIBC_LDFLAGS) $(CRT0) build/$(1)_libcuser.o $(LIBC_A) \
+	    $(CXX_RUNTIME) -o $$@ -lgcc
+endef
+$(foreach p,$(LIBC_CXX_PROGS),$(eval $(call LIBC_CXX_LINK_RULE,$(p))))
 
 build/%.elf: build/%_user.o userland/link.ld
 	$(LD) $(USER_LDFLAGS) $< -o $@

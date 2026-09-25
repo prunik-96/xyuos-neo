@@ -29,7 +29,7 @@ Requires Debian or Ubuntu (WSL is fine) with `build-essential`, `bison`,
 git clone <this repo> ~/xyuos-neo     # the path matters -- see below
 cd ~/xyuos-neo
 
-./toolchain/build.sh                  # binutils 2.42 + GCC 13.2.0, ~40 min
+./toolchain/build.sh                  # binutils 2.42 + GCC 13.2.0 + C++ runtime, ~50 min
 python3 tools/vendor.py               # DOOM and MicroPython, at pinned commits
 make                                  # kernel, libc, userland, ISO, disk image
 ```
