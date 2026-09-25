@@ -1,0 +1,112 @@
+#!/usr/bin/env python3
+"""Type several commands in the shell, photographing after each.
+
+    python3 tools/seqrun.py 2G "sigtest:25" "ls:3"
+
+Each step is COMMAND:SECONDS -- what to type, and how long to let it run
+before the screen is photographed. A step with nothing before the colon just
+presses Enter, which is how a message box left by a deliberate crash is got
+out of the way before the next command.
+
+The pictures land in /tmp/seqrun as step0.png, step1.png, ... and, if
+SEQRUN_COPY names a directory, are copied there as well.
+"""
+import os, shutil, socket, subprocess, sys, time
+
+XYUOS = os.environ.get(
+    "XYUOS", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+OUT = "/tmp/seqrun"
+COPY = os.environ.get("SEQRUN_COPY")
+RAM = sys.argv[1] if len(sys.argv) > 1 else "2G"
+STEPS = sys.argv[2:] or ["sigtest:25"]
+
+os.makedirs(OUT, exist_ok=True)
+for f in list(os.listdir(OUT)):
+    os.unlink(OUT + "/" + f)
+SER, MON = OUT + "/serial.log", OUT + "/mon.sock"
+subprocess.run(["cp", XYUOS + "/disk.img", OUT + "/disk.img"], check=True)
+
+proc = subprocess.Popen(
+    ["qemu-system-x86_64", "-enable-kvm", "-cpu", "host",
+     "-cdrom", XYUOS + "/build/xyuos_neo.iso",
+     "-serial", "file:" + SER, "-m", RAM, "-display", "none",
+     "-drive", "file=%s/disk.img,if=none,id=d0,format=raw" % OUT,
+     "-device", "virtio-blk-pci,drive=d0",
+     "-device", "qemu-xhci,id=xhci",
+     "-device", "usb-kbd,bus=xhci.0", "-device", "usb-mouse,bus=xhci.0",
+     "-monitor", "unix:%s,server,nowait" % MON],
+    stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+
+
+def serial():
+    try:
+        with open(SER, "rb") as f:
+            return f.read().decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+
+B = "wm: double-buffer"
+t0 = time.time()
+while B not in serial():
+    if time.time() - t0 > 120 or proc.poll() is not None:
+        proc.kill()
+        sys.exit("never came up")
+    time.sleep(0.25)
+time.sleep(4)
+
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+for _ in range(60):
+    try:
+        s.connect(MON); break
+    except OSError:
+        time.sleep(0.25)
+s.settimeout(0.3)
+
+
+def cmd(c, settle=0.08):
+    s.sendall((c + "\n").encode())
+    time.sleep(settle)
+    try:
+        while True:
+            if not s.recv(65536):
+                break
+    except socket.timeout:
+        pass
+
+
+KEYS = {' ': 'spc', '.': 'dot', '/': 'slash', '-': 'minus', '\n': 'ret',
+        ':': 'shift-semicolon', '_': 'shift-minus', '=': 'equal'}
+
+
+def typ(t):
+    for ch in t:
+        n = KEYS.get(ch) or (('shift-' + ch.lower()) if 'A' <= ch <= 'Z' else ch)
+        cmd("sendkey " + n, 0.05)
+
+
+for i, step in enumerate(STEPS):
+    line, _, wait = step.rpartition(":")
+    typ(line + "\n")
+    time.sleep(float(wait))
+    cmd("screendump %s/step%d.ppm" % (OUT, i), 1.5)
+
+log = serial()
+bad = [l for l in log.splitlines()
+       if any(k in l for k in ("PANIC", "FAULT", "#PF", "#GP", "HEAP:",
+                               "faulted"))]
+print("panics/faults:", "\n   ".join(bad) if bad else "(none)")
+print("boots:", log.count(B))
+
+cmd("quit", 0.3)
+time.sleep(1)
+proc.kill()
+for f in sorted(os.listdir(OUT)):
+    if f.endswith(".ppm"):
+        subprocess.run(["convert", OUT + "/" + f, OUT + "/" + f[:-4] + ".png"],
+                       check=False)
+        os.unlink(OUT + "/" + f)
+        if COPY:
+            os.makedirs(COPY, exist_ok=True)
+            shutil.copy(OUT + "/" + f[:-4] + ".png", COPY)
+print("pictures in " + OUT + (" and " + COPY if COPY else ""))
