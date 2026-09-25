@@ -233,9 +233,13 @@ int process_spawn_image(const char *name, const void *elf_data, uint64_t size,
         return -1;
     }
 
-    if (paging_map_alloc(p->pml4, USER_STACK_BASE, USER_STACK_SIZE,
+    // Only the top of the stack is built here: the kernel writes the
+    // arguments into it from ring 0, and a fault taken there would not be a
+    // program's fault to take. The other eight megabytes appear as the
+    // program grows into them -- see vmm_fault().
+    if (paging_map_alloc(p->pml4, USER_STACK_TOP - USER_STACK_EAGER,
+                         USER_STACK_EAGER,
                          PAGE_PRESENT | PAGE_WRITE | PAGE_USER) != 0) {
-        kprintf("process: out of memory mapping the stack\n");
         proc_abandon(p);
         return -1;
     }
@@ -966,13 +970,11 @@ uint64_t process_sbrk(int64_t increment) {
 
     if (increment > 0) {
         if ((uint64_t)increment > USER_HEAP_LIMIT - old) return (uint64_t)-1;
-        // Pages left mapped by an earlier grow-then-shrink are reused as they
-        // are; malloc does not assume sbrk memory is zeroed, and fresh frames
-        // arrive zeroed anyway.
-        if (paging_map_alloc(current->pml4, old, (uint64_t)increment,
-                             PAGE_PRESENT | PAGE_WRITE | PAGE_USER) != 0) {
-            return (uint64_t)-1;
-        }
+        // Nothing is mapped here. malloc asks for a quarter of a megabyte at
+        // a time and typically writes a few hundred bytes of it, so building
+        // the whole of it now would be frames spent on memory nobody reads.
+        // Moving the break is the whole of the work; the pages appear as they
+        // are touched.
         current->brk = old + (uint64_t)increment;
     } else {
         uint64_t shrink = (uint64_t)(-increment);

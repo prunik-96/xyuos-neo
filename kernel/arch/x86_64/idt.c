@@ -9,6 +9,7 @@
 #include "apic.h"
 #include "../../wm/wm.h"
 #include <stddef.h>
+#include "../../mm/vmm.h"
 
 struct idt_entry {
     uint16_t offset_low;
@@ -203,6 +204,15 @@ void isr_handler(struct interrupt_frame *frame) {
             uint64_t cr2 = 0;
             if (frame->int_no == 14)
                 __asm__ volatile ("mov %%cr2, %0" : "=r"(cr2));
+
+            // Not every page fault is a mistake. The stack and the heap below
+            // the break are declared and not built, so the first touch of a
+            // page in either is how they come into existence. If that is what
+            // this was, the page is there now and the instruction can simply
+            // be run again.
+            if (frame->int_no == 14 &&
+                vmm_fault(cr2, (int)(frame->err_code & 2)))
+                return;
             kprintf("process %d faulted: %s rip=%x:%x cr2=%x:%x -- terminated\n",
                     p->pid, name,
                     (unsigned)(frame->rip >> 32), (unsigned)(frame->rip & 0xFFFFFFFF),
@@ -219,8 +229,18 @@ void isr_handler(struct interrupt_frame *frame) {
         // No current process yet: fall through to the panic path.
     }
 
-    // A kernel-mode fault is unrecoverable. Paint the full panic report to the
-    // screen (reads the kernel log for its "recent messages" panel, so do it
+    // ...unless it is a fault on a USER address, which is a syscall writing
+    // into a buffer the program has asked for and not yet touched. The kernel
+    // is running in that program's address space, so the page goes in exactly
+    // as it would have had the program touched it first.
+    if (frame->int_no == 14) {
+        uint64_t cr2 = 0;
+        __asm__ volatile ("mov %%cr2, %0" : "=r"(cr2));
+        if (vmm_fault(cr2, (int)(frame->err_code & 2))) return;
+    }
+
+    // Any other kernel-mode fault is unrecoverable. Paint the full panic
+    // report to the screen (reads the kernel log for its "recent messages" panel, so do it
     // before the serial dump below adds to that log).
     panic_screen(name, frame);
 
