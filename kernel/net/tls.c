@@ -579,7 +579,13 @@ int tls_connect(uint32_t ip, uint16_t port, const char *host) {
     if (!tls_need_session()) return 0;
     uint8_t shared[32];
 
+    /* The session is cleared for the new connection, but the response
+     * buffer belongs to the SESSION and outlives every connection made on
+     * it. Forgetting that here nulled the pointer and sent the next response
+     * to address zero. */
+    uint8_t *keep_resp = T.resp;
     tmemset(&T, 0, sizeof T);
+    T.resp = keep_resp;
     T.sock = -1;
     T.err = 0;
     sha256_init(&T.tr);
@@ -768,6 +774,7 @@ int tls_https_get(const char *host, uint32_t ip, uint16_t port,
      * fetched next to it is not. */
     uint8_t *resp = T.resp;
     const int cap = TLS_RESP_MAX;
+    if (!resp) return -1;      /* no buffer, no answer -- never write blind */
 
     /* Twice at most: a connection we kept may have been closed by the server
      * while it sat idle, and that only shows up when we try to use it. The
