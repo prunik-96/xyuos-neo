@@ -113,6 +113,20 @@ static process_t *proc_alloc(const char *name) {
     for (int i = 0; i < MAX_PROCESSES; i++) {
         if (proc_table[i].state != PROC_UNUSED) continue;
         process_t *p = &proc_table[i];
+
+        // From nothing. A slot must not remember who had it last.
+        //
+        // This used to set the fields it knew about one by one, and every
+        // field added since was a field it did not know about. is_thread
+        // was one: a process that landed in a slot a thread had just left
+        // inherited the flag, and when it ended it ended AS A THREAD -- it
+        // did not wake its parent, which then waited in waitpid() for ever.
+        // `stopped` was another, which would have started a program
+        // suspended in the slot of one that was killed while suspended.
+        // Clearing the lot makes the next field added safe by default.
+        uint8_t *q = (uint8_t *)p;
+        for (uint64_t k = 0; k < sizeof *p; k++) q[k] = 0;
+
         p->pid = next_pid++;
         p->parent_pid = current ? current->pid : 0;
         p->state = PROC_READY;
@@ -921,6 +935,12 @@ void process_notify_exit(int code) {
     }
 
     process_t *dead = current;
+
+    // Collect any threads that have already finished -- above all when it is
+    // the program itself that is ending, since after that nothing of it will
+    // come back to ask. It skips `dead`, which is still running here.
+    reap_dead_threads();
+
     dead->exit_code = code;
     dead->state = PROC_ZOMBIE;
     last_exit_code = code;
@@ -972,7 +992,12 @@ void process_notify_exit(int code) {
     }
 
     // Nobody will ever reap a process the kernel started, so retire it here.
-    if (!dead->parent_pid) proc_reap(dead);
+    //
+    // NOT a thread, though a thread has no parent either. It has a share of
+    // the address space still to give back, which only reap_dead_threads()
+    // does -- retiring it here skipped that, and every program that ever
+    // started a thread left its whole address space behind when it ended.
+    if (!dead->parent_pid && !dead->is_thread) proc_reap(dead);
 
     if (next) {
         if (next->resume_kernel) kctx_restore(next->kctx, 1);
