@@ -71,6 +71,28 @@ typedef struct {
     uint32_t pad;
 } vm_region_t;
 
+// --- the memory of a process, as a thing in itself -------------------------
+//
+// Held by pointer rather than by value because it can have more than one
+// holder: threads of one program share exactly this, and nothing else. The
+// count is what lets any of them exit first, in any order, without the
+// address space going out from under the others.
+typedef struct addr_space {
+    uint64_t    pml4;       // physical address of the page tables
+    uint64_t    brk;        // heap break
+    vm_region_t vm[VM_REGIONS_MAX];
+    int         refs;       // how many processes share this
+} addr_space_t;
+
+// A fresh address space with page tables of its own, held once. Returns NULL
+// if either the object or the tables could not be had.
+addr_space_t *vmm_space_new(void);
+
+// One more holder, and one fewer. The last unref frees the page tables, every
+// user page in them, and the object.
+void vmm_space_ref(addr_space_t *as);
+void vmm_space_unref(addr_space_t *as);
+
 // True if [addr, addr + len) lies entirely inside the user window. Every
 // syscall that dereferences a userland pointer must ask this first -- it is
 // the only thing standing between a buggy (or hostile) program and the kernel.

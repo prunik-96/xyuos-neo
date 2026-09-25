@@ -76,6 +76,18 @@
 #define VM_OP_UNMAP    1   // a2 = address, a3 = length  -> 0, or -1
 #define VM_OP_PROTECT  2   // a2 = address, a3 = length  -> 0, or -1
 
+#define SYS_THREAD    47  // op=a1: 0 create, 1 exit, 2 join, 3 self
+
+// a2/a3 depend on the op:
+//   CREATE  a2 = entry, a3 = argument  -> the new thread id, or -1
+//   EXIT    a2 = exit code             -> does not return
+//   JOIN    a2 = thread id             -> 0 once it has ended, or -1
+//   SELF                               -> this thread's id
+#define THREAD_OP_CREATE 0
+#define THREAD_OP_EXIT   1
+#define THREAD_OP_JOIN   2
+#define THREAD_OP_SELF   3
+
 // SYS_SETTING operations.
 #define SETOP_GET        0   // a2 = SET_*                     -> value
 #define SETOP_SET        1   // a2 = SET_*, a3 = value          -> the value set

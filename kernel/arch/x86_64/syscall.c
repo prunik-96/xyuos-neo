@@ -538,6 +538,23 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3) {
             }
             return 0;
         }
+        case SYS_THREAD: {
+            if (a1 == THREAD_OP_CREATE) {
+                return (uint64_t)(int64_t)process_thread_create(a2, a3);
+            }
+            if (a1 == THREAD_OP_EXIT) {
+                process_thread_exit((int)a2);   // does not return
+                return 0;
+            }
+            if (a1 == THREAD_OP_JOIN) {
+                return (uint64_t)(int64_t)process_thread_join((int)a2);
+            }
+            if (a1 == THREAD_OP_SELF) {
+                process_t *me = process_current();
+                return me ? (uint64_t)(int64_t)me->pid : (uint64_t)-1;
+            }
+            return (uint64_t)-1;
+        }
         case SYS_VM: {
             // The dispatcher has three arguments and protect needs four
             // things said, so the protection travels in the top of the op --

@@ -13,6 +13,7 @@
 #define WAIT_KEY   2   // in a read-key syscall, woken by the keyboard IRQ
 #define WAIT_TIME  3   // sleeping; woken by the timer once wake_at passes
 #define WAIT_PIPE  4   // in a pipe read/write, woken by the other end
+#define WAIT_THREAD 5  // in thread_join(), woken when that thread ends
 
 // A standard stream is one of three things. This replaces the old "vfs fd or
 // -1 for terminal" pair with something that can also name a pipe endpoint.
@@ -38,6 +39,14 @@ typedef enum {
 typedef struct process {
     int          pid;
     int          parent_pid;   // 0 when spawned by the kernel
+
+    // A thread is a process that shares another's memory. It has its own
+    // everything else, and on the way out it must skip the three things that
+    // belong to the program rather than to it -- see process_notify_exit.
+    int          is_thread;
+    int          tgid;         // pid of the program these threads belong to
+    uint64_t     tstack;       // the mapping its user stack lives in, or 0
+    uint64_t     tstack_len;
     proc_state_t state;
     // Suspended by the task manager. Deliberately NOT a proc_state_t value:
     // a stopped process keeps whatever state it had, so resuming it does not
@@ -48,14 +57,15 @@ typedef struct process {
     unsigned long long ticks;
     char         name[PROC_NAME_MAX];
 
-    uint64_t pml4;        // physical address of this process's PML4
-    uint64_t entry;
-    uint64_t brk;         // heap break, per process
+    // The memory: page tables, heap break, mappings. A pointer, because more
+    // than one process can share one -- see addr_space_t in mm/vmm.h.
+    addr_space_t *as;
 
-    // What this process has asked to have mapped, beyond its image, heap and
-    // stack. Placed from the top of the window downwards; the heap grows up
-    // towards them and neither may pass the other. See kernel/mm/vmm.c.
-    vm_region_t vm[VM_REGIONS_MAX];
+    // The same page tables as as->pml4, kept here as well because activate()
+    // reaches for it on every switch and one dereference less is worth the
+    // duplication. Set when `as` is set and never separately.
+    uint64_t pml4;
+    uint64_t entry;
 
     // Kernel stack. The CPU switches to this (via TSS.RSP0) on every trap out
     // of ring 3, and syscalls run on it too, so each process needs its own --
@@ -97,6 +107,13 @@ typedef struct process {
 // Create a process from an ELF on the filesystem and put it on the run queue,
 // WITHOUT running it. Returns the pid, or -1 if it could not be loaded.
 int process_spawn(const char *path, int argc, const char *const *argv);
+
+// --- threads ---------------------------------------------------------------
+// `entry` is a user address called with `arg` in the first argument register.
+// It must not return: libc's trampoline calls process_thread_exit for it.
+int  process_thread_create(uint64_t entry, uint64_t arg);
+void process_thread_exit(int code) __attribute__((noreturn));
+int  process_thread_join(int tid);
 
 // Same, from an image already in memory (tcc is still a GRUB module).
 int process_spawn_image(const char *name, const void *elf_data, uint64_t size,

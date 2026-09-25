@@ -102,13 +102,9 @@ static process_t *proc_alloc(const char *name) {
         p->pid = next_pid++;
         p->parent_pid = current ? current->pid : 0;
         p->state = PROC_READY;
+        p->as = 0;            // given one by whoever is starting it
         p->pml4 = 0;
         p->entry = 0;
-        p->brk = USER_HEAP_BASE;
-        for (int r = 0; r < VM_REGIONS_MAX; r++) {
-            p->vm[r].base = 0;
-            p->vm[r].len = 0;
-        }
         p->exit_code = 0;
         p->kstack = NULL;
         p->resume_kernel = 0;
@@ -136,7 +132,8 @@ static void proc_reap(process_t *p) {
 
 // Failure path for a process that was never started.
 static void proc_abandon(process_t *p) {
-    if (p->pml4) paging_free_address_space(p->pml4);
+    vmm_space_unref(p->as);
+    p->as = 0;
     p->pml4 = 0;
     proc_reap(p);
 }
@@ -225,12 +222,13 @@ int process_spawn_image(const char *name, const void *elf_data, uint64_t size,
         return -1;
     }
 
-    p->pml4 = paging_new_address_space();
-    if (!p->pml4) {
+    p->as = vmm_space_new();
+    if (!p->as) {
         kprintf("process: out of memory creating an address space\n");
         p->state = PROC_UNUSED;
         return -1;
     }
+    p->pml4 = p->as->pml4;
 
     if (elf_load_into(p->pml4, elf_data, size, &p->entry) != 0) {
         proc_abandon(p);
@@ -380,7 +378,9 @@ static int spawn_from_user(uint64_t upath, uint64_t uargv, int argc,
         if (fd < 0) {
             kprintf("spawn: cannot read '%s'\n", in_path);
             child->state = PROC_UNUSED;   // never ran; nothing to unwind
-            paging_free_address_space(child->pml4);
+            vmm_space_unref(child->as);
+            child->as = 0;
+            child->pml4 = 0;
             if (child->kstack) kfree(child->kstack);
             return -1;
         }
@@ -842,6 +842,33 @@ int process_wait(int pid) {
 }
 
 // Wake a parent blocked in process_wait() for this child.
+// Anyone sitting in thread_join for this one.
+static void wake_joiners_of(process_t *dead) {
+    for (int i = 0; i < MAX_PROCESSES; i++) {
+        process_t *p = &proc_table[i];
+        if (p->state != PROC_BLOCKED) continue;
+        if (p->wait_reason != WAIT_THREAD) continue;
+        if (p->waiting_for != dead->pid) continue;
+        p->state = PROC_READY;
+    }
+}
+
+// A thread has no parent to reap it, and it cannot free its own kernel stack
+// while standing on it. So it is left a zombie and collected here, which is
+// only ever called from somebody else's context.
+static void reap_dead_threads(void) {
+    for (int i = 0; i < MAX_PROCESSES; i++) {
+        process_t *p = &proc_table[i];
+        if (p == current) continue;
+        if (!p->is_thread || p->state != PROC_ZOMBIE) continue;
+        vmm_space_unref(p->as);
+        p->as = 0;
+        p->pml4 = 0;
+        p->is_thread = 0;
+        proc_reap(p);
+    }
+}
+
 static void wake_parent_of(process_t *dead) {
     if (!dead->parent_pid) return;
     process_t *parent = find_by_pid(dead->parent_pid);
@@ -865,11 +892,20 @@ void process_notify_exit(int code) {
     // disk, and a pipe's close (EOF / SIGPIPE) must reach the other end, before
     // the parent is woken and reads what the child produced. stream_release
     // reads current->pid, and current is still `dead` at this point.
-    stream_release(&dead->in);
-    stream_release(&dead->out);
+    if (dead->is_thread) {
+        // None of what follows is a thread's to do: the streams belong to the
+        // program, the parent is not waiting on a thread, and the window
+        // manager must not be told the program has finished -- it has not.
+        // Its user stack, though, is its own and goes back now.
+        if (dead->tstack) vmm_munmap(dead->tstack, dead->tstack_len);
+        wake_joiners_of(dead);
+    } else {
+        stream_release(&dead->in);
+        stream_release(&dead->out);
 
-    wake_parent_of(dead);
-    wm_notify_exit(dead->pid);   // hand the pane a fresh shell, if it had one
+        wake_parent_of(dead);
+        wm_notify_exit(dead->pid);  // hand the pane a fresh shell, if it had one
+    }
 
     // The address space can go now, but NOT the kernel stack: this code is
     // running on it. The stack is freed when the process is reaped, which
@@ -881,8 +917,18 @@ void process_notify_exit(int code) {
         current = NULL;
         paging_switch(kernel_space);
     }
-    paging_free_address_space(dead->pml4);
-    dead->pml4 = 0;
+    // One fewer holder. When the last one goes the page tables and every
+    // user page in them go with it; while others remain, nothing happens
+    // here at all.
+    //
+    // A thread is the exception: it is still standing on a kernel stack
+    // inside this address space, so its share is given up by whoever reaps
+    // it, once nothing is running in it any more.
+    if (!dead->is_thread) {
+        vmm_space_unref(dead->as);
+        dead->as = 0;
+        dead->pml4 = 0;
+    }
 
     // Nobody will ever reap a process the kernel started, so retire it here.
     if (!dead->parent_pid) proc_reap(dead);
@@ -964,12 +1010,116 @@ int process_run(const char *path, int argc, const char *const *argv) {
     return process_run_all();
 }
 
+// --- threads ---------------------------------------------------------------
+
+// A megabyte of address space each, built a page at a time as it is used, so
+// a thread that needs a few hundred bytes of stack costs one page.
+#define THREAD_STACK_SIZE (1024 * 1024ULL)
+
+int process_thread_create(uint64_t entry, uint64_t arg) {
+    if (!current || !current->as) return -1;
+    if (!vmm_user_range_ok(entry, 1)) return -1;
+
+    reap_dead_threads();
+
+    process_t *me = current;
+    process_t *t = proc_alloc(me->name);
+    if (!t) return -1;
+
+    /* The whole of what a thread shares. */
+    t->as = me->as;
+    vmm_space_ref(t->as);
+    t->pml4 = me->pml4;
+    t->is_thread = 1;
+    t->tgid = me->is_thread ? me->tgid : me->pid;
+    t->entry = entry;
+
+    /* Not a child of anybody: a parent waiting for its children must not be
+     * woken by a thread of one of them finishing. */
+    t->parent_pid = 0;
+
+    /* Where its output goes. Copied, not owned -- the streams belong to the
+     * program, and the thread must not release them when it ends. */
+    t->in = me->in;
+    t->out = me->out;
+
+    t->kstack = (uint8_t *)kmalloc(KSTACK_SIZE);
+    if (!t->kstack) {
+        vmm_space_unref(t->as);
+        t->as = 0;
+        t->state = PROC_UNUSED;
+        return -1;
+    }
+    t->kstack_top = ((uint64_t)(uintptr_t)t->kstack + KSTACK_SIZE) & ~0xFULL;
+
+    /* Its user stack is an ordinary mapping in the shared address space, so
+     * it costs nothing until the thread goes deep enough to need it, and the
+     * page below it belongs to nobody. */
+    uint64_t st = vmm_mmap(THREAD_STACK_SIZE, VM_READ | VM_WRITE);
+    if (!st) {
+        kfree(t->kstack);
+        t->kstack = 0;
+        vmm_space_unref(t->as);
+        t->as = 0;
+        t->state = PROC_UNUSED;
+        return -1;
+    }
+    t->tstack = st;
+    t->tstack_len = THREAD_STACK_SIZE;
+
+    build_initial_frame(t, (st + THREAD_STACK_SIZE - 16) & ~0xFULL);
+
+    /* The argument, in the register the ABI passes the first one in. The
+     * frame is fifteen saved registers in the order the interrupt stub pops
+     * them -- r15 lowest -- which puts rdi tenth. */
+    ((uint64_t *)(uintptr_t)t->saved_rsp)[9] = arg;
+
+    __asm__ volatile ("fxsave (%0)" : : "r"(t->fxstate) : "memory");
+    t->state = PROC_READY;
+    return t->pid;
+}
+
+void process_thread_exit(int code) {
+    if (current && !current->is_thread) {
+        /* The program itself called this. Ending only "the thread" would
+         * leave a program with nothing running in it, so treat it as the
+         * program exiting, which is what was meant. */
+        process_notify_exit(code);
+    }
+    process_notify_exit(code);      /* noreturn either way */
+    for (;;) { __asm__ volatile ("hlt"); }
+}
+
+int process_thread_join(int tid) {
+    if (!current) return -1;
+
+    for (;;) {
+        reap_dead_threads();
+
+        process_t *t = find_by_pid(tid);
+        if (!t) return 0;                      /* already gone, and reaped */
+        if (!t->is_thread) return -1;          /* not a thread of ours */
+        if (t == current) return -1;           /* joining itself never ends */
+        if (t->state == PROC_ZOMBIE) {
+            reap_dead_threads();
+            return 0;
+        }
+
+        current->wait_reason = WAIT_THREAD;
+        current->waiting_for = tid;
+        current->state = PROC_BLOCKED;
+        block_current();
+        current->wait_reason = WAIT_NONE;
+    }
+}
+
 // --- per-process heap ------------------------------------------------------
 
 uint64_t process_sbrk(int64_t increment) {
     if (!current) return (uint64_t)-1;
 
-    uint64_t old = current->brk;
+    if (!current->as) return (uint64_t)-1;
+    uint64_t old = current->as->brk;
     if (increment == 0) return old;
 
     if (increment > 0) {
@@ -987,11 +1137,11 @@ uint64_t process_sbrk(int64_t increment) {
         // the whole of it now would be frames spent on memory nobody reads.
         // Moving the break is the whole of the work; the pages appear as they
         // are touched.
-        current->brk = old + (uint64_t)increment;
+        current->as->brk = old + (uint64_t)increment;
     } else {
         uint64_t shrink = (uint64_t)(-increment);
         if (shrink > old - USER_HEAP_BASE) return (uint64_t)-1;
-        current->brk = old - shrink;
+        current->as->brk = old - shrink;
     }
     return old;
 }
