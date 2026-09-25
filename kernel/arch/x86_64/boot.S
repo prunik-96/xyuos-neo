@@ -143,6 +143,10 @@ enable_paging:
     mov $0xC0000080, %ecx                   # EFER MSR
     rdmsr
     or $(1 << 8), %eax                      # long mode enable
+    or $(1 << 11), %eax                     # NXE: bit 63 of a page table
+                                            # entry means "never execute this".
+                                            # Without this it is a reserved
+                                            # bit and setting it faults.
     wrmsr
 
     mov %cr0, %eax

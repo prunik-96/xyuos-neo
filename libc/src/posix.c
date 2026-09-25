@@ -93,17 +93,6 @@ int execvp(const char *file, char *const argv[]) {
     return -1;
 }
 
-/* --- memory protection ---------------------------------------------------
- * One flat identity-mapped address space with no NX enforcement: every page a
- * program can reach is already readable, writable and executable, so there is
- * genuinely nothing to change and reporting success is accurate. This is what
- * makes tcc's -run mode work -- it relocates generated code into ordinary
- * malloc'd memory and jumps straight into it.
- */
-int mprotect(void *addr, size_t len, int prot) {
-    (void)addr; (void)len; (void)prot;
-    return 0;
-}
 
 int ftruncate(int fd, unsigned long length) {
     if (fd < FD_OFFSET) return -1;

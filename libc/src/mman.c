@@ -6,6 +6,7 @@
  */
 
 #include <sys/mman.h>
+#include <xyuos_syscall.h>
 #include <dirent.h>
 #include <unistd.h>
 #include <stdlib.h>
@@ -21,9 +22,16 @@ void *mmap(void *addr, size_t length, int prot, int flags, int fd,
     if (length == 0) { errno = EINVAL; return MAP_FAILED; }
 
     if (flags & MAP_ANONYMOUS) {
-        void *p = calloc(1, length);          /* a fresh mapping reads as zero */
-        if (p == NULL) { errno = ENOMEM; return MAP_FAILED; }
-        return p;
+        /* A real mapping now: address space from the kernel, at the top of
+         * the window, with no pages behind it until they are touched. That
+         * is the difference that matters -- asking for a hundred megabytes
+         * and using one costs one page, where a calloc cost a hundred
+         * megabytes of zeroing. */
+        long r = xyuos_syscall3(SYS_VM,
+                                VM_OP_MAP | ((long)prot << 8),
+                                (long)length, 0);
+        if (r == 0) { errno = ENOMEM; return MAP_FAILED; }
+        return (void *)r;
     }
 
     /* Writes to a shared mapping are supposed to reach the file and every
@@ -53,9 +61,34 @@ void *mmap(void *addr, size_t length, int prot, int flags, int fd,
 }
 
 int munmap(void *addr, size_t length) {
-    (void)length;                  /* the block is freed whole, as it was made */
     if (addr == NULL || addr == MAP_FAILED) { errno = EINVAL; return -1; }
+
+    /* Ask the kernel first and fall back to free(). A pointer from here is
+     * either a mapping it knows about or a block from the file-backed path
+     * below, which is ordinary heap -- and asking is a cheaper way to tell
+     * them apart than keeping a table that could disagree with the kernel. */
+    if (xyuos_syscall3(SYS_VM, VM_OP_UNMAP, (long)addr, (long)length) == 0)
+        return 0;
+
     free(addr);
+    return 0;
+}
+
+int mprotect(void *addr, size_t length, int prot) {
+    if (addr == NULL) { errno = EINVAL; return -1; }
+    if (xyuos_syscall3(SYS_VM, VM_OP_PROTECT | ((long)prot << 8),
+                       (long)addr, (long)length) == 0)
+        return 0;
+
+    /* Not a mapping. Ordinary heap memory is readable, writable AND
+     * executable here and has no protection of its own to change, so there
+     * is genuinely nothing to do and saying so is accurate rather than
+     * polite.
+     *
+     * A program that wants the rights on a piece of memory actually
+     * enforced asks mmap for it and says what it is for. That is the whole
+     * arrangement: protection is a property of a mapping, and the heap is
+     * not one. */
     return 0;
 }
 

@@ -105,6 +105,10 @@ static process_t *proc_alloc(const char *name) {
         p->pml4 = 0;
         p->entry = 0;
         p->brk = USER_HEAP_BASE;
+        for (int r = 0; r < VM_REGIONS_MAX; r++) {
+            p->vm[r].base = 0;
+            p->vm[r].len = 0;
+        }
         p->exit_code = 0;
         p->kstack = NULL;
         p->resume_kernel = 0;
@@ -969,7 +973,15 @@ uint64_t process_sbrk(int64_t increment) {
     if (increment == 0) return old;
 
     if (increment > 0) {
-        if ((uint64_t)increment > USER_HEAP_LIMIT - old) return (uint64_t)-1;
+        // The heap and the mappings grow towards each other out of the same
+        // 760 MiB. Whoever asks first gets the room; the one page of daylight
+        // keeps a heap that has grown as far as it can from touching the
+        // mapping directly above it.
+        uint64_t ceiling = vmm_mmap_floor();
+        if (ceiling < USER_HEAP_BASE + 0x1000) return (uint64_t)-1;
+        ceiling -= 0x1000;
+        if (old >= ceiling) return (uint64_t)-1;
+        if ((uint64_t)increment > ceiling - old) return (uint64_t)-1;
         // Nothing is mapped here. malloc asks for a quarter of a megabyte at
         // a time and typically writes a few hundred bytes of it, so building
         // the whole of it now would be frames spent on memory nobody reads.

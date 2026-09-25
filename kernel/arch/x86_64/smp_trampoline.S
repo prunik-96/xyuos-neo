@@ -54,6 +54,8 @@ ap_pm32:
     mov $0xC0000080, %ecx             # EFER
     rdmsr
     or  $(1 << 8), %eax               # EFER.LME
+    or  $(1 << 11), %eax              # EFER.NXE -- per processor, so every
+                                      # core needs it, not just the first
     wrmsr
 
     mov %cr0, %eax

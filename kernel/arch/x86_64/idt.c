@@ -211,7 +211,7 @@ void isr_handler(struct interrupt_frame *frame) {
             // this was, the page is there now and the instruction can simply
             // be run again.
             if (frame->int_no == 14 &&
-                vmm_fault(cr2, (int)(frame->err_code & 2)))
+                vmm_fault(cr2, frame->err_code))
                 return;
             kprintf("process %d faulted: %s rip=%x:%x cr2=%x:%x -- terminated\n",
                     p->pid, name,
@@ -236,7 +236,7 @@ void isr_handler(struct interrupt_frame *frame) {
     if (frame->int_no == 14) {
         uint64_t cr2 = 0;
         __asm__ volatile ("mov %%cr2, %0" : "=r"(cr2));
-        if (vmm_fault(cr2, (int)(frame->err_code & 2))) return;
+        if (vmm_fault(cr2, frame->err_code)) return;
     }
 
     // Any other kernel-mode fault is unrecoverable. Paint the full panic

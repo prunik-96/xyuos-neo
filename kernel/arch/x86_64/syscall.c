@@ -538,6 +538,19 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3) {
             }
             return 0;
         }
+        case SYS_VM: {
+            // The dispatcher has three arguments and protect needs four
+            // things said, so the protection travels in the top of the op --
+            // it is three bits, and growing the dispatcher for one caller
+            // would be the tail wagging the dog.
+            uint64_t op = a1 & 0xFF;
+            uint32_t prot = (uint32_t)(a1 >> 8);
+            if (op == VM_OP_MAP)     return vmm_mmap(a2, prot);
+            if (op == VM_OP_UNMAP)   return (uint64_t)(int64_t)vmm_munmap(a2, a3);
+            if (op == VM_OP_PROTECT) return (uint64_t)(int64_t)
+                                            vmm_mprotect(a2, a3, prot);
+            return (uint64_t)-1;
+        }
         case SYS_GFX: {
             struct pane *p = my_pane();
             if (!p) return (uint64_t)-1;

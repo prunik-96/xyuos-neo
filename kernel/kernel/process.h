@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include "../arch/x86_64/syscall.h"   // struct si_proc, for process_list()
+#include "../mm/vmm.h"
 
 #define PROC_NAME_MAX 32
 
@@ -50,6 +51,11 @@ typedef struct process {
     uint64_t pml4;        // physical address of this process's PML4
     uint64_t entry;
     uint64_t brk;         // heap break, per process
+
+    // What this process has asked to have mapped, beyond its image, heap and
+    // stack. Placed from the top of the window downwards; the heap grows up
+    // towards them and neither may pass the other. See kernel/mm/vmm.c.
+    vm_region_t vm[VM_REGIONS_MAX];
 
     // Kernel stack. The CPU switches to this (via TSS.RSP0) on every trap out
     // of ring 3, and syscalls run on it too, so each process needs its own --

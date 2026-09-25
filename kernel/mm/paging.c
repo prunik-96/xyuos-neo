@@ -130,7 +130,8 @@ int paging_map(uint64_t pml4_phys, uint64_t vaddr, uint64_t paddr, uint64_t flag
     uint64_t *pt = next_level(pd, idx_pd(vaddr), 1, flags);
     if (!pt) return -1;
 
-    pt[idx_pt(vaddr)] = (paddr & ADDR_MASK) | (flags & 0xFFF) | PAGE_PRESENT;
+    pt[idx_pt(vaddr)] = (paddr & ADDR_MASK) | (flags & 0xFFF)
+                      | (flags & PAGE_NX) | PAGE_PRESENT;
     return 0;
 }
 
@@ -214,4 +215,59 @@ void paging_free_address_space(uint64_t pml4_phys) {
 
     pmm_free_frame(pdpt_phys);
     pmm_free_frame(pml4_phys);
+}
+
+/* --- changing a mapping after the fact ------------------------------------ */
+
+static void invlpg(uint64_t v) {
+    __asm__ volatile ("invlpg (%0)" :: "r"((void *)(uintptr_t)v) : "memory");
+}
+
+/* Walk to the page table entry for `v`, or NULL. Never creates anything:
+ * both callers below are only interested in pages that already exist. */
+static uint64_t *pte_of(uint64_t pml4_phys, uint64_t v) {
+    uint64_t *pml4 = phys_to_ptr(pml4_phys);
+    uint64_t *pdpt = next_level(pml4, idx_pml4(v), 0, 0);
+    if (!pdpt) return 0;
+    uint64_t *pd = next_level(pdpt, idx_pdpt(v), 0, 0);
+    if (!pd) return 0;
+    uint64_t pde = pd[idx_pd(v)];
+    if (!(pde & PAGE_PRESENT)) return 0;
+    if (pde & 0x80) return 0;            /* a 2 MiB page has no table below */
+    uint64_t *pt = phys_to_ptr(pde & ADDR_MASK);
+    if (!(pt[idx_pt(v)] & PAGE_PRESENT)) return 0;
+    return &pt[idx_pt(v)];
+}
+
+void paging_protect(uint64_t pml4_phys, uint64_t vaddr, uint64_t bytes,
+                    uint64_t flags) {
+    uint64_t start = vaddr & ~0xFFFULL;
+    uint64_t end = (vaddr + bytes + 0xFFF) & ~0xFFFULL;
+    for (uint64_t v = start; v < end; v += PAGE_SIZE) {
+        uint64_t *e = pte_of(pml4_phys, v);
+        if (!e) continue;
+        *e = (*e & ADDR_MASK) | (flags & 0xFFF) | (flags & PAGE_NX)
+           | PAGE_PRESENT;
+        invlpg(v);
+    }
+}
+
+int paging_unmap(uint64_t pml4_phys, uint64_t vaddr, uint64_t bytes) {
+    uint64_t start = vaddr & ~0xFFFULL;
+    uint64_t end = (vaddr + bytes + 0xFFF) & ~0xFFFULL;
+    int n = 0;
+    for (uint64_t v = start; v < end; v += PAGE_SIZE) {
+        uint64_t *e = pte_of(pml4_phys, v);
+        if (!e) continue;
+        uint64_t frame = *e & ADDR_MASK;
+        *e = 0;
+        invlpg(v);
+        pmm_free_frame(frame);
+        n++;
+    }
+    /* The page tables themselves are left standing. They are one frame per
+     * two megabytes of address space and a program that unmaps something
+     * usually maps something else nearby; walking them to find empty ones
+     * would cost more than it saves. */
+    return n;
 }

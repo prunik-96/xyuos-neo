@@ -1,11 +1,18 @@
-/* Mapping a file into memory.
+/* Mapping memory, and mapping a file into it.
  *
- * There is no demand paging behind this. A read-only mapping is read in full
- * when it is asked for, and munmap gives the memory back. For a program that
- * maps a file to read it -- which is every caller here -- that is the same
- * thing observed from the outside: the same bytes at the same addresses for
- * the same lifetime. What it is not is cheap for a large file, and it is not
- * shared between programs.
+ * ANONYMOUS mappings are real: the kernel hands out address space at the top
+ * of the process window and puts pages behind it only as they are touched.
+ * Asking for a hundred megabytes and using one costs one page. mprotect
+ * changes what a mapping may be used for afterwards, and a mapping that was
+ * not asked to be executable is marked never-executable in the page tables --
+ * which is what makes it possible to have memory that can be written and
+ * memory that can be run, and not both at once.
+ *
+ * FILE mappings are not. A read-only file mapping is read in full when it is
+ * asked for, and munmap gives the memory back. For a program that maps a file
+ * to read it -- which is every caller here -- that is the same thing observed
+ * from the outside: the same bytes at the same addresses for the same
+ * lifetime. What it is not is cheap for a large file, and it is not shared.
  *
  * A writable shared mapping is a different promise -- that writes reach the
  * file and other readers -- and this cannot keep it, so it is refused rather
@@ -37,6 +44,11 @@ extern "C" {
  * chosen address, and says so by failing rather than putting it elsewhere. */
 void *mmap(void *addr, size_t length, int prot, int flags, int fd, long offset);
 int   munmap(void *addr, size_t length);
+
+/* Change what a whole anonymous mapping may be used for. The address and
+ * length must be the ones mmap returned: half of a mapping is a real thing to
+ * ask for and nothing here needs it, so it is refused rather than guessed. */
+int   mprotect(void *addr, size_t length, int prot);
 
 #ifdef __cplusplus
 }

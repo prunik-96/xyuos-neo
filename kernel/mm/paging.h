@@ -39,6 +39,11 @@
 #define PAGE_PRESENT 0x001ULL
 #define PAGE_WRITE   0x002ULL
 #define PAGE_USER    0x004ULL
+// "Never execute what is in this page." Only meaningful once EFER.NXE is on,
+// which boot.S and the SMP trampoline both do. The processor ORs this bit
+// down the whole walk, so an intermediate table must never carry it or
+// everything beneath it becomes unexecutable.
+#define PAGE_NX      0x8000000000000000ULL
 
 #define USER_PDPT_INDEX 1ULL
 #define USER_VIRT_BASE  0x40000000ULL   /* 1 GiB */
@@ -76,5 +81,16 @@ uint64_t paging_current(void);
 // Free every user page and page table of the space, then the PDPT and PML4.
 // The shared kernel entries are left alone.
 void paging_free_address_space(uint64_t pml4_phys);
+
+// Change the rights on pages that are already mapped, leaving the frames
+// where they are. Addresses in the range that are not mapped are skipped --
+// a region built on demand is mostly holes, and they will be built with the
+// new rights when they are touched.
+void paging_protect(uint64_t pml4_phys, uint64_t vaddr, uint64_t bytes,
+                    uint64_t flags);
+
+// Remove the mapping and give the frame back. Returns the number of pages
+// that were actually there.
+int paging_unmap(uint64_t pml4_phys, uint64_t vaddr, uint64_t bytes);
 
 #endif

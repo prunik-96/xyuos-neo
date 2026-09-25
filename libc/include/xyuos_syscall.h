@@ -102,6 +102,15 @@ struct msgbox_req {
 #define SI_MEM    0
 #define SI_PROCS  1
 #define SYS_SETTING   45  /* op=a1, key=a2, value=a3 -> the value, or -1 */
+#define SYS_VM        46  // op=a1: 0 map, 1 unmap, 2 protect
+
+// What a program may do with a piece of memory. The same three bits libc
+// spells PROT_READ / PROT_WRITE / PROT_EXEC.
+// a1 = op | (protection << 8), because the dispatcher has three arguments
+// and protect needs to say four things.
+#define VM_OP_MAP      0   // a2 = length                -> address, or 0
+#define VM_OP_UNMAP    1   // a2 = address, a3 = length  -> 0, or -1
+#define VM_OP_PROTECT  2   // a2 = address, a3 = length  -> 0, or -1
 
 /* SYS_SETTING operations. */
 #define SETOP_GET        0   /* a2 = SET_*                    -> value        */
