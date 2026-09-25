@@ -109,12 +109,9 @@ static struct pane *my_pane(void) {
     return 0;
 }
 
-uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3) {
-    // A process marked for interruption dies here, before running the syscall
-    // it was about to. This is a safe point: no fd is open, no buffer half
-    // written. Never returns when it fires.
-    process_check_kill();
-
+static uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
+                           struct syscall_frame *f) {
+    (void)f;
     switch (num) {
         case SYS_WRITE: {
             const char *buf = (const char *)(uintptr_t)a1;
@@ -173,9 +170,28 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3) {
             // `sti; hlt` inside the kernel, which does not deadlock but does
             // stall every other process, because the timer never preempts
             // ring 0. Sleeping hands the CPU to somebody else instead.
-            char c;
-            while (!keyboard_poll(&c)) process_block_on_key();
+            char c = 0;
+            // A signal with a handler breaks the wait. The value returned
+            // here is thrown away: the call is put back and happens again
+            // once the handler is done, so the program still ends up with the
+            // key it asked for.
+            while (!keyboard_poll(&c)) if (process_block_on_key()) break;
             return (uint64_t)(uint8_t)c;
+        }
+        case SYS_SIGNAL: {
+            switch (a1) {
+                case SIGOP_HANDLER: return signal_set_handler((int)a2, a3);
+                case SIGOP_SEND:
+                    return (uint64_t)(int64_t)signal_send((int)a2, (int)a3);
+                case SIGOP_RETURN:  return signal_return(f, a2);
+                case SIGOP_TRAMP:
+                    return (uint64_t)(int64_t)signal_set_trampoline(a2);
+                case SIGOP_ALARM:
+                    return (uint64_t)(int64_t)signal_alarm(a2);
+                case SIGOP_MASK:
+                    return (uint64_t)signal_mask((int)a2, (uint32_t)a3);
+                default: return (uint64_t)-1;
+            }
         }
         case SYS_HYPER: {
             wm_request_split();
@@ -220,18 +236,24 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3) {
                                                  (const char *)(uintptr_t)a2);
         }
         case SYS_READEVENT: {
-            struct kbd_event ev;
+            // Zeroed because a signal can break the wait below before any
+            // event has been read. What is returned then is discarded: the
+            // call is put back and happens again after the handler.
+            struct kbd_event ev = (struct kbd_event){0};
             struct pane *p = my_pane();
             if (p) {
                 // Pane owners read their OWN queue, filled by the WM only while
                 // they hold focus. That is what keeps a background pane from
                 // stealing the keyboard.
-                while (!wm_pane_pop_event(p, &ev)) process_block_on_key();
+                while (!wm_pane_pop_event(p, &ev)) if (process_block_on_key()) break;
             } else {
                 // No window: read the raw ring, which now carries both edges.
                 // A blocking "give me a keystroke" means a key going down.
                 for (;;) {
-                    if (!keyboard_poll_event(&ev)) { process_block_on_key(); continue; }
+                    if (!keyboard_poll_event(&ev)) {
+                        if (process_block_on_key()) break;
+                        continue;
+                    }
                     if (ev.pressed) break;
                 }
             }
@@ -724,7 +746,12 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3) {
                 p->in_pos = 0;
                 for (;;) {
                     struct kbd_event ev;
-                    while (!wm_pane_pop_event(p, &ev)) process_block_on_key();
+                    // This one is NOT interruptible. The half-typed line lives
+                    // in the pane, and putting the call back would start it
+                    // again from nothing -- the person would watch their own
+                    // typing disappear. The handler runs when the line is done.
+                    while (!wm_pane_pop_event(p, &ev))
+                        if (process_block_on_key()) signal_no_restart();
 
                     if (ev.code == KEY_ENTER) {
                         if (p->in_len < PANE_INPUT_MAX) p->in_line[p->in_len++] = '\n';
@@ -767,4 +794,21 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3) {
         default:
             return (uint64_t)-1;
     }
+}
+
+// Every syscall goes in and out through here, which is the only place that
+// sees both ends of one: the safe point before it runs, and the frame it is
+// about to return through.
+uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
+                          struct syscall_frame *f) {
+    // Anything pending that needs no user code happens BEFORE the call the
+    // process was about to make. This is a safe point: no fd is open, no
+    // buffer half written. Never returns when what is pending ends it.
+    signal_check();
+
+    uint64_t ret = syscall_do(num, a1, a2, a3, f);
+
+    // And on the way out, where there is a frame to bend, a handler can run.
+    signal_on_syscall_return(f, num, ret);
+    return ret;
 }

@@ -213,6 +213,15 @@ void isr_handler(struct interrupt_frame *frame) {
             if (frame->int_no == 14 &&
                 vmm_fault(cr2, frame->err_code))
                 return;
+
+            // A program is allowed to be told about its own fault instead of
+            // being ended by it -- that is what catching SIGSEGV means. If it
+            // asked for that, it is now inside its handler and this interrupt
+            // simply returns there. Only a real handler counts: returning to
+            // the same instruction with nothing changed would fault for ever,
+            // so a program that has merely ignored the signal still dies.
+            if (signal_from_fault(frame, (int)frame->int_no)) return;
+
             kprintf("process %d faulted: %s rip=%x:%x cr2=%x:%x -- terminated\n",
                     p->pid, name,
                     (unsigned)(frame->rip >> 32), (unsigned)(frame->rip & 0xFFFFFFFF),

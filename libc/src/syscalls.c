@@ -105,10 +105,6 @@ unsigned int sleep_ms(unsigned int ms) {
     return 0;
 }
 
-int kill(int pid) {
-    return (int)xyuos_syscall3(SYS_KILL, (long)pid, 0, 0);
-}
-
 unsigned int sleep(unsigned int seconds) {
     return sleep_ms(seconds * 1000);
 }

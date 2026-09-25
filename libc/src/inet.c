@@ -212,20 +212,8 @@ char *setlocale(int category, const char *locale) {
 
 struct lconv *localeconv(void) { return &c_locale; }
 
-/* --- signals, of which none are delivered -------------------------------- */
-
-/* Kept so that a program which saves a handler and puts it back gets its own
- * back. Nothing is ever delivered to any of them. */
-static sighandler_t handlers[32];
-
-sighandler_t signal(int sig, sighandler_t handler) {
-    if (sig < 0 || sig >= 32) return SIG_ERR;
-    sighandler_t was = handlers[sig];
-    handlers[sig] = handler;
-    return was;
-}
-
-int raise(int sig) { (void)sig; return 0; }
+/* Signals were a polite lie here -- remembered and never delivered. They are
+ * real now and live in signal.c. */
 
 /* --- random numbers ------------------------------------------------------ */
 

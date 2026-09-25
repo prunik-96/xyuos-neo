@@ -3325,7 +3325,10 @@ void wm_route_input(void) {
             (ev.ascii == 'c' || ev.ascii == 'C') && !p->gfx_on) {
             if (p->owner_pid > 0) {
                 int fg = process_foreground(p->owner_pid);
-                if (fg != p->owner_pid) { process_kill(fg); continue; }
+                // SIGINT, not a bare kill: a program is entitled to catch
+                // Ctrl+C and put its own things away. One that does not still
+                // ends with 130, exactly as before.
+                if (fg != p->owner_pid) { signal_send(fg, SIGINT); continue; }
             }
         }
 

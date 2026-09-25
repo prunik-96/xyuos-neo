@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include "paging.h"
+#include "../kernel/signal.h"   // NSIG: the dispositions live in here
 
 // Virtual layout of a process, all inside the private user window
 // [USER_VIRT_BASE, USER_VIRT_END) = [1 GiB, 2 GiB). Every process sees exactly
@@ -84,6 +85,16 @@ typedef struct addr_space {
     uint64_t    brk;        // heap break
     vm_region_t vm[VM_REGIONS_MAX];
     int         refs;       // how many processes share this
+
+    // What each signal does. Here rather than in the process because a
+    // handler is a function in the program's own code: every thread running
+    // that code means the same thing by it. 0 = default, 1 = ignore,
+    // anything else is the address of the handler.
+    uint64_t    sig_handler[NSIG];
+    // Where a handler returns to -- a few instructions in libc that ask the
+    // kernel to put the interrupted context back. Registered once, by libc,
+    // before the first handler is installed.
+    uint64_t    sig_tramp;
 } addr_space_t;
 
 // A fresh address space with page tables of its own, held once. Returns NULL
@@ -130,5 +141,15 @@ int      vmm_mprotect(uint64_t addr, uint64_t len, uint32_t prot);
 // The lowest address any mapping occupies, or USER_MMAP_TOP when there are
 // none. This is where the heap has to stop.
 uint64_t vmm_mmap_floor(void);
+
+// Make every page of [addr, addr + len) exist, building the ones that are
+// declared-and-not-built exactly as a touch from ring 3 would. Returns 1 if
+// the whole range can now be written, 0 if any of it cannot.
+//
+// The kernel needs this where it writes into a program's memory at a moment
+// when taking a fault would be answering the wrong question -- signal
+// delivery, which writes a frame onto a stack that may never have been that
+// deep before.
+int vmm_touch_write(uint64_t addr, uint64_t len);
 
 #endif

@@ -88,6 +88,8 @@
 #define THREAD_OP_JOIN   2
 #define THREAD_OP_SELF   3
 
+#define SYS_SIGNAL    48  // op=a1; the ops are SIGOP_* in kernel/kernel/signal.h
+
 // SYS_SETTING operations.
 #define SETOP_GET        0   // a2 = SET_*                     -> value
 #define SETOP_SET        1   // a2 = SET_*, a3 = value          -> the value set

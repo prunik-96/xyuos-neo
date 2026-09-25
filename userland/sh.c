@@ -13,6 +13,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <tty.h>
 #include "upath.h"
 
@@ -725,7 +726,7 @@ static int run_pipeline(char *stages[], int nstages) {
      * running stage EOF / a broken pipe so it exits. */
     if (failed) {
         for (int i = 0; i < npipes; i++) pipe_close(pfd[i]);
-        for (int i = 0; i < nstages; i++) if (pid[i] >= 0) kill(pid[i]);
+        for (int i = 0; i < nstages; i++) if (pid[i] >= 0) kill(pid[i], SIGKILL);
     }
 
     int last = 0;

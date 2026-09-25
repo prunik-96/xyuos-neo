@@ -37,7 +37,8 @@ RAW_USER_PROGS  := test1
 LIBC_C_PROGS    := files note view taskmgr play hello_c fstest spin parent keywait sh fm edit cc run \
                    ls cat echo wc grep head tail sort uniq tee hexdump \
                    cp mv touch stat ps free uname sleep kill loop bigfile yes count crash \
-                   plasma devmgr control web ftest netlog memtest vmtest thrtest
+                   plasma devmgr control web ftest netlog memtest vmtest thrtest \
+                   sigtest sigchild
 LIBC_CXX_PROGS  := hello_cpp
 # The interactive shell / file manager / editor now live in the kernel WM pane
 # engine (kernel/wm/), so there are no separate userland shell binaries; these
@@ -49,7 +50,8 @@ LIBC_SRCS := libc/src/syscalls.c libc/src/stdio.c libc/src/stdlib.c libc/src/str
              libc/src/string_extra.c libc/src/posix.c libc/src/scanf.c \
              libc/src/math.c libc/src/readline.c libc/src/dirstat.c \
              libc/src/inet.c libc/src/regex.c libc/src/thread.c \
-             libc/src/timecal.c libc/src/posixbits.c libc/src/mman.c
+             libc/src/timecal.c libc/src/posixbits.c libc/src/mman.c \
+             libc/src/signal.c
 LIBC_OBJS := $(patsubst libc/src/%.c,build/libc_%.o,$(LIBC_SRCS))
 LIBC_CXX_OBJS := build/libc_cxxabi_stubs.o
 LIBC_A    := build/libc.a
@@ -122,9 +124,15 @@ $(CRT0): libc/src/crt0.S
 
 # setjmp/longjmp must be assembly: they save and restore callee-saved
 # registers, the stack pointer and the return address by hand.
-LIBC_ASM_OBJS := build/libc_setjmp.o
+LIBC_ASM_OBJS := build/libc_setjmp.o build/libc_sigtramp.o
 
 build/libc_setjmp.o: libc/src/setjmp.S
+	mkdir -p build
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# Where a signal handler returns to. Assembly because it runs with the
+# stack pointer sitting exactly on the saved context and may not disturb it.
+build/libc_sigtramp.o: libc/src/sigtramp.S
 	mkdir -p build
 	$(CC) $(CFLAGS) -c $< -o $@
 
@@ -142,7 +150,7 @@ build/%_libcuser.o: userland/%.c $(wildcard libc/include/*.h) $(wildcard userlan
 # that libgcc for this target does not provide. Add a program here if it starts
 # using doubles. Programs that merely PASS doubles to printf are fine, since
 # the conversion happens inside libc.
-FP_USER_PROGS := fstest sleep ftest web
+FP_USER_PROGS := fstest sleep ftest web sigtest
 
 define FP_OBJ_RULE
 build/$(1)_libcuser.o: userland/$(1).c $$(wildcard libc/include/*.h) $$(wildcard userland/*.h)

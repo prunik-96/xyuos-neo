@@ -107,9 +107,10 @@ long xyuos_sysinfo(int what, void *buf, unsigned long len);
 unsigned int sleep(unsigned int seconds);
 unsigned int sleep_ms(unsigned int ms);
 
-/* Interrupt a process by pid (there is one signal: terminate). Returns 0, or
- * -1 if there is no such process. */
-int kill(int pid);
+/* Send a signal to a process by pid -- declared in signal.h, where the
+ * signal numbers are. Kept mentioned here because this is where it used to
+ * live, with one argument and one meaning. */
+int kill(int pid, int sig);
 
 /* Suspend / resume a process by pid. 0 on success, -1 on error. A suspended
  * process keeps its memory and its windows; it simply stops being picked. */

@@ -8,6 +8,7 @@
 // suspended by.
 
 #include "process.h"
+#include "signal.h"
 #include "elf.h"
 #include "kio.h"
 #include "../arch/x86_64/syscall.h"
@@ -63,7 +64,7 @@ struct pipe {
 };
 static struct pipe pipes[MAX_PIPES];
 
-static void process_block_on_pipe(void);
+static int  process_block_on_pipe(void);
 static void process_wake_pipe(void);
 
 // Where to go when nothing is left to run, and the address space to go back to.
@@ -87,6 +88,14 @@ process_t *process_by_pid(int pid) {
         }
     }
     return 0;
+}
+
+int process_slots(void) { return MAX_PROCESSES; }
+
+process_t *process_at(int i) {
+    if (i < 0 || i >= MAX_PROCESSES) return 0;
+    if (proc_table[i].state == PROC_UNUSED) return 0;
+    return &proc_table[i];
 }
 
 static process_t *find_by_pid(int pid) {
@@ -116,7 +125,10 @@ static process_t *proc_alloc(const char *name) {
         p->wait_reason = WAIT_NONE;
         p->waiting_for = 0;
         p->wake_at = 0;
-        p->pending_kill = 0;
+        p->sig_pending = 0;
+        p->sig_blocked = 0;
+        p->sig_restart = 0;
+        p->alarm_at = 0;
         p->in.kind = STREAM_TERM;   p->in.handle = -1;
         p->out.kind = STREAM_TERM;  p->out.handle = -1;
         int k = 0;
@@ -481,16 +493,13 @@ static void stream_release(struct pstream *s) {
             }
             if (p->reader_pid == current->pid) {
                 p->read_open = 0;
-                // SIGPIPE: a writer with no reader left has nothing to do.
-                // Terminate it (the P7 way) so `yes | head` actually stops
-                // instead of spinning on failed writes.
-                if (p->write_open && p->writer_pid) {
-                    process_t *w = process_by_pid(p->writer_pid);
-                    if (w) {
-                        w->pending_kill = 1;
-                        if (w->state == PROC_BLOCKED) w->state = PROC_READY;
-                    }
-                }
+                // A writer with no reader left has nothing to do. This used
+                // to be a bare kill; it is the real SIGPIPE now, so a
+                // program that wants to survive a closed pipe can, and one
+                // that does not still stops -- which is what makes
+                // `yes | head` end instead of spinning on failed writes.
+                if (p->write_open && p->writer_pid)
+                    signal_send(p->writer_pid, SIGPIPE);
             }
             process_wake_pipe();   // EOF for a waiting reader / space for a writer
             pipe_maybe_free(idx);
@@ -506,7 +515,14 @@ static int pipe_write(int idx, const uint8_t *buf, uint32_t len) {
     while (written < len) {
         if (!p->read_open) return (written > 0) ? (int)written : -1;  // EPIPE
         if (p->count == PIPE_BUF_SIZE) {
-            process_block_on_pipe();
+            if (process_block_on_pipe()) {
+                // A handler wants to run. Bytes already in the pipe cannot be
+                // written twice, so a part-done write is REPORTED rather than
+                // restarted -- the caller sees a short write, which is a thing
+                // write() is allowed to do and libc already loops on.
+                if (written > 0) { current->sig_restart = 0; return (int)written; }
+                return 0;    /* nothing written: the call is restarted whole */
+            }
             continue;
         }
         while (written < len && p->count < PIPE_BUF_SIZE) {
@@ -523,7 +539,9 @@ static int pipe_read(int idx, uint8_t *buf, uint32_t len) {
     struct pipe *p = &pipes[idx];
     while (p->count == 0) {
         if (!p->write_open) return 0;   // EOF
-        process_block_on_pipe();
+        // Nothing has been copied yet, so the whole call can simply happen
+        // again after the handler; the return value here is discarded.
+        if (process_block_on_pipe()) return 0;
     }
     uint32_t n = 0;
     while (n < len && p->count > 0) {
@@ -608,18 +626,21 @@ uint64_t sched_on_tick(uint64_t cur_rsp, uint64_t cs) {
     // A process spinning in ring 3 (`while (1) {}`) makes no syscalls, so the
     // timer is the only place we can interrupt it. We are on its kernel stack
     // (the IRQ from ring 3 landed here), which is exactly where the exit path
-    // expects to run. Never returns when it fires.
-    if (current->pending_kill) {
-        current->saved_rsp = cur_rsp;   // unused after exit, but keep it sane
-        process_check_kill();
-    }
+    // expects to run. Never returns when a pending signal ends it.
+    current->saved_rsp = cur_rsp;       // so the exit path sees something sane
+    signal_check();
 
     process_t *next = pick_next(current);
-    if (!next || next == current) return cur_rsp;
+    if (!next || next == current) {
+        // Staying on the CPU. This is the frame that is about to go back to
+        // ring 3, so it is the place to bend it into a signal handler.
+        signal_on_interrupt_return((struct interrupt_frame *)(uintptr_t)cur_rsp);
+        return cur_rsp;
+    }
 
     // Put the current process down: its entire register state is the frame at
-    // cur_rsp, on its own kernel stack, so remembering the pointer is enough.
-    current->saved_rsp = cur_rsp;
+    // cur_rsp, on its own kernel stack, and the pointer to it is already
+    // remembered above.
     current->resume_kernel = 0;
     current->state = PROC_READY;
     __asm__ volatile ("fxsave (%0)" : : "r"(current->fxstate) : "memory");
@@ -631,12 +652,16 @@ uint64_t sched_on_tick(uint64_t cur_rsp, uint64_t cs) {
         // it directly and never come back to this interrupt.
         kctx_restore(next->kctx, 1);
     }
+    // Its address space is in CR3 now, so its stack is the one a signal frame
+    // would be written to. This is the only moment at which that is true.
+    signal_on_interrupt_return((struct interrupt_frame *)(uintptr_t)next->saved_rsp);
     return next->saved_rsp;
 }
 
 // Give up the CPU from inside a syscall. Returns once someone has made this
-// process READY again.
-static void block_current(void) {
+// process READY again -- 1 if what made it ready was a signal with a handler
+// waiting to run, 0 otherwise.
+static int block_current(void) {
     process_t *me = current;
 
     while (me->state == PROC_BLOCKED) {
@@ -667,25 +692,34 @@ static void block_current(void) {
         g_cpu_idle = 0;
     }
 
-    // Woken. If a Ctrl+C arrived while we slept, die now instead of resuming
-    // the syscall we blocked in -- this is the safe point for it.
-    process_check_kill();
+    // Woken. If something fatal arrived while we slept, act on it now instead
+    // of resuming the syscall we blocked in -- this is the safe point for it.
+    signal_check();
+
+    // A handler cannot be run from in here: the kernel would be calling user
+    // code with a half-finished syscall underneath it. Say so instead, and
+    // let the caller unwind out to the return path, which puts the syscall
+    // back so that it happens again once the handler is done.
+    if (signal_deliverable(me)) { me->sig_restart = 1; return 1; }
+    return 0;
 }
 
-void process_block_on_key(void) {
-    if (!current) return;
+int process_block_on_key(void) {
+    if (!current) return 0;
     current->state = PROC_BLOCKED;
     current->wait_reason = WAIT_KEY;
-    block_current();
+    int sig = block_current();
     current->wait_reason = WAIT_NONE;
+    return sig;
 }
 
-static void process_block_on_pipe(void) {
-    if (!current) return;
+static int process_block_on_pipe(void) {
+    if (!current) return 0;
     current->state = PROC_BLOCKED;
     current->wait_reason = WAIT_PIPE;
-    block_current();
+    int sig = block_current();
     current->wait_reason = WAIT_NONE;
+    return sig;
 }
 
 // Wake every process blocked on a pipe. They re-check their own pipe's state,
@@ -712,6 +746,10 @@ void process_sleep_ms(uint64_t ms) {
     current->wait_reason = WAIT_TIME;
     block_current();
     current->wait_reason = WAIT_NONE;
+    // A sleep that a signal cut short has HAPPENED, just not for as long as
+    // was asked. Restarting it would sleep the whole time again, which is the
+    // one thing the program can tell the difference between.
+    current->sig_restart = 0;
 }
 
 // Called from the timer IRQ. Runs with interrupts off on whatever stack was
@@ -724,6 +762,7 @@ void process_tick(uint64_t now) {
             p->state = PROC_READY;
         }
     }
+    signal_tick(now);    // and anything whose alarm has come round
 }
 
 int process_suspend(int pid) {
@@ -772,13 +811,9 @@ void process_wake_key(void) {
 // --- interruption (Ctrl+C) -------------------------------------------------
 
 int process_kill(int pid) {
-    process_t *p = process_by_pid(pid);
-    if (!p || p->state == PROC_UNUSED || p->state == PROC_ZOMBIE) return -1;
-    p->pending_kill = 1;
-    // If it is asleep it will never reach a safe point on its own -- wake it,
-    // and it dies the instant it returns from the block.
-    if (p->state == PROC_BLOCKED) p->state = PROC_READY;
-    return 0;
+    // SIGKILL rather than SIGTERM: this is the window's close button and the
+    // task manager's End task, and neither of those is a request.
+    return signal_send(pid, SIGKILL);
 }
 
 int process_foreground(int pid) {
@@ -797,12 +832,6 @@ int process_foreground(int pid) {
     return cur;
 }
 
-void process_check_kill(void) {
-    if (current && current->pending_kill) {
-        current->pending_kill = 0;
-        process_notify_exit(130);   // 128 + SIGINT; never returns
-    }
-}
 
 void process_make_session_root(int pid) {
     // A pane's shell is a top-level session leader, not a child of whatever
@@ -841,8 +870,11 @@ int process_wait(int pid) {
         current->state = PROC_BLOCKED;
         current->wait_reason = WAIT_CHILD;
         current->waiting_for = pid;
-        block_current();
+        int sig = block_current();
         current->wait_reason = WAIT_NONE;
+        // Nothing has been reaped, so there is nothing to lose by giving up
+        // here: the call is put back and happens again after the handler.
+        if (sig) return -1;
     }
 }
 
@@ -909,6 +941,10 @@ void process_notify_exit(int code) {
         stream_release(&dead->out);
 
         wake_parent_of(dead);
+        // And tell it, in the way a parent can be told. Ignored by default,
+        // so nothing that does not ask for it notices; a parent that does ask
+        // has its wait() put back and run again, which finds this zombie.
+        if (dead->parent_pid) signal_send(dead->parent_pid, SIGCHLD);
         wm_notify_exit(dead->pid);  // hand the pane a fresh shell, if it had one
     }
 
@@ -1113,8 +1149,9 @@ int process_thread_join(int tid) {
         current->wait_reason = WAIT_THREAD;
         current->waiting_for = tid;
         current->state = PROC_BLOCKED;
-        block_current();
+        int sig = block_current();
         current->wait_reason = WAIT_NONE;
+        if (sig) return -1;   /* put back; it runs again after the handler */
     }
 }
 

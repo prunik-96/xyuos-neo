@@ -124,6 +124,19 @@ struct msgbox_req {
 #define THREAD_OP_JOIN   2
 #define THREAD_OP_SELF   3
 
+// Signals. op=a1; see signal.h for what a2 and a3 mean for each.
+#define SYS_SIGNAL    48
+#define SIGOP_HANDLER 0
+#define SIGOP_SEND    1
+#define SIGOP_RETURN  2
+#define SIGOP_TRAMP   3
+#define SIGOP_ALARM   4
+#define SIGOP_MASK    5
+
+#define SIGMASK_SET     0
+#define SIGMASK_BLOCK   1
+#define SIGMASK_UNBLOCK 2
+
 /* SYS_SETTING operations. */
 #define SETOP_GET        0   /* a2 = SET_*                    -> value        */
 #define SETOP_SET        1   /* a2 = SET_*, a3 = value        -> the value set*/

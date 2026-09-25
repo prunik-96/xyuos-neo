@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include "../arch/x86_64/syscall.h"   // struct si_proc, for process_list()
 #include "../mm/vmm.h"
+#include "signal.h"
 
 #define PROC_NAME_MAX 32
 
@@ -93,11 +94,23 @@ typedef struct process {
     uint64_t wake_at;     // tick to wake on, for WAIT_TIME
     int exit_code;
 
-    // Set by process_kill(); the process ends itself at the next SAFE point
-    // (syscall entry, wakeup from a block, or a timer tick in ring 3) rather
-    // than being torn down asynchronously mid-syscall, where it might hold
-    // open fds or point into another process's memory.
-    int pending_kill;
+    // Signals that have arrived and not yet been acted on, and the ones being
+    // held off. Nothing happens to a process the moment a signal is sent: it
+    // acts at the next SAFE point (syscall entry, wakeup from a block, or a
+    // timer tick in ring 3) rather than being torn down asynchronously
+    // mid-syscall, where it might hold open fds or point into another
+    // process's memory. See signal.h.
+    uint32_t sig_pending;
+    uint32_t sig_blocked;
+
+    // Set when a blocking syscall gave up because a signal wants to run a
+    // handler. The syscall is then put back the way it was rather than
+    // finished, so that returning from the handler runs it again -- see
+    // signal_on_syscall_return().
+    int sig_restart;
+
+    // Tick at which SIGALRM is due, or 0. Checked by the timer.
+    uint64_t alarm_at;
 
     // x87/SSE state. Userland does floating point (strtod, printf), so this
     // has to be swapped too. 16-byte aligned, as FXSAVE requires.
@@ -145,6 +158,12 @@ process_t *process_current(void);
 // deciding which pane a process may write to.
 process_t *process_by_pid(int pid);
 
+// The process table as a thing to walk: slot `i`, or NULL if it is empty.
+// For the few places that genuinely have to look at every process rather
+// than at one they can name.
+int        process_slots(void);
+process_t *process_at(int i);
+
 // Move the current process's break. Returns the PREVIOUS break, or
 // (uint64_t)-1 if the request would leave the heap region.
 uint64_t process_sbrk(int64_t increment);
@@ -190,7 +209,12 @@ int process_wait(int pid);
 // Sleep the current process until a key arrives. Used by the read-key
 // syscalls so that waiting for input does not stall every other process.
 // Returns immediately (having done nothing) if no process is running.
-void process_block_on_key(void);
+//
+// Returns 1 when it came back not because a key arrived but because a signal
+// wants to run a handler. The caller must then stop what it was doing and
+// let the syscall return -- the signal machinery puts the call back so that
+// it happens again after the handler. Returns 0 on an ordinary wakeup.
+int process_block_on_key(void);
 
 // Called from the keyboard IRQ: make every process sleeping on input runnable.
 void process_wake_key(void);
@@ -203,8 +227,9 @@ int  process_resume(int pid);
 // to another process; never returns.
 void process_notify_exit(int code);
 
-// Mark `pid` for death. It is not killed here -- it dies at its next safe
-// point (see pending_kill). A blocked process is woken so it can reach one.
+// Mark `pid` for death: SIGKILL, which cannot be caught or ignored. It is
+// not killed here -- it dies at its next safe point. A blocked process is
+// woken so it can reach one.
 // Returns 0, or -1 if there is no such live process.
 int process_kill(int pid);
 
@@ -213,10 +238,6 @@ int process_kill(int pid);
 // no living descendant (e.g. a shell sitting at its prompt). This is what
 // Ctrl+C targets.
 int process_foreground(int pid);
-
-// If the current process has been marked for death, end it now (exit code
-// 130 = 128 + SIGINT). Never returns when it fires. Call only at safe points.
-void process_check_kill(void);
 
 // Detach `pid` from its accidental parent and make it a session root
 // (parent_pid 0). The WM calls this for every pane shell, so the foreground

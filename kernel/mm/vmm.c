@@ -162,6 +162,20 @@ int vmm_mprotect(uint64_t addr, uint64_t len, uint32_t prot) {
     return 0;
 }
 
+int vmm_touch_write(uint64_t addr, uint64_t len) {
+    process_t *p = process_current();
+    if (!p || !p->as || !p->pml4 || len == 0) return 0;
+    if (!vmm_user_range_ok(addr, len)) return 0;
+
+    uint64_t first = addr & ~(PAGE - 1);
+    uint64_t last = (addr + len - 1) & ~(PAGE - 1);
+    for (uint64_t v = first; v <= last; v += PAGE) {
+        if (paging_translate(p->pml4, v)) continue;
+        if (!vmm_fault(v, PF_WRITE)) return 0;
+    }
+    return 1;
+}
+
 /* --- pages that appear when they are touched -------------------------------
  *
  * Three parts of a process are declared rather than built: the stack, which

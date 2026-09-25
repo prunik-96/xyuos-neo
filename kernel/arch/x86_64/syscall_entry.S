@@ -59,6 +59,13 @@ syscall_entry:
     mov %r10, %rdx      # a2
     mov %r11, %rcx      # a3
 
+    # Fifth argument: where the saved user state is. Everything above this
+    # point is a `struct syscall_frame` (kernel/kernel/signal.h) read from
+    # the bottom up, and signal delivery rewrites three of its fields to send
+    # the program to a handler instead of back to where it called from. The
+    # pushes and that struct must stay in step.
+    mov %rsp, %r8
+
     call syscall_dispatch
 
     pop %r10

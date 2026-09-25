@@ -16,6 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <signal.h>
 #include "xyuos_syscall.h"
 #include "gui.h"
 
@@ -228,7 +229,8 @@ static void act(int which) {
     const char *name = sel >= 0 ? procs[sel].name : "";
     switch (which) {
         case 0:
-            if (kill(pid) == 0) snprintf(status, sizeof status, "ended %s (pid %d)", name, pid);
+            /* SIGKILL: End task is not a request. */
+            if (kill(pid, SIGKILL) == 0) snprintf(status, sizeof status, "ended %s (pid %d)", name, pid);
             else snprintf(status, sizeof status, "cannot end pid %d", pid);
             break;
         case 1:
