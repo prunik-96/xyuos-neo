@@ -296,12 +296,42 @@ static int udp_send(uint32_t dstip, uint16_t sport, uint16_t dport,
     return ip_send(dstip, IPPROTO_UDP, udpseg, seglen);
 }
 
-// Single-slot capture for the reply a blocking caller is waiting on.
-static volatile int  udp_have = 0;
-static uint16_t      udp_dport, udp_sport;
-static uint32_t      udp_sip;
-static uint8_t       udp_data[1500];
-static int           udp_dlen;
+// Where a reply lands: a box for each port somebody is waiting on.
+//
+// There used to be one place, shared. Lookups do overlap -- a page names a
+// new host and all four fetch slots ask for it together -- and each answer
+// then overwrote the one before it. The slots whose answers were lost sat out
+// a 1.2-second timeout and asked again: measured on Wikipedia, one to five
+// and a half seconds for every new host.
+//
+// A box a lookup never gave back -- its program gone mid-question -- is taken
+// over once it is older than any lookup can last, three tries at 2.4 seconds
+// each, so a lost one costs nothing for good.
+#define UDP_BOXES     8
+#define UDP_BOX_STALE 10000     // ms
+typedef struct {
+    uint16_t port;              // 0 when free
+    int      have;              // a datagram is waiting in data[]
+    uint32_t sip;
+    int      len;
+    uint64_t since;             // when it was claimed
+    uint8_t  data[1500];
+} udp_box_t;
+static udp_box_t udp_boxes[UDP_BOXES];
+
+static udp_box_t *udp_box_open(uint16_t port) {
+    for (int i = 0; i < UDP_BOXES; i++) {
+        udp_box_t *b = &udp_boxes[i];
+        if (b->port && now_ms() - b->since < UDP_BOX_STALE) continue;
+        b->port = port;
+        b->have = 0;
+        b->since = now_ms();
+        return b;
+    }
+    return NULL;
+}
+
+static void udp_box_close(udp_box_t *b) { b->port = 0; b->have = 0; }
 
 // ==========================================================================
 //  ICMP (ping)
@@ -819,6 +849,39 @@ int net_resolve(const char *name, uint32_t *ip) {
     return 1;
 }
 
+// What came back for question `txid`: 1 with the first address in *ip; 0 if
+// it is the answer and there is no address in it -- no such name; -2 if the
+// server could not answer just now and asking again may help; -1 if it is not
+// the answer to this question at all.
+static int dns_answer(const uint8_t *r, int rl, uint16_t txid, uint32_t *ip) {
+    if (rl < 12 || ntohs(*(const uint16_t *)r) != txid) return -1;
+    if (!(r[2] & 0x80)) return -1;                   // a question, not an answer
+    int rcode = r[3] & 0x0F;
+    if (rcode == 3) return 0;                        // no such name
+    if (rcode != 0) return -2;                       // server failure and the like
+    uint16_t ancount = ntohs(*(const uint16_t *)(r + 6));
+    int off = 12;
+    while (off < rl && r[off]) off += r[off] + 1;    // the question's name
+    off += 1 + 4;                                    // its end, QTYPE, QCLASS
+    for (int a = 0; a < ancount && off < rl; a++) {
+        if ((r[off] & 0xC0) == 0xC0) off += 2;       // the name, as a pointer
+        else { while (off < rl && r[off]) off += r[off] + 1; off += 1; }
+        if (off + 10 > rl) break;
+        uint16_t atype = ntohs(*(const uint16_t *)(r + off));
+        uint16_t rdlen = ntohs(*(const uint16_t *)(r + off + 8));
+        off += 10;
+        if (off + rdlen > rl) break;
+        if (atype == 1 && rdlen == 4) {              // A: the address
+            uint32_t a4;
+            nmemcpy(&a4, r + off, 4);
+            *ip = ntohl(a4);
+            return 1;
+        }
+        off += rdlen;                                // a CNAME on the way to it
+    }
+    return 0;
+}
+
 // A source port and a transaction id that do not repeat while anything is
 // still waiting on the last ones. Several lookups may now be outstanding at
 // once, and the only thing telling their answers apart is this pair.
@@ -853,45 +916,27 @@ static int dns_query(const char *name, uint32_t *ip) {
     v = htons(1); nmemcpy(q + n, &v, 2); n += 2;           // QCLASS IN
 
     uint16_t sport = (uint16_t)(50000 + (tick % 8000));
+    udp_box_t *box = udp_box_open(sport);
+    if (!box) return 0;
+
+    int found = 0;
     for (int tries = 0; tries < 3; tries++) {
-        udp_have = 0;
-        if (udp_send(dns_ip, sport, 53, q, n) != 0) return 0;
+        box->have = 0;
+        if (udp_send(dns_ip, sport, 53, q, n) != 0) break;
+        int verdict = -1;
         uint64_t deadline = now_ms() + 1200;
-        while (now_ms() < deadline) {
+        while (verdict == -1 && now_ms() < deadline) {
             net_poll();
-            if (udp_have && udp_dport == sport && udp_sip == dns_ip) {
-                // Parse the answer section for the first A record.
-                uint8_t *r = udp_data;
-                int rl = udp_dlen;
-                if (rl < 12) break;
-                // Somebody else's answer, arriving on a port we happen to
-                // have been given after theirs was released.
-                if (ntohs(*(uint16_t *)r) != txid) break;
-                uint16_t ancount = ntohs(*(uint16_t *)(r + 6));
-                int off = 12;
-                // skip QNAME
-                while (off < rl && r[off]) off += r[off] + 1;
-                off += 1 + 4;               // zero byte + QTYPE + QCLASS
-                for (int a = 0; a < ancount && off + 12 <= rl; a++) {
-                    // NAME (pointer 0xC0.. or labels)
-                    if ((r[off] & 0xC0) == 0xC0) off += 2;
-                    else { while (off < rl && r[off]) off += r[off] + 1; off += 1; }
-                    uint16_t atype = ntohs(*(uint16_t *)(r + off));
-                    uint16_t rdlen = ntohs(*(uint16_t *)(r + off + 8));
-                    off += 10;
-                    if (atype == 1 && rdlen == 4) {
-                        uint32_t a4;
-                        nmemcpy(&a4, r + off, 4);
-                        *ip = ntohl(a4);
-                        return 1;
-                    }
-                    off += rdlen;
-                }
-                break;
-            }
+            if (!box->have) continue;
+            if (box->sip == dns_ip) verdict = dns_answer(box->data, box->len, txid, ip);
+            box->have = 0;                       // room for the next one
         }
+        if (verdict == 1) { found = 1; break; }
+        if (verdict == 0) break;                 // an answer, and it is no
+        // Silence, or a server that could not say: ask again.
     }
-    return 0;
+    udp_box_close(box);
+    return found;
 }
 
 // ==========================================================================
@@ -1427,7 +1472,6 @@ static void handle_arp(const uint8_t *p, int len) {
 static void handle_udp(uint32_t srcip, const uint8_t *p, int len) {
     if (len < (int)sizeof(udp_hdr_t)) return;
     const udp_hdr_t *u = (const udp_hdr_t *)p;
-    uint16_t sport = ntohs(u->src_port);
     uint16_t dport = ntohs(u->dst_port);
     int dlen = (int)ntohs(u->length) - sizeof(udp_hdr_t);
     if (dlen < 0 || dlen > len - (int)sizeof(udp_hdr_t)) dlen = len - sizeof(udp_hdr_t);
@@ -1440,14 +1484,18 @@ static void handle_udp(uint32_t srcip, const uint8_t *p, int len) {
         dhcp_have = 1;
         return;
     }
-    // generic capture (DNS)
-    if (dlen > (int)sizeof(udp_data)) dlen = sizeof(udp_data);
-    nmemcpy(udp_data, data, dlen);
-    udp_dlen = dlen;
-    udp_sport = sport;
-    udp_dport = dport;
-    udp_sip = srcip;
-    udp_have = 1;
+    // A reply somebody is waiting for, into its own box. Nobody waiting on
+    // the port means nobody asked, and it is dropped.
+    for (int i = 0; i < UDP_BOXES; i++) {
+        udp_box_t *b = &udp_boxes[i];
+        if (b->port != dport || b->have) continue;
+        if (dlen > (int)sizeof b->data) dlen = sizeof b->data;
+        nmemcpy(b->data, data, dlen);
+        b->len = dlen;
+        b->sip = srcip;
+        b->have = 1;
+        return;
+    }
 }
 
 static void handle_icmp(uint32_t srcip, const uint8_t *p, int len) {
