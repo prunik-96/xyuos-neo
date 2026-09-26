@@ -345,15 +345,24 @@ int net_ping(uint32_t ip, uint32_t *rtt_us) {
 // files that follow it: they went one at a time, each waiting for the last.
 //
 // Still a client: we never listen, so a connection is always something we
-// opened and can always be named by the local port we chose for it. Still
-// in-order only, with no reassembly and no data retransmission; a segment
-// that arrives out of turn is dropped and the peer sends it again because we
-// never acknowledge it. That is a real limitation and it is written down
-// rather than hidden, but on the paths this system takes it costs nothing
-// measurable, and adding a reassembly queue to eight connections is a
-// different piece of work from giving it eight connections at all.
+// opened and can always be named by the local port we chose for it.
+//
+// A segment lost on the way used to be expensive out of all proportion. The
+// ones behind it were thrown away without a word, so the sender learned of
+// the loss only from its own retransmission timer -- a second or more, and
+// doubling each time it happened again -- and then had to send everything
+// after the hole a second time. In QEMU nothing is ever lost and none of it
+// showed. Over a phone it made a page take minutes.
+//
+// Now every data segment is answered. One past a gap repeats the last
+// acknowledgement, and three repeats are the standard signal for the sender
+// to resend the missing segment at once (fast retransmit). And what arrived
+// past the gap is kept: written into the receive buffer at its place, its
+// range noted, so that when the hole is filled the acknowledgement jumps over
+// all of it and nothing is sent twice.
 
 #define TCP_CONNS   8         // as many as a page has hosts, near enough
+#define TCP_HELD    8         // ranges kept past a gap, per connection
 
 enum { TCP_CLOSED, TCP_SYN_SENT, TCP_ESTABLISHED, TCP_CLOSING };
 
@@ -368,6 +377,10 @@ typedef struct {
     int      rx_head;         // where the unread bytes start
     int      rx_len;          // how many there are
     int      remote_closed;
+    // Data that arrived past a gap: [held_lo, held_hi) in sequence numbers,
+    // already in rx at rx_head + rx_len + (held_lo - rcv_nxt).
+    int      nheld;
+    uint32_t held_lo[TCP_HELD], held_hi[TCP_HELD];
 } tcp_conn_t;
 
 static tcp_conn_t conns[TCP_CONNS];
@@ -445,6 +458,70 @@ static tcp_conn_t *tcp_lookup(uint32_t srcip, uint16_t sport, uint16_t dport) {
     return NULL;
 }
 
+// a - b, for sequence numbers that wrap.
+static int32_t seqdiff(uint32_t a, uint32_t b) { return (int32_t)(a - b); }
+
+// How far past rcv_nxt the held data reaches.
+static int tcp_held_reach(const tcp_conn_t *c) {
+    int reach = 0;
+    for (int i = 0; i < c->nheld; i++) {
+        int r = seqdiff(c->held_hi[i], c->rcv_nxt);
+        if (r > reach) reach = r;
+    }
+    return reach;
+}
+
+// Slide the unread bytes to the front of the buffer, and the held ones with
+// them: they are addressed relative to the unread end.
+static void tcp_compact(tcp_conn_t *c) {
+    if (c->rx_head == 0) return;
+    nmemmove_down(c->rx, c->rx + c->rx_head, c->rx_len + tcp_held_reach(c));
+    c->rx_head = 0;
+}
+
+static void tcp_held_drop(tcp_conn_t *c, int i) {
+    c->nheld--;
+    c->held_lo[i] = c->held_lo[c->nheld];
+    c->held_hi[i] = c->held_hi[c->nheld];
+}
+
+// Note a range that has arrived past the gap, merged with any it touches.
+// With the table full it is simply not noted; the sender will send it again.
+static void tcp_hold(tcp_conn_t *c, uint32_t lo, uint32_t hi) {
+    for (int i = 0; i < c->nheld; ) {
+        if (seqdiff(lo, c->held_hi[i]) <= 0 && seqdiff(c->held_lo[i], hi) <= 0) {
+            if (seqdiff(c->held_lo[i], lo) < 0) lo = c->held_lo[i];
+            if (seqdiff(c->held_hi[i], hi) > 0) hi = c->held_hi[i];
+            tcp_held_drop(c, i);
+            continue;
+        }
+        i++;
+    }
+    if (c->nheld < TCP_HELD) {
+        c->held_lo[c->nheld] = lo;
+        c->held_hi[c->nheld] = hi;
+        c->nheld++;
+    }
+}
+
+// The gap has closed up to rcv_nxt: take in every held range it now reaches.
+static void tcp_held_join(tcp_conn_t *c) {
+    for (int i = 0; i < c->nheld; ) {
+        if (seqdiff(c->held_lo[i], c->rcv_nxt) <= 0) {
+            int32_t gain = seqdiff(c->held_hi[i], c->rcv_nxt);
+            if (gain > 0) {
+                c->rx_len += gain;
+                c->rcv_nxt = c->held_hi[i];
+                tcp_bytes_in += (uint32_t)gain;
+            }
+            tcp_held_drop(c, i);
+            i = 0;                  // rcv_nxt moved: look again from the start
+            continue;
+        }
+        i++;
+    }
+}
+
 static void tcp_input(uint32_t srcip, const uint8_t *seg, int len) {
     if (len < (int)sizeof(tcp_hdr_t)) return;
     const tcp_hdr_t *t = (const tcp_hdr_t *)seg;
@@ -476,23 +553,42 @@ static void tcp_input(uint32_t srcip, const uint8_t *seg, int len) {
     }
 
     if (c->state == TCP_ESTABLISHED || c->state == TCP_CLOSING) {
-        // In-order data only (see the note at the top of this section).
-        if (dlen > 0 && seq == c->rcv_nxt) {
-            // Slide the unread bytes back to the front only when the room
-            // behind them has run out -- not on every read.
-            if (tcp_rx_space(c) < dlen && c->rx_head > 0) {
-                nmemmove_down(c->rx, c->rx + c->rx_head, c->rx_len);
-                c->rx_head = 0;
+        uint32_t fin_seq = seq + (uint32_t)dlen;   // where a FIN here would sit
+        if (dlen > 0) {
+            // Drop the part we already have: a retransmission that overlaps.
+            int32_t ahead = seqdiff(seq, c->rcv_nxt);
+            if (ahead < 0) {
+                int dup = -ahead;
+                if (dup >= dlen) dlen = 0;
+                else { data += dup; dlen -= dup; seq = c->rcv_nxt; ahead = 0; }
             }
-            int space = tcp_rx_space(c);
-            int take = dlen < space ? dlen : space;
-            nmemcpy(c->rx + c->rx_head + c->rx_len, data, take);
-            c->rx_len += take;
-            c->rcv_nxt += dlen;
-            tcp_bytes_in += (uint32_t)take;
+            if (dlen > 0) {
+                // Slide the unread bytes back to the front only when the
+                // room behind them has run out -- not on every read.
+                if (tcp_rx_space(c) < ahead + dlen) tcp_compact(c);
+                int space = tcp_rx_space(c);
+                int take = ahead >= space ? 0 : (dlen < space - ahead ? dlen : space - ahead);
+                if (take > 0) {
+                    nmemcpy(c->rx + c->rx_head + c->rx_len + ahead, data, take);
+                    if (ahead == 0) {
+                        c->rx_len += take;
+                        c->rcv_nxt += (uint32_t)take;   // only what was kept
+                        tcp_bytes_in += (uint32_t)take;
+                        tcp_held_join(c);
+                    } else {
+                        tcp_hold(c, seq, seq + (uint32_t)take);
+                    }
+                }
+            }
+            // Every data segment is answered, in order or not: past a gap
+            // the answer repeats the last acknowledgement, which is what
+            // tells the sender to resend the missing piece now rather than
+            // when its timer runs out.
             tcp_out(c, TCP_ACK, NULL, 0);
         }
-        if (flags & TCP_FIN) {
+        // A FIN counts only once everything before it has arrived: one that
+        // overtakes a lost segment would end the stream short.
+        if ((flags & TCP_FIN) && fin_seq == c->rcv_nxt) {
             c->rcv_nxt += 1;
             c->remote_closed = 1;
             tcp_out(c, TCP_ACK, NULL, 0);
@@ -628,7 +724,9 @@ void net_tcp_consume(int h, int n) {
     if (n > c->rx_len) n = c->rx_len;
     c->rx_head += n;
     c->rx_len  -= n;
-    if (c->rx_len == 0) c->rx_head = 0;   // empty: start from the front again
+    // Empty: start from the front again -- unless data held past a gap is
+    // sitting further along, addressed from where the unread bytes end.
+    if (c->rx_len == 0 && c->nheld == 0) c->rx_head = 0;
 }
 
 int net_tcp_fill(int h, int want, uint32_t timeout_ms) {
