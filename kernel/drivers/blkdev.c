@@ -130,6 +130,18 @@ int blkdev_read_sector(uint64_t lba, void *buf512) {
     return 0;
 }
 
+int blkdev_read_sectors(uint64_t lba, uint32_t count, void *buf) {
+    if (backend == BACKEND_VIRTIO) return virtio_blk_read_sectors(lba, count, buf);
+    if (backend == BACKEND_RAM) {
+        if (lba + count > ram_sectors) return 0;
+        const uint64_t *src = (const uint64_t *)(ram_base + lba * 512);
+        uint64_t *dst = (uint64_t *)buf;
+        for (uint32_t i = 0; i < count * 64; i++) dst[i] = src[i];
+        return 1;
+    }
+    return 0;
+}
+
 int blkdev_write_sector(uint64_t lba, const void *buf512) {
     if (backend == BACKEND_VIRTIO) return virtio_blk_write_sector(lba, buf512);
     if (backend == BACKEND_RAM) {

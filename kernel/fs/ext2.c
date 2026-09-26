@@ -68,12 +68,32 @@ static uint8_t bmp_buf[MAX_BLOCK_SIZE];  // block/inode bitmaps
 static uint8_t gd_buf[MAX_BLOCK_SIZE];   // group descriptor blocks
 static int mounted = 0;
 
+// The read path's own copies of the last indirect tables it looked at, and
+// which blocks they are (0: none). Reading a file front to back asks for the
+// same table 256 times running; without these, every kilobyte past the first
+// 268 cost two table reads before its own. With fonts on the disk that is
+// the common case -- the CJK face alone is sixteen thousand blocks.
+//
+// Separate from indirect_buf/dind_buf, which the write path fills and
+// modifies as it pleases. A write to a block drops any copy of it here
+// (write_block), so a copy is never older than the disk.
+static uint8_t  rc_ind[MAX_BLOCK_SIZE], rc_dind[MAX_BLOCK_SIZE];
+static uint32_t rc_ind_blk, rc_dind_blk;
+
+// One block, in one request to the device: `out` is always one of the static
+// buffers above, contiguous in physical memory as a device transfer needs.
 static void read_block(uint32_t block_num, uint8_t *out) {
     uint32_t sectors_per_block = block_size / 512;
-    uint64_t first_lba = (uint64_t)block_num * sectors_per_block;
-    for (uint32_t i = 0; i < sectors_per_block; i++) {
-        blkdev_read_sector(first_lba + i, out + i * 512);
+    blkdev_read_sectors((uint64_t)block_num * sectors_per_block,
+                        sectors_per_block, out);
+}
+
+static const uint32_t *table(uint32_t blk, uint8_t *buf, uint32_t *tag) {
+    if (*tag != blk) {
+        read_block(blk, buf);
+        *tag = blk;
     }
+    return (const uint32_t *)buf;
 }
 
 int ext2_mount(void) {
@@ -99,6 +119,7 @@ int ext2_mount(void) {
     bgd_block = sb.s_first_data_block + 1;
 
     kprintf("ext2: mounted, block_size=%u inodes=%u\n", block_size, sb.s_inodes_count);
+    rc_ind_blk = rc_dind_blk = 0;
     mounted = 1;
     return 1;
 }
@@ -135,21 +156,18 @@ static uint32_t resolve_block(const ext2_inode_t *inode, uint32_t block_index) {
     // single indirect: i_block[12] -> per data blocks
     if (block_index < per) {
         if (inode->i_block[12] == 0) return 0;
-        read_block(inode->i_block[12], indirect_buf);
-        return ((uint32_t *)indirect_buf)[block_index];
+        return table(inode->i_block[12], rc_ind, &rc_ind_blk)[block_index];
     }
     block_index -= per;
 
     // double indirect: i_block[13] -> per tables -> per data blocks each
     if (block_index < per * per) {
         if (inode->i_block[13] == 0) return 0;
-        read_block(inode->i_block[13], dind_buf);
         uint32_t outer = block_index / per;
         uint32_t inner = block_index % per;
-        uint32_t l2 = ((uint32_t *)dind_buf)[outer];
+        uint32_t l2 = table(inode->i_block[13], rc_dind, &rc_dind_blk)[outer];
         if (l2 == 0) return 0;
-        read_block(l2, indirect_buf);
-        return ((uint32_t *)indirect_buf)[inner];
+        return table(l2, rc_ind, &rc_ind_blk)[inner];
     }
 
     // triple indirect would start here; unreachable on a disk this small
@@ -275,6 +293,8 @@ int ext2_lookup(const char *path, uint32_t *out_inode_num, ext2_inode_t *out_ino
 // =========================================================================
 
 static void write_block(uint32_t block_num, const uint8_t *in) {
+    if (block_num == rc_ind_blk)  rc_ind_blk = 0;    // see read_block
+    if (block_num == rc_dind_blk) rc_dind_blk = 0;
     uint32_t sectors_per_block = block_size / 512;
     uint64_t first_lba = (uint64_t)block_num * sectors_per_block;
     for (uint32_t i = 0; i < sectors_per_block; i++) {

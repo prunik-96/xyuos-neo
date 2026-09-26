@@ -93,7 +93,8 @@ int virtio_blk_init(void) {
     outb(io_base + REG_DEVICE_STATUS, STATUS_ACKNOWLEDGE);
     outb(io_base + REG_DEVICE_STATUS, STATUS_ACKNOWLEDGE | STATUS_DRIVER);
 
-    // negotiate no optional features -- plain 512-byte sector I/O only.
+    // negotiate no optional features -- plain sector I/O, one buffer per
+    // request (a sector, or the sectors of one filesystem block).
     __asm__ volatile ("outl %0, %1" : : "a"((uint32_t)0), "Nd"((uint16_t)(io_base + REG_GUEST_FEATURES)));
 
     __asm__ volatile ("outw %0, %1" : : "a"((uint16_t)0), "Nd"((uint16_t)(io_base + REG_QUEUE_SELECT)));
@@ -133,7 +134,7 @@ int virtio_blk_init(void) {
     return 1;
 }
 
-static int submit_request(uint64_t lba, void *buf, int write) {
+static int submit_request(uint64_t lba, void *buf, uint32_t len, int write) {
     req_hdr.type = write ? VIRTIO_BLK_T_OUT : VIRTIO_BLK_T_IN;
     req_hdr.reserved = 0;
     req_hdr.sector = lba;
@@ -145,7 +146,7 @@ static int submit_request(uint64_t lba, void *buf, int write) {
     desc_table[0].next = 1;
 
     desc_table[1].addr = (uint64_t)(uintptr_t)buf;
-    desc_table[1].len = 512;
+    desc_table[1].len = len;
     desc_table[1].flags = VIRTQ_DESC_F_NEXT | (write ? 0 : VIRTQ_DESC_F_WRITE);
     desc_table[1].next = 2;
 
@@ -179,9 +180,13 @@ static int submit_request(uint64_t lba, void *buf, int write) {
 }
 
 int virtio_blk_read_sector(uint64_t lba, void *buf512) {
-    return submit_request(lba, buf512, 0);
+    return submit_request(lba, buf512, 512, 0);
+}
+
+int virtio_blk_read_sectors(uint64_t lba, uint32_t count, void *buf) {
+    return submit_request(lba, buf, count * 512, 0);
 }
 
 int virtio_blk_write_sector(uint64_t lba, const void *buf512) {
-    return submit_request(lba, (void *)(uintptr_t)buf512, 1);
+    return submit_request(lba, (void *)(uintptr_t)buf512, 512, 1);
 }
