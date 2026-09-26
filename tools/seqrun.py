@@ -7,7 +7,9 @@ Each step is COMMAND:SECONDS -- what to type, and how long to let it run
 before the screen is photographed. A step with nothing before the colon just
 presses Enter, which is how a message box left by a deliberate crash is got
 out of the way before the next command. A step starting with @ names keys
-instead of typing text: "@pgdn pgdn:2" presses Page Down twice.
+instead of typing text: "@pgdn pgdn:2" presses Page Down twice. One starting
+with ! is QEMU monitor commands, separated by ';': "!mouse_move 300 200:1"
+moves the pointer.
 
 The pictures land in /tmp/seqrun as step0.png, step1.png, ... and, if
 SEQRUN_COPY names a directory, are copied there as well.
@@ -126,6 +128,11 @@ for i, step in enumerate(STEPS):
         # down twice, with no Enter after.
         for k in line[1:].split():
             cmd("sendkey " + k, 0.15)
+    elif line.startswith("!"):
+        # QEMU monitor commands, separated by ';': "!mouse_move 200 100;
+        # mouse_button 1; mouse_button 0:1" moves the pointer and clicks.
+        for c in line[1:].split(";"):
+            cmd(c.strip(), 0.15)
     else:
         typ(line + "\n")
     time.sleep(float(wait))

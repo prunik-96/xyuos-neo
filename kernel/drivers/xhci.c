@@ -131,15 +131,23 @@ __attribute__((aligned(4096))) static uint64_t scratchpad_arr[64];
 __attribute__((aligned(4096))) static uint8_t scratchpad_bufs[8][4096];
 
 __attribute__((aligned(64))) static uint8_t  xfer_buf[256];       // descriptors (transient)
-__attribute__((aligned(64))) static uint8_t  report_bufs[MAX_KBD][8]; // per-kbd HID report DMA
+
+// Where a HID report lands. A boot report is 8 bytes at most, but the buffer
+// must hold a whole packet of the endpoint's size: a device that sends more
+// than the transfer asked for is a babble error to the controller, and the
+// endpoint stops for good. A wireless receiver's keyboard interface does that
+// with its media-key reports.
+#define HID_BUF 64
+__attribute__((aligned(64))) static uint8_t  report_bufs[MAX_KBD][HID_BUF]; // per-kbd HID report DMA
 
 // One live keyboard: its slot, its interrupt-IN endpoint DCI, its interrupt-ring
-// producer state, and its own key-repeat de-dup memory (so two keyboards don't
-// cancel each other's held keys).
+// producer state, how much each transfer asks for, and its own key-repeat
+// de-dup memory (so two keyboards don't cancel each other's held keys).
 struct kbdev {
     int slot;
     int dci;
     struct ring intr;
+    uint32_t len;
     uint8_t prev[6];
     uint8_t prevmod;
 };
@@ -228,8 +236,8 @@ static int port_is_rndis(int port) {
 // keyboard tables so a machine can have both.
 __attribute__((aligned(4096))) static uint32_t mouse_intr_ring[RING_SIZE * 4];
 __attribute__((aligned(64)))   static uint8_t  mouse_dev_ctx[2048];
-__attribute__((aligned(64)))   static uint8_t  mouse_report[8];
-static struct { struct ring intr; int slot, dci, port, ready; } mdev;
+__attribute__((aligned(64)))   static uint8_t  mouse_report[HID_BUF];
+static struct { struct ring intr; int slot, dci, port, ready; uint32_t len; } mdev;
 
 static int port_is_mouse(int port) {
     return mdev.ready && mdev.port == port;
@@ -307,7 +315,7 @@ static void ring_doorbell(int slot, uint32_t target) {
     (void)r32(op, OP_USBSTS);   // posting read to flush
 }
 
-static int hid_event(uint32_t slot, uint32_t epid);
+static int hid_event(uint32_t slot, uint32_t epid, uint32_t status);
 
 // Wait for a completion, returning its completion code, or -1 on timeout.
 //
@@ -352,7 +360,7 @@ static int wait_completion(uint64_t expect_trb, int ep_slot, int ep_dci,
                 return (int)TRB_CC(status);
             }
             // a completion for something else: a HID report is handled
-            if (type == TRB_TRANSFER_EVENT) hid_event(slot, epid);
+            if (type == TRB_TRANSFER_EVENT) hid_event(slot, epid, status);
         }
         // port status change etc. -> ignore, keep draining
     }
@@ -566,37 +574,49 @@ static int configure_msc(int port, uint32_t speed, int in_addr, int out_addr) {
 
 static int rndis_control_init(void);   // fwd (defined after the msg helpers)
 
-// Configure a HID boot-protocol mouse on the slot currently being probed.
-static int configure_mouse(int port, uint32_t speed, int ep_addr, int iface) {
+// Post one interrupt IN transfer for a HID report of up to `len` bytes.
+static void arm_hid(struct ring *r, uint8_t *buf, uint32_t len, int slot, int dci) {
+    for (uint32_t i = 0; i < len; i++) buf[i] = 0;
+    ring_push(r, (uint32_t)(uintptr_t)buf, (uint32_t)((uint64_t)(uintptr_t)buf >> 32),
+              len, TRB_TYPE(TRB_NORMAL) | TRB_IOC);
+    ring_doorbell(slot, dci);
+}
+
+// How much a HID interrupt transfer asks for: the endpoint's packet, which the
+// buffer has room for (see HID_BUF).
+static uint32_t hid_len(int mps) {
+    if (mps <= 0) mps = 8;
+    return (uint32_t)(mps < HID_BUF ? mps : HID_BUF);
+}
+
+// Add a boot-protocol mouse's interrupt IN endpoint to the slot being probed.
+// `keep_dci` is an endpoint the slot already has -- the keyboard of a combo
+// device -- or 0: the slot context must go on counting it.
+static int add_mouse(int port, uint32_t speed, int ep_addr, int iface, int mps,
+                     int keep_dci) {
     uint8_t setup[8];
-    make_setup(setup, 0x00, 9, 1, 0, 0);                  // SET_CONFIGURATION(1)
-    if (control_in(setup, 0) != CC_SUCCESS) return 0;
     make_setup(setup, 0x21, 0x0B, 0, (uint16_t)iface, 0); // SET_PROTOCOL(boot)
     control_in(setup, 0);                                 // some devices STALL
 
     int dci = (ep_addr & 0x0F) * 2 + 1;
-
-    // Take a private copy of the device context so the next keyboard probe can
-    // reuse the shared scratch, exactly as the mass-storage path does.
-    uint8_t *src = dev_ctxs[nkbds];
-    for (int i = 0; i < 2048; i++) mouse_dev_ctx[i] = src[i];
-    dcbaa[slot_id] = (uint64_t)(uintptr_t)mouse_dev_ctx;
+    int entries = dci > keep_dci ? dci : keep_dci;
+    if (mps <= 0) mps = 8;
 
     for (int i = 0; i < 2048; i++) in_ctx[i] = 0;
     uint32_t *icc = (uint32_t *)in_ctx;
-    icc[1] = (1u << 0) | (1u << dci);
+    icc[1] = (1u << 0) | (1u << dci);      // the slot, and this endpoint only
     uint32_t *sctx = slot_ctx_of(in_ctx);
-    sctx[0] = ((uint32_t)dci << 27) | ((speed & 0xF) << 20);
+    sctx[0] = ((uint32_t)entries << 27) | ((speed & 0xF) << 20);
     sctx[1] = ((uint32_t)(port + 1) << 16);
 
     ring_init(&mdev.intr, mouse_intr_ring);
     uint32_t *epc = ep_ctx_of(in_ctx, dci);
     epc[0] = (6u << 16);                            // interval 2^6 * 125us = 8ms
-    epc[1] = (7u << 3) | (8u << 16) | (3u << 1);    // Interrupt IN, MPS 8
+    epc[1] = (7u << 3) | ((uint32_t)mps << 16) | (3u << 1);   // Interrupt IN
     uint64_t itr = (uint64_t)(uintptr_t)mouse_intr_ring;
     epc[2] = (uint32_t)itr | 1;
     epc[3] = (uint32_t)(itr >> 32);
-    epc[4] = 8;
+    epc[4] = (uint32_t)mps;
 
     uint64_t c = ring_push(&cmd, (uint32_t)(uintptr_t)in_ctx,
                   (uint32_t)((uint64_t)(uintptr_t)in_ctx >> 32), 0,
@@ -607,16 +627,28 @@ static int configure_mouse(int port, uint32_t speed, int ep_addr, int iface) {
     mdev.slot = slot_id;
     mdev.dci  = dci;
     mdev.port = port;
+    mdev.len  = hid_len(mps);
     mdev.ready = 1;
     mouse_set_present(1);
 
-    for (int i = 0; i < 8; i++) mouse_report[i] = 0;
-    ring_push(&mdev.intr, (uint32_t)(uintptr_t)mouse_report,
-              (uint32_t)((uint64_t)(uintptr_t)mouse_report >> 32), 8,
-              TRB_TYPE(TRB_NORMAL) | TRB_IOC);
-    ring_doorbell(slot_id, dci);
-    DBG("xhci: mouse on port %d slot %d dci %d\n", port, slot_id, dci);
+    arm_hid(&mdev.intr, mouse_report, mdev.len, slot_id, dci);
+    DBG("xhci: mouse on port %d slot %d dci %d mps %d\n", port, slot_id, dci, mps);
     return 1;
+}
+
+// Configure a device that is only a HID boot-protocol mouse.
+static int configure_mouse(int port, uint32_t speed, int ep_addr, int iface, int mps) {
+    uint8_t setup[8];
+    make_setup(setup, 0x00, 9, 1, 0, 0);                  // SET_CONFIGURATION(1)
+    if (control_in(setup, 0) != CC_SUCCESS) return 0;
+
+    // Take a private copy of the device context so the next keyboard probe can
+    // reuse the shared scratch, exactly as the mass-storage path does.
+    uint8_t *src = dev_ctxs[nkbds];
+    for (int i = 0; i < 2048; i++) mouse_dev_ctx[i] = src[i];
+    dcbaa[slot_id] = (uint64_t)(uintptr_t)mouse_dev_ctx;
+
+    return add_mouse(port, speed, ep_addr, iface, mps, 0);
 }
 
 // Configure a RNDIS/CDC network adapter: SET_CONFIGURATION, add its bulk IN/OUT
@@ -893,10 +925,10 @@ static int enumerate_port(int port, int strict) {
     // report so we can see what the device actually is.
     int interface = 0;
     int cur_cls = -1, cur_sub = -1, cur_proto = -1, cur_iface = 0;
-    int kbd_if = -1, kbd_ep = 0;      // best: proto 1
-    int alt_if = -1, alt_ep = 0;      // fallback: class 3, proto != 2
+    int kbd_if = -1, kbd_ep = 0, kbd_mps = 0;      // best: proto 1
+    int alt_if = -1, alt_ep = 0, alt_mps = 0;      // fallback: class 3, proto != 2
     int msc_in = 0, msc_out = 0;      // mass-storage bulk IN/OUT endpoint addrs
-    int mouse_if = -1, mouse_ep = 0;  // HID mouse (boot protocol 2)
+    int mouse_if = -1, mouse_ep = 0, mouse_mps = 0; // HID mouse (boot protocol 2)
     int rn_comm = -1, rn_in = 0, rn_out = 0;   // RNDIS comm interface + data bulk
     for (int i = 0; i + 2 < total; ) {
         int blen = xfer_buf[i];
@@ -916,10 +948,11 @@ static int enumerate_port(int port, int strict) {
         } else if (btype == 5) {                              // endpoint
             int addr = xfer_buf[i + 2];
             int attr = xfer_buf[i + 3];
+            int mps = (xfer_buf[i + 4] | (xfer_buf[i + 5] << 8)) & 0x7FF;
             if (cur_cls == 3 && (attr & 3) == 3 && (addr & 0x80)) {   // HID interrupt IN
-                if (cur_proto == 1 && kbd_if < 0) { kbd_if = cur_iface; kbd_ep = addr; }
-                else if (cur_proto == 2 && mouse_if < 0) { mouse_if = cur_iface; mouse_ep = addr; }
-                else if (cur_proto != 2 && alt_if < 0) { alt_if = cur_iface; alt_ep = addr; }
+                if (cur_proto == 1 && kbd_if < 0) { kbd_if = cur_iface; kbd_ep = addr; kbd_mps = mps; }
+                else if (cur_proto == 2 && mouse_if < 0) { mouse_if = cur_iface; mouse_ep = addr; mouse_mps = mps; }
+                else if (cur_proto != 2 && alt_if < 0) { alt_if = cur_iface; alt_ep = addr; alt_mps = mps; }
             } else if (cur_cls == 8 && (attr & 3) == 2) {            // mass-storage bulk
                 if (addr & 0x80) msc_in = addr; else msc_out = addr;
             } else if (cur_cls == 0x0A && (attr & 3) == 2) {         // CDC data bulk
@@ -942,18 +975,21 @@ static int enumerate_port(int port, int strict) {
         if (configure_msc(port, speed, msc_in, msc_out)) { g_stage = "mass-storage"; goto done; }
     }
 
-    // A pointing device. Checked after the keyboard interfaces are known, so a
-    // combo device that also presents a keyboard is still taken as a keyboard.
+    // A device that is only a pointing device. One that also presents a
+    // keyboard is configured as a keyboard below, and its mouse added to the
+    // same slot after it.
     if (kbd_if < 0 && mouse_if >= 0 && !mdev.ready) {
-        if (configure_mouse(port, speed, mouse_ep, mouse_if)) {
+        if (configure_mouse(port, speed, mouse_ep, mouse_if, mouse_mps)) {
             g_stage = "mouse";
             slot_id = 0;            // committed; don't let disable_slot free it
             goto done;
         }
     }
-    if (kbd_if >= 0)                 { interface = kbd_if; kbd_ep_addr = kbd_ep; }
-    else if (!strict && alt_if >= 0) { interface = alt_if; kbd_ep_addr = alt_ep; }
+    int kbd_mps_use = 8;
+    if (kbd_if >= 0)                 { interface = kbd_if; kbd_ep_addr = kbd_ep; kbd_mps_use = kbd_mps; }
+    else if (!strict && alt_if >= 0) { interface = alt_if; kbd_ep_addr = alt_ep; kbd_mps_use = alt_mps; }
     else { kbd_ep_addr = 0; }
+    if (kbd_mps_use <= 0) kbd_mps_use = 8;
     if (!kbd_ep_addr) { g_stage = strict ? "not a keyboard (proto!=1)" : "not a keyboard"; disable_slot(); goto done; }
     e_kbd_seen++;
     kbd_dci = (kbd_ep_addr & 0x0F) * 2 + 1;
@@ -983,11 +1019,11 @@ static int enumerate_port(int port, int strict) {
     uint32_t *epc = ep_ctx_of(in_ctx, kbd_dci);
     uint32_t interval = 6;   // 2^6 * 125us = 8 ms
     epc[0] = (interval << 16);
-    epc[1] = (7u << 3) | (8u << 16) | (3u << 1);   // Interrupt IN, MPS 8, CErr 3
+    epc[1] = (7u << 3) | ((uint32_t)kbd_mps_use << 16) | (3u << 1);   // Interrupt IN, CErr 3
     uint64_t itr = (uint64_t)(uintptr_t)intr_rings[k];
     epc[2] = (uint32_t)itr | 1;
     epc[3] = (uint32_t)(itr >> 32);
-    epc[4] = 8;
+    epc[4] = (uint32_t)kbd_mps_use;
 
     c = ring_push(&cmd, (uint32_t)(uintptr_t)in_ctx,
                   (uint32_t)((uint64_t)(uintptr_t)in_ctx >> 32), 0,
@@ -999,14 +1035,20 @@ static int enumerate_port(int port, int strict) {
     // Commit this keyboard and arm its first interrupt IN transfer.
     kbds[k].slot = slot_id;
     kbds[k].dci = kbd_dci;
+    kbds[k].len = hid_len(kbd_mps_use);
     for (int i = 0; i < 6; i++) kbds[k].prev[i] = 0;
     kbds[k].prevmod = 0;
-    for (int i = 0; i < 8; i++) report_bufs[k][i] = 0;
-    ring_push(&kbds[k].intr, (uint32_t)(uintptr_t)report_bufs[k],
-              (uint32_t)((uint64_t)(uintptr_t)report_bufs[k] >> 32), 8,
-              TRB_TYPE(TRB_NORMAL) | TRB_IOC);
-    ring_doorbell(slot_id, kbd_dci);
+    arm_hid(&kbds[k].intr, report_bufs[k], kbds[k].len, slot_id, kbd_dci);
     nkbds++;
+
+    // A combo device: the mouse too, as a second endpoint on the same slot.
+    // Wireless receivers are the usual case -- Logitech's LIGHTSPEED and
+    // Unifying present the mouse and a keyboard (the media keys come through
+    // it) on one plug, and taking only the keyboard left the mouse dead.
+    if (mouse_if >= 0 && !mdev.ready &&
+        !add_mouse(port, speed, mouse_ep, mouse_if, mouse_mps, kbd_dci))
+        DBG("xhci: port %d: the mouse of this combo device did not configure\n", port);
+
     slot_id = 0;             // committed; don't let a later disable_slot free it
     g_stage = "OK";
     result = 1;
@@ -1347,7 +1389,7 @@ void xhci_poll(void) {
 
         if (type != TRB_TRANSFER_EVENT) continue;
         rndis_note_event(ctrl, status);   // don't drop a RNDIS RX completion
-        hid_event(slot, (ctrl >> 16) & 0x1F);
+        hid_event(slot, (ctrl >> 16) & 0x1F, status);
     }
 }
 
@@ -1355,26 +1397,27 @@ void xhci_poll(void) {
 // on and arm the endpoint for the next one. 1 if it was one of theirs. Called
 // from xhci_poll, and from wait_completion for events that arrive while it is
 // waiting for something else.
-static int hid_event(uint32_t slot, uint32_t epid) {
+//
+// The event says how many bytes did not arrive, so the report's real length
+// is known, and it decides what the report is. A boot keyboard report is
+// exactly 8 bytes; a receiver's keyboard interface also sends the 2- and
+// 3-byte reports of its media keys, which read as a boot report would be a
+// stream of wrong keys. A boot mouse report is at least 3 bytes.
+static int hid_event(uint32_t slot, uint32_t epid, uint32_t status) {
+    uint32_t missing = status & 0xFFFFFF;
+
     if (mdev.ready && mdev.slot == (int)slot && mdev.dci == (int)epid) {
-        process_mouse_report(mouse_report);
-        for (int j = 0; j < 8; j++) mouse_report[j] = 0;
-        ring_push(&mdev.intr, (uint32_t)(uintptr_t)mouse_report,
-                  (uint32_t)((uint64_t)(uintptr_t)mouse_report >> 32), 8,
-                  TRB_TYPE(TRB_NORMAL) | TRB_IOC);
-        ring_doorbell(mdev.slot, mdev.dci);
+        uint32_t got = missing < mdev.len ? mdev.len - missing : 0;
+        if (got >= 3) process_mouse_report(mouse_report);
+        arm_hid(&mdev.intr, mouse_report, mdev.len, mdev.slot, mdev.dci);
         return 1;
     }
 
     for (int i = 0; i < nkbds; i++) {
         if (kbds[i].slot != (int)slot || kbds[i].dci != (int)epid) continue;
-        process_report(&kbds[i], report_bufs[i]);
-        // re-arm this keyboard's interrupt transfer
-        for (int j = 0; j < 8; j++) report_bufs[i][j] = 0;
-        ring_push(&kbds[i].intr, (uint32_t)(uintptr_t)report_bufs[i],
-                  (uint32_t)((uint64_t)(uintptr_t)report_bufs[i] >> 32), 8,
-                  TRB_TYPE(TRB_NORMAL) | TRB_IOC);
-        ring_doorbell(kbds[i].slot, kbds[i].dci);
+        uint32_t got = missing < kbds[i].len ? kbds[i].len - missing : 0;
+        if (got == 8) process_report(&kbds[i], report_bufs[i]);
+        arm_hid(&kbds[i].intr, report_bufs[i], kbds[i].len, kbds[i].slot, kbds[i].dci);
         return 1;
     }
     return 0;
