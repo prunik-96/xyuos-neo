@@ -175,6 +175,14 @@ static uint32_t resolve_block(const ext2_inode_t *inode, uint32_t block_index) {
     return 0;
 }
 
+// Where a run of blocks lands when a read asks for more than one: a file is
+// written onto the disk mostly in order, so the blocks after the one wanted
+// are usually the blocks after it on the disk too, and one request fetches
+// them all. 64 KiB, aligned to 64 KiB: a USB controller cannot take a buffer
+// that crosses such a line in one piece.
+#define RUN_BYTES (64u * 1024)
+static uint8_t run_buf[RUN_BYTES] __attribute__((aligned(RUN_BYTES)));
+
 uint32_t ext2_read(const ext2_inode_t *inode, uint32_t offset, void *buf, uint32_t len) {
     if (offset >= inode->i_size) return 0;
     if (offset + len > inode->i_size) len = inode->i_size - offset;
@@ -192,9 +200,25 @@ uint32_t ext2_read(const ext2_inode_t *inode, uint32_t offset, void *buf, uint32
 
         if (blk == 0) {
             for (uint32_t i = 0; i < chunk; i++) out[total + i] = 0;
-        } else {
+            total += chunk;
+            continue;
+        }
+
+        // How many of the blocks still wanted follow this one on the disk.
+        uint32_t wanted = (block_off + (len - total) + block_size - 1) / block_size;
+        uint32_t most = RUN_BYTES / block_size, n = 1;
+        if (wanted > most) wanted = most;
+        while (n < wanted && resolve_block(inode, block_index + n) == blk + n) n++;
+
+        if (n == 1) {
             read_block(blk, block_buf);
             for (uint32_t i = 0; i < chunk; i++) out[total + i] = block_buf[block_off + i];
+        } else {
+            uint32_t spb = block_size / 512;
+            blkdev_read_sectors((uint64_t)blk * spb, n * spb, run_buf);
+            chunk = n * block_size - block_off;
+            if (chunk > len - total) chunk = len - total;
+            for (uint32_t i = 0; i < chunk; i++) out[total + i] = run_buf[block_off + i];
         }
         total += chunk;
     }
@@ -296,10 +320,8 @@ static void write_block(uint32_t block_num, const uint8_t *in) {
     if (block_num == rc_ind_blk)  rc_ind_blk = 0;    // see read_block
     if (block_num == rc_dind_blk) rc_dind_blk = 0;
     uint32_t sectors_per_block = block_size / 512;
-    uint64_t first_lba = (uint64_t)block_num * sectors_per_block;
-    for (uint32_t i = 0; i < sectors_per_block; i++) {
-        blkdev_write_sector(first_lba + i, in + i * 512);
-    }
+    blkdev_write_sectors((uint64_t)block_num * sectors_per_block,
+                         sectors_per_block, in);
 }
 
 static uint32_t num_groups(void) {

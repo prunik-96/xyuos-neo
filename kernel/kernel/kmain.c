@@ -315,26 +315,24 @@ void kernel_main(uint32_t multiboot_addr) {
     }
     kprintf("[main] scheduler demo done\n");
 
-    if (vfs_init(multiboot_addr)) {
-        kprintf("vfs: ext2 root filesystem mounted\n");
-    } else {
-        kprintf("vfs: mount failed (no disk and no RAM-disk module)\n");
-    }
-
     // USB keyboard: needed on UEFI-only hardware where there is no PS/2 at port
     // 0x60. Harmless in QEMU/BIOS -- returns 0 if there is no xHCI, and the
     // PS/2 driver keeps working alongside it. xhci_poll() is driven by the
     // timer tick (see pit.c).
     power_init(multiboot_addr);   // ACPI: learn how to power off / reset
 
+    // Before the filesystem: the root filesystem may be on the USB stick the
+    // machine booted from, and xhci_init is what finds the sticks.
     if (xhci_init()) {
         kprintf("usb: keyboard ready\n");
     }
-
-    // USB mass-storage devices were configured during xhci_init; the FAT32 data
-    // stick is mounted lazily on the first 'usb' command, so a normal boot never
-    // issues SCSI reads to the boot medium.
     kprintf("usbdisk: %d device(s)\n", usb_disk_count());
+
+    if (vfs_init(multiboot_addr)) {
+        kprintf("vfs: ext2 root filesystem mounted\n");
+    } else {
+        kprintf("vfs: mount failed (no disk and no RAM-disk module)\n");
+    }
 
     // Sound. Failure here is not fatal: sound_alert() falls back to the PC
     // speaker, and a machine that can report its own errors out loud is worth

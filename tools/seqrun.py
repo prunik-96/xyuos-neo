@@ -16,7 +16,13 @@ SEQRUN_SMP sets the number of cores. QEMU gives ONE unless told otherwise,
 which is worth knowing: every test run without it is a single-core test.
 
 SEQRUN_RAMDISK=1 leaves out the virtio disk, so the system runs from the copy
-of the image GRUB loads into memory -- the only disk it has on real hardware.
+of the image GRUB loads into memory.
+
+SEQRUN_STICK=1 boots the way real hardware does: the ISO written to a USB
+stick, no CD and no virtio, so the disk is the partition on the stick. The
+stick is a copy of the ISO in /tmp/seqrun; SEQRUN_KEEP=1 keeps the one from
+the last run instead, to see that what was written survived. SEQRUN_UEFI=1
+boots with OVMF instead of SeaBIOS, as the real machine does.
 """
 import os, shutil, socket, subprocess, sys, time
 
@@ -26,26 +32,37 @@ OUT = "/tmp/seqrun"
 COPY = os.environ.get("SEQRUN_COPY")
 SMP = os.environ.get("SEQRUN_SMP", "1")
 RAMDISK = os.environ.get("SEQRUN_RAMDISK") == "1"
+STICK = os.environ.get("SEQRUN_STICK") == "1"
+KEEP = os.environ.get("SEQRUN_KEEP") == "1"
+UEFI = os.environ.get("SEQRUN_UEFI") == "1"
 RAM = sys.argv[1] if len(sys.argv) > 1 else "2G"
 STEPS = sys.argv[2:] or ["sigtest:25"]
 
 os.makedirs(OUT, exist_ok=True)
 for f in list(os.listdir(OUT)):
-    os.unlink(OUT + "/" + f)
+    if not (KEEP and f == "stick.img"):
+        os.unlink(OUT + "/" + f)
 SER, MON = OUT + "/serial.log", OUT + "/mon.sock"
 DISK = []
-if not RAMDISK:
+if STICK:
+    if not (KEEP and os.path.exists(OUT + "/stick.img")):
+        subprocess.run(["cp", XYUOS + "/build/xyuos_neo.iso", OUT + "/stick.img"],
+                       check=True)
+    DISK = ["-drive", "file=%s/stick.img,if=none,id=stick,format=raw" % OUT]
+elif not RAMDISK:
     subprocess.run(["cp", XYUOS + "/disk.img", OUT + "/disk.img"], check=True)
     DISK = ["-drive", "file=%s/disk.img,if=none,id=d0,format=raw" % OUT,
             "-device", "virtio-blk-pci,drive=d0"]
+BOOT = [] if STICK else ["-cdrom", XYUOS + "/build/xyuos_neo.iso"]
+FIRMWARE = ["-bios", "/usr/share/qemu/OVMF.fd"] if UEFI else []
 
 proc = subprocess.Popen(
-    ["qemu-system-x86_64", "-enable-kvm", "-cpu", "host",
-     "-cdrom", XYUOS + "/build/xyuos_neo.iso",
-     "-serial", "file:" + SER, "-m", RAM, "-display", "none",
+    ["qemu-system-x86_64", "-enable-kvm", "-cpu", "host"] + BOOT + FIRMWARE +
+    ["-serial", "file:" + SER, "-m", RAM, "-display", "none",
      "-smp", SMP] + DISK +
-    ["-device", "qemu-xhci,id=xhci",
-     "-device", "usb-kbd,bus=xhci.0", "-device", "usb-mouse,bus=xhci.0",
+    ["-device", "qemu-xhci,id=xhci"] +
+    (["-device", "usb-storage,bus=xhci.0,drive=stick,bootindex=0"] if STICK else []) +
+    ["-device", "usb-kbd,bus=xhci.0", "-device", "usb-mouse,bus=xhci.0",
      "-monitor", "unix:%s,server,nowait" % MON],
     stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
 

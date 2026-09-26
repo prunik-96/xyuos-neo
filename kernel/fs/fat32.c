@@ -9,6 +9,7 @@
 #include "fat32.h"
 #include <stddef.h>
 #include "../drivers/xhci.h"      // usb_disk_read/write
+#include "../drivers/blkdev.h"    // blkdev_usb_dev: the stick that is not ours
 #include "../drivers/rtc.h"       // real timestamps on written entries
 #include "../kernel/kio.h"
 
@@ -71,8 +72,12 @@ int fat32_mount(int dev) {
 
 int fat32_automount(void) {
     int n = usb_disk_count();
-    for (int d = 0; d < n; d++)
+    for (int d = 0; d < n; d++) {
+        // The stick the root filesystem is on is not a data stick, whatever
+        // its first sector looks like.
+        if (d == blkdev_usb_dev()) continue;
         if (fat32_mount(d)) return 1;
+    }
     return 0;
 }
 

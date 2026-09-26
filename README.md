@@ -17,8 +17,26 @@ DOOM, MicroPython, TinyCC).
 
 **This system never touches the machine's internal NVMe disk.** It does not
 format it, does not write to it, does not have a driver bound to it. Storage
-is a RAM disk, a GRUB module, or an external drive. That is deliberate and
-must stay true of anything added here.
+is the USB stick it boots from, a RAM disk, or an external drive. That is
+deliberate and must stay true of anything added here.
+
+On the stick, the system writes to one partition only: the ext2 partition
+the build appends to the ISO, recognised by a UUID made fresh for each build
+(`build/diskid`). A stick written by another build, a data stick, a backup
+drive -- anything without that exact filesystem -- is never written to.
+
+## Writing a stick
+
+`build/xyuos_neo.iso` is a hybrid image: write it to the stick as it is --
+Rufus in **DD image** mode, or `dd` -- not file by file. Everything on the
+stick is replaced. The system then boots from it (UEFI, no CSM needed) and
+its disk is the 1 GiB partition at the end of the image: what you write there
+is still there after a reboot. Windows will say it cannot read the stick; that
+is expected, do not let it format it.
+
+If the stick's disk cannot be used on some machine, the boot menu's second
+entry, "disk in memory", loads the same files into RAM, where they last until
+the machine is switched off.
 
 ## Building from nothing on a new machine
 
@@ -93,14 +111,16 @@ with JavaScript.
 The platform work between here and a modern browser engine was planned as
 eight layers. Seven are done: parallel sockets, virtual memory, threads and
 scheduling on every core, processes and IPC, the C++ runtime, text, and a
-bigger disk -- 128 MiB, still loaded into memory by GRUB, since the kernel
-reaches only the low 4 GiB (see `DISK_MB` in the Makefile). One is left: a
-path rasteriser.
+bigger disk -- a 1 GiB partition on the boot stick, persistent, with a
+128 MiB image in memory as the fallback (see `STICK_MB` and `DISK_MB` in the
+Makefile). One is left: a path rasteriser.
 
 The tests are programs on the disk (`fstest`, `sigtest`, `shmtest`,
 `thrtest`, `partest`, `cpptest`, `texttest`, `memtest`, `vmtest`), driven
 from the host by `tools/seqrun.py`, which types commands into the shell and
 photographs the screen. Set `SEQRUN_SMP=8` to run them on eight cores: QEMU
-gives one unless told otherwise. `SEQRUN_RAMDISK=1` runs from the in-memory
-disk alone, as real hardware does. `fonts` opens a window of text in every
-script, for the eye.
+gives one unless told otherwise. `SEQRUN_STICK=1` boots the way real hardware
+does, from the ISO as a USB stick, and `SEQRUN_UEFI=1` with UEFI firmware;
+`SEQRUN_KEEP=1` keeps the stick from the last run, to see what survived.
+`SEQRUN_RAMDISK=1` runs from the in-memory disk. `fonts` opens a window of
+text in every script, for the eye.

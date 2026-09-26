@@ -255,10 +255,14 @@ int device_list(struct si_dev *out, int max) {
     if ((d = slot(out, max, &n))) {
         d->cat = DEVC_STORAGE;
         int be = blkdev_backend();
-        scopy(d->name, be == 1 ? "virtio-blk disk" :
-                       be == 2 ? "RAM disk (boot module)" : "No block device",
+        scopy(d->name, be == BACKEND_VIRTIO ? "virtio-blk disk" :
+                       be == BACKEND_RAM    ? "RAM disk (boot module)" :
+                       be == BACKEND_STICK  ? "Boot USB stick (ext2 partition)" :
+                                              "No block device",
               sizeof d->name);
-        scopy(d->driver, be == 1 ? "virtio-blk" : be == 2 ? "ramdisk" : "",
+        scopy(d->driver, be == BACKEND_VIRTIO ? "virtio-blk" :
+                         be == BACKEND_RAM    ? "ramdisk" :
+                         be == BACKEND_STICK  ? "usb-storage" : "",
               sizeof d->driver);
         scopy(d->status, be ? "mounted" : "absent", sizeof d->status);
     }

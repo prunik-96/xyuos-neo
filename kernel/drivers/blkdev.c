@@ -1,18 +1,23 @@
 #include "blkdev.h"
 #include "virtio_blk.h"
+#include "xhci.h"
 #include "../include/multiboot2.h"
 #include "../kernel/kio.h"
 #include "../mm/paging.h"
 #include "../mm/pmm.h"
 #include <stddef.h>
 
-#define BACKEND_NONE   0
-#define BACKEND_VIRTIO 1
-#define BACKEND_RAM    2
-
 static int      backend = BACKEND_NONE;
 static uint8_t *ram_base = NULL;
 static uint64_t ram_sectors = 0;
+
+// The boot stick: which USB disk, and where on it the partition is. Every
+// sector the filesystem asks for is relative to `stick_first` and checked
+// against `stick_sectors`, so nothing outside that one partition can ever be
+// read or written -- not the ISO that boots the machine, not the EFI
+// partition, not the rest of the stick.
+static int      stick_dev = -1;
+static uint64_t stick_first, stick_sectors;
 
 static int name_eq(const char *a, const char *b) {
     while (*a && *b) { if (*a != *b) return 0; a++; b++; }
@@ -85,13 +90,118 @@ static uint8_t *settle(uint8_t *base, uint64_t size) {
     return (uint8_t *)(uintptr_t)to;
 }
 
+// --- the boot stick ----------------------------------------------------------
+//
+// The stick is written from the ISO the build makes, and the build appends to
+// that ISO a partition holding the ext2 root filesystem. Which partition, on
+// which of possibly several sticks, is settled by one thing only: the UUID of
+// that filesystem, which the build also puts beside the kernel as a tiny GRUB
+// module called "diskid". A stick with no partition carrying that UUID -- a
+// data stick, a stick from an earlier build, a backup drive -- is never
+// written to. And there is no driver for the machine's internal disk at all.
+
+// Sector buffers the controller writes into directly: static, so physically
+// contiguous, and aligned so that none crosses a 64 KiB line.
+static uint8_t sec[1024] __attribute__((aligned(1024)));
+
+static int hexval(uint8_t c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+// "11111111-2222-3333-4444-555555555555" -> 16 bytes, in the order ext2 keeps
+// them (the order they are written in).
+static int parse_uuid(const uint8_t *s, uint64_t len, uint8_t out[16]) {
+    int n = 0;
+    for (uint64_t i = 0; i < len && n < 32; i++) {
+        if (s[i] == '-') continue;
+        int v = hexval(s[i]);
+        if (v < 0) break;
+        if (n & 1) out[n / 2] |= (uint8_t)v;
+        else out[n / 2] = (uint8_t)(v << 4);
+        n++;
+    }
+    return n == 32;
+}
+
+// Is there an ext2 filesystem with this UUID at `first` on disk `dev`?
+static int ext2_with_uuid(int dev, uint64_t first, const uint8_t want[16]) {
+    if (!usb_disk_read(dev, (uint32_t)(first + 2), 2, sec)) return 0;  // superblock
+    if (sec[56] != 0x53 || sec[57] != 0xEF) return 0;                  // s_magic
+    for (int i = 0; i < 16; i++) if (sec[104 + i] != want[i]) return 0; // s_uuid
+    return 1;
+}
+
+static uint32_t le32(const uint8_t *p) {
+    return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
+}
+static uint64_t le64(const uint8_t *p) { return le32(p) | (uint64_t)le32(p + 4) << 32; }
+
+static int take(int dev, uint64_t first, uint64_t count, uint32_t disk_blocks,
+                const uint8_t want[16]) {
+    if (!first || !count || first + count > disk_blocks) return 0;
+    if (!ext2_with_uuid(dev, first, want)) return 0;
+    stick_dev = dev;
+    stick_first = first;
+    stick_sectors = count;
+    return 1;
+}
+
+// Look at every partition on every USB disk. Both tables are read: the ISO
+// grub-mkrescue writes carries a GPT and an MBR describing the same appended
+// partition, and a tool that rewrote one of them should not lose the disk.
+static int find_stick(const uint8_t want[16]) {
+    for (int dev = 0; dev < usb_disk_count(); dev++) {
+        uint32_t blocks = 0, bsize = 0;
+        if (!usb_disk_capacity(dev, &blocks, &bsize) || bsize != 512) continue;
+        if (!usb_disk_read(dev, 0, 1, sec)) continue;
+        if (sec[510] != 0x55 || sec[511] != 0xAA) continue;
+
+        int gpt = 0;
+        uint64_t mbr_first[4], mbr_count[4];
+        for (int i = 0; i < 4; i++) {
+            const uint8_t *e = sec + 446 + 16 * i;
+            mbr_first[i] = mbr_count[i] = 0;
+            if (e[4] == 0xEE) gpt = 1;
+            else if (e[4]) { mbr_first[i] = le32(e + 8); mbr_count[i] = le32(e + 12); }
+        }
+        for (int i = 0; i < 4; i++)
+            if (take(dev, mbr_first[i], mbr_count[i], blocks, want)) return 1;
+
+        if (!gpt || !usb_disk_read(dev, 1, 1, sec)) continue;
+        if (le64(sec) != 0x5452415020494645ULL) continue;         // "EFI PART"
+        uint64_t table = le64(sec + 72);
+        uint32_t entries = le32(sec + 80), esize = le32(sec + 84);
+        if (esize < 128 || esize > 512 || entries > 256) continue;
+        for (uint32_t i = 0; i < entries; i++) {
+            uint64_t at = (uint64_t)i * esize;
+            if (!usb_disk_read(dev, (uint32_t)(table + at / 512), 1, sec)) break;
+            const uint8_t *e = sec + at % 512;
+            int used = 0;
+            for (int k = 0; k < 16; k++) used |= e[k];
+            if (!used) continue;
+            uint64_t first = le64(e + 32), last = le64(e + 40);
+            if (last < first) continue;
+            if (take(dev, first, last - first + 1, blocks, want)) return 1;
+        }
+    }
+    return 0;
+}
+
+// --- choosing ----------------------------------------------------------------
+
 int blkdev_init(uint32_t multiboot_addr) {
-    // virtio-blk first: it is the real device in QEMU. On bare metal there is
-    // no PCI virtio device, so this fails fast and we fall back to the module.
     uint8_t *base = NULL;
     uint64_t size = 0;
     int have = find_module(multiboot_addr, "disk", &base, &size) && size >= 1024;
+    uint8_t *idtext = NULL;
+    uint64_t idlen = 0;
+    int want_stick = find_module(multiboot_addr, "diskid", &idtext, &idlen);
 
+    // virtio-blk first: it is the real device in QEMU. On bare metal there is
+    // no PCI virtio device, so this fails fast and we go on.
     if (virtio_blk_init()) {
         backend = BACKEND_VIRTIO;
         kprintf("blkdev: virtio-blk\n");
@@ -99,6 +209,21 @@ int blkdev_init(uint32_t multiboot_addr) {
         // real device it is dead weight the size of the whole disk.
         if (have) release((uint64_t)(uintptr_t)base, (uint64_t)(uintptr_t)base + size);
         return 1;
+    }
+
+    // Then the stick the machine booted from, when the menu entry asked for
+    // it by naming the filesystem's UUID. Writes to it survive a reboot.
+    uint8_t uuid[16];
+    if (want_stick && parse_uuid(idtext, idlen, uuid)) {
+        if (find_stick(uuid)) {
+            backend = BACKEND_STICK;
+            kprintf("blkdev: the boot stick, USB disk %d, partition at sector %u, %u MiB\n",
+                    stick_dev, (unsigned)stick_first, (unsigned)(stick_sectors / 2048));
+            if (have) release((uint64_t)(uintptr_t)base, (uint64_t)(uintptr_t)base + size);
+            return 1;
+        }
+        kprintf("blkdev: the boot stick's disk was not found on any of %d USB disk(s)\n",
+                usb_disk_count());
     }
 
     if (have) {
@@ -112,26 +237,23 @@ int blkdev_init(uint32_t multiboot_addr) {
         return 1;
     }
 
-    kprintf("blkdev: no disk (no virtio device, no 'disk' module)\n");
+    if (want_stick)
+        kprintf("blkdev: no disk. Restart and choose \"disk in memory\" in the "
+                "boot menu.\n");
+    else
+        kprintf("blkdev: no disk (no virtio device, no 'disk' module)\n");
     return 0;
 }
 
 int blkdev_backend(void) { return backend; }
-
-int blkdev_read_sector(uint64_t lba, void *buf512) {
-    if (backend == BACKEND_VIRTIO) return virtio_blk_read_sector(lba, buf512);
-    if (backend == BACKEND_RAM) {
-        if (lba >= ram_sectors) return 0;
-        const uint8_t *src = ram_base + lba * 512;
-        uint8_t *dst = (uint8_t *)buf512;
-        for (int i = 0; i < 512; i++) dst[i] = src[i];
-        return 1;
-    }
-    return 0;
-}
+int blkdev_usb_dev(void) { return backend == BACKEND_STICK ? stick_dev : -1; }
 
 int blkdev_read_sectors(uint64_t lba, uint32_t count, void *buf) {
     if (backend == BACKEND_VIRTIO) return virtio_blk_read_sectors(lba, count, buf);
+    if (backend == BACKEND_STICK) {
+        if (lba + count > stick_sectors) return 0;
+        return usb_disk_read(stick_dev, (uint32_t)(stick_first + lba), count, buf);
+    }
     if (backend == BACKEND_RAM) {
         if (lba + count > ram_sectors) return 0;
         const uint64_t *src = (const uint64_t *)(ram_base + lba * 512);
@@ -142,14 +264,31 @@ int blkdev_read_sectors(uint64_t lba, uint32_t count, void *buf) {
     return 0;
 }
 
-int blkdev_write_sector(uint64_t lba, const void *buf512) {
-    if (backend == BACKEND_VIRTIO) return virtio_blk_write_sector(lba, buf512);
+int blkdev_write_sectors(uint64_t lba, uint32_t count, const void *buf) {
+    if (backend == BACKEND_VIRTIO) {
+        for (uint32_t i = 0; i < count; i++)
+            if (!virtio_blk_write_sector(lba + i, (const uint8_t *)buf + i * 512))
+                return 0;
+        return 1;
+    }
+    if (backend == BACKEND_STICK) {
+        if (lba + count > stick_sectors) return 0;
+        return usb_disk_write(stick_dev, (uint32_t)(stick_first + lba), count, buf);
+    }
     if (backend == BACKEND_RAM) {
-        if (lba >= ram_sectors) return 0;
-        uint8_t *dst = ram_base + lba * 512;
-        const uint8_t *src = (const uint8_t *)buf512;
-        for (int i = 0; i < 512; i++) dst[i] = src[i];
+        if (lba + count > ram_sectors) return 0;
+        const uint64_t *src = (const uint64_t *)buf;
+        uint64_t *dst = (uint64_t *)(ram_base + lba * 512);
+        for (uint32_t i = 0; i < count * 64; i++) dst[i] = src[i];
         return 1;   // RAM only: not written back to any real disk on reboot
     }
     return 0;
+}
+
+int blkdev_read_sector(uint64_t lba, void *buf512) {
+    return blkdev_read_sectors(lba, 1, buf512);
+}
+
+int blkdev_write_sector(uint64_t lba, const void *buf512) {
+    return blkdev_write_sectors(lba, 1, buf512);
 }

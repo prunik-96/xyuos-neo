@@ -45,8 +45,11 @@ OBJ   := $(SRC_C:.c=.o) $(SRC_S:.S=.o)
 KERNEL := build/xyuos_neo.elf
 ISO    := build/xyuos_neo.iso
 
-# The disk, in MiB. On bare metal the whole image is loaded into RAM by GRUB
-# as a module and is the only disk there is, so two things bound it:
+# The disk image, in MiB. On a stick written from the ISO the disk is the
+# partition appended to it (STICK_MB below), which is never read into memory.
+# This image is what GRUB loads into RAM instead when there is no such
+# partition -- the "disk in memory" menu entry, or the ISO booted as a CD --
+# and there two things bound it:
 #
 #   Boot time. GRUB reads every byte through the firmware before the kernel
 #   starts, empty blocks included. From a USB stick that is a few seconds per
@@ -379,14 +382,33 @@ build/python.elf: $(LIBC_A) $(CRT0) $(wildcard $(MPY_PORT)/*.c) $(wildcard $(MPY
 python-clean:
 	$(MAKE) -C $(MPY_PORT) clean
 
-$(ISO): $(KERNEL) $(USER_ELFS) build/python.elf grub.cfg disk.img
+# The same filesystem as disk.img, grown to STICK_MB, for the partition that
+# is appended to the ISO. On a stick written from the ISO it is the disk, and
+# it is never read into memory -- so, unlike DISK_MB, its size costs nothing
+# at boot, only the time it takes to write the stick. Same UUID as disk.img.
+STICK_MB := 1024
+
+build/stick.img: disk.img
+	cp disk.img $@
+	e2fsck -fy $@ >/dev/null 2>&1 || true
+	resize2fs -f $@ $(STICK_MB)M >/dev/null 2>&1
+
+# A partition type Windows leaves alone. The default, "Microsoft basic data",
+# would have it offer to format the stick's disk for you.
+LINUX_FS_GUID := 0FC63DAF-8483-4772-8E79-3D69D8477DE4
+
+$(ISO): $(KERNEL) $(USER_ELFS) build/python.elf grub.cfg disk.img build/stick.img
 	mkdir -p build/isodir/boot/grub
 	cp $(KERNEL) build/isodir/boot/xyuos_neo.elf
-	cp grub.cfg build/isodir/boot/grub/grub.cfg
-	# The filesystem image ships in the ISO as a GRUB module, so the OS has a
-	# disk on bare metal (a RAM disk) with no storage driver at all.
+	sed "s/@DISKID@/`cat build/diskid`/" grub.cfg > build/isodir/boot/grub/grub.cfg
+	# The filesystem image also ships inside the ISO as a GRUB module: the
+	# disk when booted from a CD, and the "disk in memory" menu entry.
 	cp disk.img build/isodir/boot/disk.img
-	grub-mkrescue -o $@ build/isodir 2>/dev/null
+	cp build/diskid build/isodir/boot/diskid
+	# And after the ISO, as a partition of its own: the disk on a stick
+	# written from this image (Rufus in DD mode, or dd). See grub.cfg.
+	grub-mkrescue -o $@ build/isodir -- \
+	    -append_partition 3 $(LINUX_FS_GUID) build/stick.img 2>/dev/null
 
 # Userland lives on the filesystem now (P2), so the disk image depends on the
 # program binaries. NOTE: disk.img has no dependency on the Makefile itself --
@@ -409,7 +431,11 @@ disk.img: disk/hello.txt disk/about.txt disk/t1.c disk/demo.c disk/calc.c \
 	rm -f disk.img
 	# See DISK_MB above for why this size and not a bigger one.
 	dd if=/dev/zero of=disk.img bs=1M count=$(DISK_MB) status=none
-	mke2fs -q -F -b 1024 -O ^resize_inode disk.img
+	# A fresh UUID each build: it is how the kernel recognises the stick's
+	# partition as the one written with this build, and nothing else.
+	mkdir -p build
+	python3 -c "import uuid; print(uuid.uuid4())" > build/diskid
+	mke2fs -q -F -b 1024 -O ^resize_inode -L xyuos -U `cat build/diskid` disk.img
 	debugfs -w -R "write disk/hello.txt hello.txt" disk.img
 	debugfs -w -R "write disk/about.txt about.txt" disk.img
 	debugfs -w -R "write disk/t1.c t1.c" disk.img
