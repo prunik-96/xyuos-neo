@@ -98,6 +98,8 @@ static inline void w64(volatile uint8_t *p, uint32_t off, uint64_t v) {
 
 #define TRB_TYPE(t) ((uint32_t)(t) << 10)
 #define TRB_CYCLE (1u << 0)
+#define TRB_ISP (1u << 2)     // interrupt on short packet
+#define TRB_CHAIN (1u << 4)   // the TD goes on in the next TRB
 #define TRB_IOC (1u << 5)     // interrupt on completion
 #define TRB_IDT (1u << 6)     // immediate data
 #define TRB_TYPE_OF(ctrl) (((ctrl) >> 10) & 0x3F)
@@ -287,9 +289,13 @@ static uint64_t ring_push(struct ring *r, uint32_t d0, uint32_t d1,
 
     r->enq++;
     if (r->enq == RING_SIZE - 1) {   // reached the Link TRB
-        // set the Link TRB's cycle to the producer cycle, then wrap+toggle
+        // set the Link TRB's cycle to the producer cycle, then wrap+toggle.
+        // A TD that runs on past the end of the ring runs on through the
+        // Link TRB too, and the controller must be told so: its Chain bit
+        // is the Chain bit of the TRB just written.
         uint32_t *link = &r->trb[(RING_SIZE - 1) * 4];
-        link[3] = (link[3] & ~TRB_CYCLE) | (r->cycle ? TRB_CYCLE : 0);
+        link[3] = (link[3] & ~(TRB_CYCLE | TRB_CHAIN)) | (control & TRB_CHAIN) |
+                  (r->cycle ? TRB_CYCLE : 0);
         r->enq = 0;
         r->cycle ^= 1;
     }
@@ -301,10 +307,23 @@ static void ring_doorbell(int slot, uint32_t target) {
     (void)r32(op, OP_USBSTS);   // posting read to flush
 }
 
-// Wait for a command/transfer completion event for `expect_trb` (its address),
-// returning the completion code, or -1 on timeout. Also drains port-change and
-// other events. If expect_trb is 0, returns on the first completion event.
-static int wait_event(uint64_t expect_trb, uint32_t *out_slot) {
+static int hid_event(uint32_t slot, uint32_t epid);
+
+// Wait for a completion, returning its completion code, or -1 on timeout.
+//
+// What is waited for: the completion of the TRB at `expect_trb`; or, when that
+// is 0 and `ep_slot` is not, the next transfer event from endpoint `ep_dci` of
+// slot `ep_slot` -- a transfer of several TRBs can finish early, at whichever
+// of them saw a short packet; or, with both 0, the first completion of any
+// kind.
+//
+// Everything else on the one shared event ring is dealt with on the way,
+// never dropped: a keyboard or mouse report is taken and its endpoint armed
+// again (hid_event). A disk transfer can take long enough for a key to be
+// pressed in the middle of it, and a report thrown away here used to leave
+// that keyboard with nothing armed -- silent for good.
+static int wait_completion(uint64_t expect_trb, int ep_slot, int ep_dci,
+                           uint32_t *out_slot) {
     for (uint32_t spin = 0; spin < 3000000; spin++) {
         uint32_t *e = &evt_ring[evt_deq * 4];
         uint32_t ctrl = e[3];
@@ -323,13 +342,25 @@ static int wait_event(uint64_t expect_trb, uint32_t *out_slot) {
         w64(rt, RT_ERDP, ((uint64_t)(uintptr_t)&evt_ring[evt_deq * 4]) | (1u << 3));
 
         if (type == TRB_CMD_COMPLETION || type == TRB_TRANSFER_EVENT) {
-            if (out_slot) *out_slot = slot;
-            if (expect_trb == 0 || ptr == expect_trb) return (int)TRB_CC(status);
-            // a completion for something else; keep looking
+            uint32_t epid = (ctrl >> 16) & 0x1F;
+            int mine = expect_trb ? ptr == expect_trb
+                     : ep_slot   ? (type == TRB_TRANSFER_EVENT &&
+                                    (int)slot == ep_slot && (int)epid == ep_dci)
+                     :             1;
+            if (mine) {
+                if (out_slot) *out_slot = slot;
+                return (int)TRB_CC(status);
+            }
+            // a completion for something else: a HID report is handled
+            if (type == TRB_TRANSFER_EVENT) hid_event(slot, epid);
         }
         // port status change etc. -> ignore, keep draining
     }
     return -1;
+}
+
+static int wait_event(uint64_t expect_trb, uint32_t *out_slot) {
+    return wait_completion(expect_trb, 0, 0, out_slot);
 }
 
 // A control transfer on EP0. setup is the 8-byte SETUP packet. If len>0 and
@@ -1316,41 +1347,70 @@ void xhci_poll(void) {
 
         if (type != TRB_TRANSFER_EVENT) continue;
         rndis_note_event(ctrl, status);   // don't drop a RNDIS RX completion
-
-        if (mdev.ready && mdev.slot == (int)slot) {
-            process_mouse_report(mouse_report);
-            for (int j = 0; j < 8; j++) mouse_report[j] = 0;
-            ring_push(&mdev.intr, (uint32_t)(uintptr_t)mouse_report,
-                      (uint32_t)((uint64_t)(uintptr_t)mouse_report >> 32), 8,
-                      TRB_TYPE(TRB_NORMAL) | TRB_IOC);
-            ring_doorbell(mdev.slot, mdev.dci);
-            continue;
-        }
-
-        for (int i = 0; i < nkbds; i++) {
-            if (kbds[i].slot != (int)slot) continue;
-            process_report(&kbds[i], report_bufs[i]);
-            // re-arm this keyboard's interrupt transfer
-            for (int j = 0; j < 8; j++) report_bufs[i][j] = 0;
-            ring_push(&kbds[i].intr, (uint32_t)(uintptr_t)report_bufs[i],
-                      (uint32_t)((uint64_t)(uintptr_t)report_bufs[i] >> 32), 8,
-                      TRB_TYPE(TRB_NORMAL) | TRB_IOC);
-            ring_doorbell(kbds[i].slot, kbds[i].dci);
-            break;
-        }
+        hid_event(slot, (ctrl >> 16) & 0x1F);
     }
+}
+
+// A transfer event that is a keyboard's or the mouse's report: hand the report
+// on and arm the endpoint for the next one. 1 if it was one of theirs. Called
+// from xhci_poll, and from wait_completion for events that arrive while it is
+// waiting for something else.
+static int hid_event(uint32_t slot, uint32_t epid) {
+    if (mdev.ready && mdev.slot == (int)slot && mdev.dci == (int)epid) {
+        process_mouse_report(mouse_report);
+        for (int j = 0; j < 8; j++) mouse_report[j] = 0;
+        ring_push(&mdev.intr, (uint32_t)(uintptr_t)mouse_report,
+                  (uint32_t)((uint64_t)(uintptr_t)mouse_report >> 32), 8,
+                  TRB_TYPE(TRB_NORMAL) | TRB_IOC);
+        ring_doorbell(mdev.slot, mdev.dci);
+        return 1;
+    }
+
+    for (int i = 0; i < nkbds; i++) {
+        if (kbds[i].slot != (int)slot || kbds[i].dci != (int)epid) continue;
+        process_report(&kbds[i], report_bufs[i]);
+        // re-arm this keyboard's interrupt transfer
+        for (int j = 0; j < 8; j++) report_bufs[i][j] = 0;
+        ring_push(&kbds[i].intr, (uint32_t)(uintptr_t)report_bufs[i],
+                  (uint32_t)((uint64_t)(uintptr_t)report_bufs[i] >> 32), 8,
+                  TRB_TYPE(TRB_NORMAL) | TRB_IOC);
+        ring_doorbell(kbds[i].slot, kbds[i].dci);
+        return 1;
+    }
+    return 0;
 }
 
 // --- USB Mass Storage: Bulk-Only Transport + SCSI ---------------------------
 
-// One bulk transfer (a single Normal TRB) on `dci`, waiting for its completion.
-// Returns 0 on success (SUCCESS or a Short Packet, both fine), -1 otherwise.
-static int msc_bulk(int slot, int dci, struct ring *r, void *buf, uint32_t len) {
-    uint64_t b = (uint64_t)(uintptr_t)buf;
-    uint64_t t = ring_push(r, (uint32_t)b, (uint32_t)(b >> 32), len,
-                           TRB_TYPE(TRB_NORMAL) | TRB_IOC);
+// One bulk transfer on `dci`, waiting for it to finish. Returns 0 on success
+// (SUCCESS or a Short Packet, both fine), -1 otherwise.
+//
+// A TRB's buffer may not cross a 64 KiB boundary (xHCI 4.11.7.1), so the
+// transfer is as many Normal TRBs as it touches such pieces, chained into one
+// TD. QEMU does not mind a TRB that crosses one; a real controller may. Each
+// TRB says how many packets are left after it (TD Size), and an IN transfer
+// asks to hear about a short packet wherever it happens, because the
+// controller then skips the rest of the TD -- the last TRB would never
+// complete. So the wait is for the next event on this endpoint, not for one
+// particular TRB.
+static int msc_bulk(int slot, int dci, struct ring *r, void *buf, uint32_t len,
+                    uint32_t mps, int in) {
+    uint64_t b = (uint64_t)(uintptr_t)buf, end = b + len;
+    if (!mps) mps = 512;
+    do {
+        uint64_t edge = (b | 0xFFFFull) + 1;
+        uint32_t n = (uint32_t)((edge < end ? edge : end) - b);
+        uint32_t left = (uint32_t)(end - b - n);
+        uint32_t packets = (left + mps - 1) / mps;
+        if (packets > 31) packets = 31;
+        int more = left > 0;
+        ring_push(r, (uint32_t)b, (uint32_t)(b >> 32), n | (packets << 17),
+                  TRB_TYPE(TRB_NORMAL) | (more ? TRB_CHAIN : TRB_IOC) |
+                  (in ? TRB_ISP : 0));
+        b += n;
+    } while (b < end);
     ring_doorbell(slot, dci);
-    int cc = wait_event(t, NULL);
+    int cc = wait_completion(0, slot, dci, NULL);
     return (cc == CC_SUCCESS || cc == CC_SHORT_PKT) ? 0 : -1;
 }
 
@@ -1373,13 +1433,13 @@ static int bot_xfer(struct msc_dev *d, const uint8_t *cdb, int cdb_len,
         msc_cbw[14] = (uint8_t)cdb_len;
         for (int i = 0; i < cdb_len && i < 16; i++) msc_cbw[15 + i] = cdb[i];
 
-        if (msc_bulk(d->slot, d->out_dci, &d->out, msc_cbw, 31) != 0) break;
+        if (msc_bulk(d->slot, d->out_dci, &d->out, msc_cbw, 31, d->mps, 0) != 0) break;
         if (data_len) {
             int dci = dir_in ? d->in_dci : d->out_dci;
             struct ring *r = dir_in ? &d->in : &d->out;
-            if (msc_bulk(d->slot, dci, r, data, data_len) != 0) break;
+            if (msc_bulk(d->slot, dci, r, data, data_len, d->mps, dir_in) != 0) break;
         }
-        if (msc_bulk(d->slot, d->in_dci, &d->in, msc_csw, 13) != 0) break;
+        if (msc_bulk(d->slot, d->in_dci, &d->in, msc_csw, 13, d->mps, 1) != 0) break;
         if (*(uint32_t *)(msc_csw + 0) != 0x53425355) break;   // 'USBS'
         result = msc_csw[12];                                  // bCSWStatus
     } while (0);
@@ -1451,7 +1511,8 @@ int rndis_send(const void *frame, int len) {
     const uint8_t *f = frame;
     for (int i = 0; i < len; i++) rndis_txbuf[44 + i] = f[i];
     __asm__ volatile ("cli");
-    int r = msc_bulk(rndis.slot, rndis.out_dci, &rndis.out, rndis_txbuf, 44 + len);
+    int r = msc_bulk(rndis.slot, rndis.out_dci, &rndis.out, rndis_txbuf, 44 + len,
+                     rndis.mps, 0);
     __asm__ volatile ("sti");
     return r;
 }
