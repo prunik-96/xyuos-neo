@@ -1,24 +1,95 @@
-/* Measuring text, and the one function that decides how big it is.
+/* Measuring text, and the one place a NetSurf font becomes a real one.
  *
- * The font here is a bitmap one at a fixed cell, magnified by a whole number.
- * That sounds like a limitation and is mostly a gift: measurement is exact,
- * costs nothing, and cannot disagree with drawing, because both go through
- * xy_font_scale below. Half the awkward bugs in a browser's text layout come
- * from measuring with one set of metrics and drawing with another.
+ * With the fonts on the disk, every question NetSurf asks -- how wide is
+ * this, where did the click land, where should this line end -- goes to
+ * libtext, which answers from the same shaping it draws from. Kerning,
+ * ligatures, Arabic joining and the rest therefore reach the layout, not
+ * only the pixels: a line of Arabic is exactly as wide as it will be drawn.
  *
- * What it does cost is choice. A page asking for 11pt and one asking for 12pt
- * get the same size when both round to the same magnification. Between 1x and
- * 2x that is a wide gap, and it is the honest consequence of a font that
- * exists at one size.
+ * Without them the old bitmap font is still here: fixed cells, magnified by
+ * a whole number. Measurement is trivially exact there too, because both
+ * sides go through xy_font_scale. It is the fallback, not the design.
  */
 
 #include <string.h>
+#include <strings.h>
+
+#include <libwapcaplet/libwapcaplet.h>
 
 #include "utils/log.h"
 #include "netsurf/layout.h"
 #include "netsurf/plot_style.h"
+#include "netsurf/browser_window.h"
 
 #include "xy_front.h"
+
+bool xy_text = false;
+
+void xy_text_init(void) {
+    xy_text = txt_init(NULL) > 0;
+    if (!xy_text)
+        NSLOG(netsurf, WARNING, "no fonts in /fonts: using the bitmap font");
+}
+
+/* --- which family ------------------------------------------------------- */
+
+static int has(const char *s, const char *what) { return strstr(s, what) != NULL; }
+
+/* A page names fonts it hopes the reader has. We have three, so each name is
+ * sorted into the one it most resembles, and a name that says nothing about
+ * that is passed over for the next in the list. */
+static int family_named(lwc_string *name) {
+    char s[64];
+    size_t n = lwc_string_length(name);
+    if (n >= sizeof s) n = sizeof s - 1;
+    for (size_t i = 0; i < n; i++) {
+        char c = lwc_string_data(name)[i];
+        s[i] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
+    }
+    s[n] = 0;
+
+    if (has(s, "mono") || has(s, "courier") || has(s, "consol") ||
+        has(s, "menlo") || has(s, "monaco") || has(s, "code") ||
+        strcmp(s, "monospace") == 0)
+        return TXT_MONO;
+    if ((has(s, "serif") && !has(s, "sans")) || has(s, "times") ||
+        has(s, "georgia") || has(s, "garamond") || has(s, "cambria") ||
+        has(s, "palatino") || has(s, "baskerville") || has(s, "libertine") ||
+        has(s, "merriweather") || has(s, "book"))
+        return TXT_SERIF;
+    if (has(s, "sans") || has(s, "arial") || has(s, "helvetica") ||
+        has(s, "verdana") || has(s, "tahoma") || has(s, "segoe") ||
+        has(s, "roboto") || has(s, "system-ui") || has(s, "apple-system") ||
+        has(s, "inter") || has(s, "ubuntu") || has(s, "lato") ||
+        has(s, "open sans") || has(s, "noto"))
+        return TXT_SANS;
+    return -1;
+}
+
+void xy_text_style(const plot_font_style_t *f, txt_style *st) {
+    int fam = -1;
+    if (f->families)
+        for (lwc_string * const *p = f->families; *p && fam < 0; p++)
+            fam = family_named(*p);
+    if (fam < 0)
+        fam = f->family == PLOT_FONT_FAMILY_SERIF     ? TXT_SERIF
+            : f->family == PLOT_FONT_FAMILY_MONOSPACE ? TXT_MONO
+            :                                           TXT_SANS;
+    st->family = (txt_family)fam;
+    st->weight = f->weight;
+    st->italic = (f->flags & (FONTF_ITALIC | FONTF_OBLIQUE)) != 0;
+
+    /* NetSurf hands over points, fixed point with ten fraction bits, having
+     * turned CSS pixels into them at browser_get_dpi(). Back to pixels at
+     * the same rate, so 16px in the style sheet is 16 pixels here. */
+    long long v = (long long)f->size * browser_get_dpi() * 64 /
+                  (72LL << PLOT_STYLE_RADIX);
+    if (v < 64) v = 64;
+    if (v > 512 * 64) v = 512 * 64;
+    st->size = (int)v;
+}
+
+/* --- the bitmap font, for when there are no fonts ------------------------ */
 
 /* Points to pixels at the 96dpi CSS assumes, then to whole cells. */
 int xy_font_scale(const plot_font_style_t *fstyle) {
@@ -49,8 +120,16 @@ static int chars_in(const char *s, size_t len) {
     return n;
 }
 
+/* --- the three questions -------------------------------------------------- */
+
 static nserror xyl_width(const plot_font_style_t *fstyle,
                          const char *string, size_t length, int *width) {
+    if (xy_text) {
+        txt_style st;
+        xy_text_style(fstyle, &st);
+        *width = txt_width(&st, string, length);
+        return NSERROR_OK;
+    }
     *width = chars_in(string, length) * xy_gui.fw * xy_font_scale(fstyle);
     return NSERROR_OK;
 }
@@ -58,6 +137,13 @@ static nserror xyl_width(const plot_font_style_t *fstyle,
 static nserror xyl_position(const plot_font_style_t *fstyle,
                             const char *string, size_t length, int x,
                             size_t *char_offset, int *actual_x) {
+    if (xy_text) {
+        txt_style st;
+        xy_text_style(fstyle, &st);
+        *char_offset = txt_hit(&st, string, length, x, actual_x);
+        return NSERROR_OK;
+    }
+
     int step = xy_gui.fw * xy_font_scale(fstyle);
     if (step < 1) step = 1;
 
@@ -79,6 +165,16 @@ static nserror xyl_position(const plot_font_style_t *fstyle,
 static nserror xyl_split(const plot_font_style_t *fstyle,
                          const char *string, size_t length, int x,
                          size_t *char_offset, int *actual_x) {
+    if (xy_text) {
+        /* Where a line may end is Unicode's to say (UAX #14), not only at
+         * spaces: after a hyphen, between two Chinese characters. NetSurf's
+         * layout drops the space at a split point and keeps anything else. */
+        txt_style st;
+        xy_text_style(fstyle, &st);
+        *char_offset = txt_split(&st, string, length, x, actual_x);
+        return NSERROR_OK;
+    }
+
     int step = xy_gui.fw * xy_font_scale(fstyle);
     if (step < 1) step = 1;
 

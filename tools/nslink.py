@@ -61,16 +61,38 @@ LIBS = [
     HOME + "/third_party/netsurf/libnsbmp.a",
     HOME + "/third_party/netsurf/libutf8proc.a",
     HOME + "/third_party/shim/libnsshim.a",
+    # The text stack: fonts, shaping, bidi, line breaking. Built by the
+    # Makefile (make build/libtext.a and the four under it).
+    HOME + "/build/libtext.a",
+    HOME + "/build/libharfbuzz.a",
+    HOME + "/build/libfreetype.a",
+    HOME + "/build/libsheenbidi.a",
+    HOME + "/build/libunibreak.a",
     HOME + "/build/libc.a",
 ]
 for p in LIBS:
     if not os.path.exists(p):
         sys.exit("missing: " + p)
 
+# HarfBuzz is C++, so the C++ runtime comes after everything that calls into
+# it, then libc once more for what the runtime itself asks of it, and libgcc
+# for the arithmetic helpers the compiler emits calls to.
+def toolchain_file(name):
+    return run([BIN + "g++", "-print-file-name=" + name]).stdout.strip()
+
+RUNTIME = [toolchain_file("libstdc++.a"), toolchain_file("libsupc++.a"),
+           HOME + "/build/libc.a",
+           run([BIN + "gcc", "-print-libgcc-file-name"]).stdout.strip()]
+
+# One group: the linker goes round all of these until nothing new turns up.
+# Listing them twice used to be enough, and stopped being enough the day the
+# text libraries arrived -- the Duktape bindings' navigator.o was then first
+# wanted on the second pass, after the core that defines user_agent_string
+# had already gone by. A group has no such pass to miss.
 elf = OUT + "/netsurf.elf"
 cmd = ([BIN + "ld", "-nostdlib", "-static", "-o", elf,
-        "-T", HOME + "/userland/link.ld", HOME + "/build/crt0.o"]
-       + LIBS + LIBS + [HOME + "/build/libc.a"])
+        "-T", HOME + "/userland/link.ld", HOME + "/build/crt0.o",
+        "--start-group"] + LIBS + RUNTIME + ["--end-group"])
 
 r = run(cmd)
 

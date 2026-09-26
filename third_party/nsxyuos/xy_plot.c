@@ -456,7 +456,10 @@ static nserror xyp_bitmap(const struct redraw_context *ctx,
 
 /* --- text ---------------------------------------------------------------- */
 
-/* The window manager's font covers Latin, Latin-1, Latin Extended-A and
+/* What follows is for the bitmap font only, when there are no fonts on the
+ * disk; with them, libtext draws every one of these characters as itself.
+ *
+ * The window manager's font covers Latin, Latin-1, Latin Extended-A and
  * Cyrillic. Typography lives above all of that: the quotation marks a word
  * processor inserts, the dash between a range of numbers, the ellipsis, the
  * bullet in front of every item of every list. A page is full of them, and
@@ -494,6 +497,16 @@ static nserror xyp_text(const struct redraw_context *ctx,
                         const plot_font_style_t *fstyle, int x, int y,
                         const char *text, size_t length) {
     (void)ctx;
+    if (xy_text) {
+        /* Real fonts: every script, every size, the same shaping the layout
+         * measured with. y is the baseline, which is what libtext wants. */
+        txt_style st;
+        xy_text_style(fstyle, &st);
+        txt_target t = { xy_gui.px, xy_gui.w, xy_cx0, xy_cy0, xy_cx1, xy_cy1 };
+        txt_draw(&t, &st, x, y, xy_colour(fstyle->foreground), text, length);
+        return NSERROR_OK;
+    }
+
     int scale = xy_font_scale(fstyle);
     unsigned c = xy_colour(fstyle->foreground);
     int top = y - xy_font_ascent(scale);

@@ -93,6 +93,39 @@ static int inside(int px, int py, int x, int y, int w, int h) {
     return px >= x && px < x + w && py >= y && py < y + h;
 }
 
+/* A line of chrome text, centred in a strip of height h, no wider than maxw.
+ * A page's title is in whatever script the page is in, so with fonts on the
+ * disk this goes through libtext like the page does; one too long ends in an
+ * ellipsis rather than simply stopping. The address field is the exception:
+ * it is an editor, with a cursor that moves a character cell at a time, and
+ * an address is nearly always ASCII -- it keeps the cell font. */
+static void chrome_text(int x, int y, int h, const char *s, unsigned col, int maxw) {
+    if (!xy_text) {
+        gui_text_clip(&xy_gui, x, y + (h - xy_gui.fh) / 2, s, col, maxw);
+        return;
+    }
+    txt_style st = { TXT_SANS, 400, 0, 13 * 64 };
+    int asc, desc;
+    txt_metrics(&st, &asc, &desc);
+    int base = y + (h + asc - desc) / 2;
+    txt_target t = { xy_gui.px, xy_gui.w, x, y, x + maxw, y + h };
+    if (t.x1 > xy_gui.w) t.x1 = xy_gui.w;
+    if (t.y1 > xy_gui.h) t.y1 = xy_gui.h;
+
+    size_t len = strlen(s);
+    if (txt_width(&st, s, len) <= maxw) {
+        txt_draw(&t, &st, x, base, col, s, len);
+        return;
+    }
+    static const char dots[] = "\xE2\x80\xA6";          /* the ellipsis */
+    int dw = txt_width(&st, dots, 3), at = 0;
+    size_t keep = txt_hit(&st, s, len, maxw - dw, &at);
+    if (at > maxw - dw && keep > 0)                   /* nearest may be past it */
+        keep = txt_hit(&st, s, keep, at - 1, &at);
+    txt_draw(&t, &st, x, base, col, s, keep);
+    txt_draw(&t, &st, x + at, base, col, dots, 3);
+}
+
 /* --- the tabs ------------------------------------------------------------ */
 
 static void draw_tabs(int mx, int my) {
@@ -116,8 +149,7 @@ static void draw_tabs(int mx, int my) {
 
         const char *name = xy_tabs[i]->title[0] ? xy_tabs[i]->title
                                                 : "loading";
-        gui_text_clip(&xy_gui, x + 8, (XY_TABS_H - xy_gui.fh) / 2, name,
-                      on ? C_TEXT : C_DIM, tw - 28);
+        chrome_text(x + 8, 0, XY_TABS_H, name, on ? C_TEXT : C_DIM, tw - 28);
 
         /* The cross. Two strokes, drawn rather than lettered for the same
          * reason as the arrows. */
@@ -217,8 +249,7 @@ void xy_status_draw(void) {
         msg = xy_win->status[0] ? xy_win->status : xy_win->url;
         if (xy_win->throbbing && xy_win->status[0] == 0) msg = "loading ...";
     }
-    gui_text_clip(&xy_gui, 8, y + (XY_STATUS_H - xy_gui.fh) / 2, msg,
-                  C_DIM, xy_gui.w - 90);
+    chrome_text(8, y, XY_STATUS_H, msg, C_DIM, xy_gui.w - 90);
 
     /* How far down the page, on the right, where a person looks for it. */
     if (xy_ntabs > 0 && xy_win) {
@@ -229,8 +260,7 @@ void xy_status_draw(void) {
             if (pct > 100) pct = 100;
             char pc[16];
             snprintf(pc, sizeof pc, "%d%%", pct);
-            gui_text(&xy_gui, xy_gui.w - 46,
-                     y + (XY_STATUS_H - xy_gui.fh) / 2, pc, C_DIM);
+            chrome_text(xy_gui.w - 46, y, XY_STATUS_H, pc, C_DIM, 40);
         }
     }
 }

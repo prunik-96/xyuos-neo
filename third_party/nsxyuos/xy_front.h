@@ -110,6 +110,16 @@ static inline unsigned xy_colour(colour c) {
     return ((c & 0x0000FFu) << 16) | (c & 0x00FF00u) | ((c >> 16) & 0xFFu);
 }
 
+/* Text, through libtext when the fonts are on the disk (xy_text), through
+ * the bitmap font when they are not. xy_layout.c decides which. */
+#include "text.h"
+
+extern bool xy_text;
+void xy_text_init(void);
+
+/* NetSurf's description of a font, as libtext's. */
+void xy_text_style(const plot_font_style_t *f, txt_style *st);
+
 /* How many times the bitmap font is magnified for a given style. Layout and
  * drawing both go through this, so what is measured is what is drawn --
  * which is the whole reason a font this simple is workable. */

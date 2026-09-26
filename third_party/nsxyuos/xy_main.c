@@ -52,9 +52,9 @@ static bool address_focused = false;
 static nserror set_defaults(struct nsoption_s *defaults) {
     (void)defaults;
 
-    /* Nothing is written to disc: this system's storage is a thirty-two
-     * megabyte image, and NetSurf's own default for the disc cache is a
-     * gigabyte. The memory cache is what there is. */
+    /* Nothing is written to disc: this system's storage is an image of a
+     * hundred and twenty-eight megabytes, and NetSurf's own default for the
+     * disc cache is a gigabyte. The memory cache is what there is. */
     nsoption_set_int(memory_cache_size, 8 * 1024 * 1024);
     nsoption_set_uint(disc_cache_size, 0);
 
@@ -66,6 +66,11 @@ static nserror set_defaults(struct nsoption_s *defaults) {
      * engine would otherwise pretend to have one; this build has Duktape and
      * the generated DOM bindings linked in, so it can say yes. */
     nsoption_set_bool(enable_javascript, true);
+
+    /* The text size a page gets when it does not choose one, in tenths of
+     * a point: 12pt, which at the 96 DPI set in main is the 16 pixels every
+     * other browser uses. NetSurf's 12.8 was chosen for its own 90. */
+    nsoption_set_int(font_size, 120);
 
     return NSERROR_OK;
 }
@@ -373,6 +378,12 @@ int main(int argc, char **argv) {
         printf("netsurf: failed to start\n");
         return 1;
     }
+
+    /* A CSS pixel is a screen pixel, and a point is 1/72 of 96 of them, as
+     * in every current browser. NetSurf's own default is 90, which makes
+     * 12pt text 15 pixels instead of the 16 a page expects. */
+    browser_set_dpi(96);
+    xy_text_init();
 
     /* The http and https fetcher, over this system's own network calls.
      * fetcher_init() registered none, because NetSurf was built without
