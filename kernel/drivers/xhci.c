@@ -10,6 +10,7 @@
 #include "framebuffer.h"
 #include "../kernel/kio.h"
 #include "mouse.h"
+#include "hid.h"
 #include "../arch/x86_64/pit.h"
 #include "../mm/paging.h"
 #include <stdint.h>
@@ -130,7 +131,10 @@ __attribute__((aligned(64))) static uint8_t  in_ctx[2048];        // input conte
 __attribute__((aligned(4096))) static uint64_t scratchpad_arr[64];
 __attribute__((aligned(4096))) static uint8_t scratchpad_bufs[8][4096];
 
-__attribute__((aligned(64))) static uint8_t  xfer_buf[256];       // descriptors (transient)
+// Descriptors (transient). 1 KiB for a HID report descriptor, which is often
+// longer than the 255 bytes a configuration is read in; aligned so that a
+// control transfer into it never crosses a 64 KiB line.
+__attribute__((aligned(1024))) static uint8_t xfer_buf[1024];
 
 // Where a HID report lands. A boot report is 8 bytes at most, but the buffer
 // must hold a whole packet of the endpoint's size: a device that sends more
@@ -237,7 +241,12 @@ static int port_is_rndis(int port) {
 __attribute__((aligned(4096))) static uint32_t mouse_intr_ring[RING_SIZE * 4];
 __attribute__((aligned(64)))   static uint8_t  mouse_dev_ctx[2048];
 __attribute__((aligned(64)))   static uint8_t  mouse_report[HID_BUF];
-static struct { struct ring intr; int slot, dci, port, ready; uint32_t len; } mdev;
+static struct {
+    struct ring intr;
+    int slot, dci, port, ready;
+    uint32_t len;
+    hid_mouse_fmt fmt;          // where its reports keep what (see hid.h)
+} mdev;
 
 static int port_is_mouse(int port) {
     return mdev.ready && mdev.port == port;
@@ -589,14 +598,31 @@ static uint32_t hid_len(int mps) {
     return (uint32_t)(mps < HID_BUF ? mps : HID_BUF);
 }
 
-// Add a boot-protocol mouse's interrupt IN endpoint to the slot being probed.
-// `keep_dci` is an endpoint the slot already has -- the keyboard of a combo
-// device -- or 0: the slot context must go on counting it.
+// Add a mouse's interrupt IN endpoint to the slot being probed. `rlen` is the
+// length of its HID report descriptor, 0 if it gave none. `keep_dci` is an
+// endpoint the slot already has -- the keyboard of a combo device -- or 0:
+// the slot context must go on counting it.
 static int add_mouse(int port, uint32_t speed, int ep_addr, int iface, int mps,
-                     int keep_dci) {
+                     int rlen, int keep_dci) {
     uint8_t setup[8];
-    make_setup(setup, 0x21, 0x0B, 0, (uint16_t)iface, 0); // SET_PROTOCOL(boot)
+
+    // Where its reports keep the buttons, X, Y and wheel: from its own report
+    // descriptor, and then the reports are taken as they are described. Only
+    // when that cannot be read is the boot protocol asked for -- a request
+    // some devices accept and then ignore (see hid.h).
+    int parsed = 0;
+    if (rlen > (int)sizeof xfer_buf) rlen = (int)sizeof xfer_buf;
+    if (rlen > 0) {
+        make_setup(setup, 0x81, 6, 0x2200, (uint16_t)iface, (uint16_t)rlen); // GET_DESCRIPTOR(report)
+        if (control_in(setup, rlen) == CC_SUCCESS)
+            parsed = hid_parse_mouse(xfer_buf, rlen, &mdev.fmt);
+    }
+    if (!parsed) hid_mouse_boot(&mdev.fmt);
+    make_setup(setup, 0x21, 0x0B, parsed ? 1 : 0, (uint16_t)iface, 0); // SET_PROTOCOL
     control_in(setup, 0);                                 // some devices STALL
+    DBG("xhci: mouse reports %s: id %d x %d/%d y %d/%d wheel %d/%d\n",
+        parsed ? "as described" : "boot protocol", mdev.fmt.id,
+        mdev.fmt.x, mdev.fmt.xs, mdev.fmt.y, mdev.fmt.ys, mdev.fmt.wheel, mdev.fmt.ws);
 
     int dci = (ep_addr & 0x0F) * 2 + 1;
     int entries = dci > keep_dci ? dci : keep_dci;
@@ -636,8 +662,9 @@ static int add_mouse(int port, uint32_t speed, int ep_addr, int iface, int mps,
     return 1;
 }
 
-// Configure a device that is only a HID boot-protocol mouse.
-static int configure_mouse(int port, uint32_t speed, int ep_addr, int iface, int mps) {
+// Configure a device that is only a mouse.
+static int configure_mouse(int port, uint32_t speed, int ep_addr, int iface, int mps,
+                           int rlen) {
     uint8_t setup[8];
     make_setup(setup, 0x00, 9, 1, 0, 0);                  // SET_CONFIGURATION(1)
     if (control_in(setup, 0) != CC_SUCCESS) return 0;
@@ -648,7 +675,7 @@ static int configure_mouse(int port, uint32_t speed, int ep_addr, int iface, int
     for (int i = 0; i < 2048; i++) mouse_dev_ctx[i] = src[i];
     dcbaa[slot_id] = (uint64_t)(uintptr_t)mouse_dev_ctx;
 
-    return add_mouse(port, speed, ep_addr, iface, mps, 0);
+    return add_mouse(port, speed, ep_addr, iface, mps, rlen, 0);
 }
 
 // Configure a RNDIS/CDC network adapter: SET_CONFIGURATION, add its bulk IN/OUT
@@ -930,6 +957,7 @@ static int enumerate_port(int port, int strict) {
     int msc_in = 0, msc_out = 0;      // mass-storage bulk IN/OUT endpoint addrs
     int mouse_if = -1, mouse_ep = 0, mouse_mps = 0; // HID mouse (boot protocol 2)
     int rn_comm = -1, rn_in = 0, rn_out = 0;   // RNDIS comm interface + data bulk
+    int hid_rlen[8] = { 0 };          // report descriptor length, per interface
     for (int i = 0; i + 2 < total; ) {
         int blen = xfer_buf[i];
         int btype = xfer_buf[i + 1];
@@ -945,6 +973,11 @@ static int enumerate_port(int port, int strict) {
             if ((cur_cls == 0x02 && cur_sub == 0x02) ||
                 (cur_cls == 0xE0 && cur_sub == 0x01 && cur_proto == 0x03))
                 rn_comm = cur_iface;
+        } else if (btype == 0x21 && cur_cls == 3 && blen >= 9 && i + 8 < total) {
+            // HID descriptor: the length of the report descriptor, which is
+            // fetched separately and says what the reports look like.
+            if (xfer_buf[i + 6] == 0x22)
+                hid_rlen[cur_iface & 7] = xfer_buf[i + 7] | (xfer_buf[i + 8] << 8);
         } else if (btype == 5) {                              // endpoint
             int addr = xfer_buf[i + 2];
             int attr = xfer_buf[i + 3];
@@ -979,7 +1012,7 @@ static int enumerate_port(int port, int strict) {
     // keyboard is configured as a keyboard below, and its mouse added to the
     // same slot after it.
     if (kbd_if < 0 && mouse_if >= 0 && !mdev.ready) {
-        if (configure_mouse(port, speed, mouse_ep, mouse_if, mouse_mps)) {
+        if (configure_mouse(port, speed, mouse_ep, mouse_if, mouse_mps, hid_rlen[mouse_if & 7])) {
             g_stage = "mouse";
             slot_id = 0;            // committed; don't let disable_slot free it
             goto done;
@@ -1046,7 +1079,7 @@ static int enumerate_port(int port, int strict) {
     // Unifying present the mouse and a keyboard (the media keys come through
     // it) on one plug, and taking only the keyboard left the mouse dead.
     if (mouse_if >= 0 && !mdev.ready &&
-        !add_mouse(port, speed, mouse_ep, mouse_if, mouse_mps, kbd_dci))
+        !add_mouse(port, speed, mouse_ep, mouse_if, mouse_mps, hid_rlen[mouse_if & 7], kbd_dci))
         DBG("xhci: port %d: the mouse of this combo device did not configure\n", port);
 
     slot_id = 0;             // committed; don't let a later disable_slot free it
@@ -1353,13 +1386,15 @@ static void process_report(struct kbdev *kb, const uint8_t *r) {
     kb->prevmod = mod;
 }
 
-// One HID boot-protocol mouse report: buttons, then signed relative motion.
-static void process_mouse_report(const uint8_t *r) {
+// One mouse report, read by the layout its own descriptor gave (mdev.fmt).
+static void process_mouse_report(const uint8_t *r, int len) {
+    int b, dx, dy, wheel;
+    if (!hid_mouse_read(&mdev.fmt, r, len, &b, &dx, &dy, &wheel)) return;
     uint8_t buttons = 0;
-    if (r[0] & 0x01) buttons |= MOUSE_LEFT;
-    if (r[0] & 0x02) buttons |= MOUSE_RIGHT;
-    if (r[0] & 0x04) buttons |= MOUSE_MIDDLE;
-    mouse_inject(buttons, (int)(int8_t)r[1], (int)(int8_t)r[2], (int)(int8_t)r[3]);
+    if (b & 1) buttons |= MOUSE_LEFT;
+    if (b & 2) buttons |= MOUSE_RIGHT;
+    if (b & 4) buttons |= MOUSE_MIDDLE;
+    mouse_inject(buttons, dx, dy, wheel);
 }
 
 int xhci_present(void) { return kbd_ready || mdev.ready; }
@@ -1402,13 +1437,14 @@ void xhci_poll(void) {
 // is known, and it decides what the report is. A boot keyboard report is
 // exactly 8 bytes; a receiver's keyboard interface also sends the 2- and
 // 3-byte reports of its media keys, which read as a boot report would be a
-// stream of wrong keys. A boot mouse report is at least 3 bytes.
+// stream of wrong keys. A mouse report is read by the layout its own
+// descriptor gave (hid.h).
 static int hid_event(uint32_t slot, uint32_t epid, uint32_t status) {
     uint32_t missing = status & 0xFFFFFF;
 
     if (mdev.ready && mdev.slot == (int)slot && mdev.dci == (int)epid) {
         uint32_t got = missing < mdev.len ? mdev.len - missing : 0;
-        if (got >= 3) process_mouse_report(mouse_report);
+        if (got > 0) process_mouse_report(mouse_report, (int)got);
         arm_hid(&mdev.intr, mouse_report, mdev.len, mdev.slot, mdev.dci);
         return 1;
     }
