@@ -25,6 +25,9 @@ stick, no CD and no virtio, so the disk is the partition on the stick. The
 stick is a copy of the ISO in /tmp/seqrun; SEQRUN_KEEP=1 keeps the one from
 the last run instead, to see that what was written survived. SEQRUN_UEFI=1
 boots with OVMF instead of SeaBIOS, as the real machine does.
+
+SEQRUN_USBNET=1 puts the network on QEMU's USB RNDIS adapter instead of the
+e1000: the path a phone's USB tethering takes on real hardware.
 """
 import os, shutil, socket, subprocess, sys, time
 
@@ -56,6 +59,11 @@ elif not RAMDISK:
     DISK = ["-drive", "file=%s/disk.img,if=none,id=d0,format=raw" % OUT,
             "-device", "virtio-blk-pci,drive=d0"]
 BOOT = [] if STICK else ["-cdrom", XYUOS + "/build/xyuos_neo.iso"]
+# SEQRUN_USBNET=1: the network through QEMU's USB RNDIS adapter instead of the
+# e1000 -- the path a tethered phone takes on real hardware.
+NET = (["-nic", "none", "-netdev", "user,id=n0",
+        "-device", "usb-net,bus=xhci.0,netdev=n0"]
+       if os.environ.get("SEQRUN_USBNET") == "1" else [])
 FIRMWARE = ["-bios", "/usr/share/qemu/OVMF.fd"] if UEFI else []
 
 proc = subprocess.Popen(
@@ -65,7 +73,7 @@ proc = subprocess.Popen(
     ["-device", "qemu-xhci,id=xhci"] +
     (["-device", "usb-storage,bus=xhci.0,drive=stick,bootindex=0"] if STICK else []) +
     ["-device", "usb-kbd,bus=xhci.0", "-device", "usb-mouse,bus=xhci.0",
-     "-monitor", "unix:%s,server,nowait" % MON],
+     "-monitor", "unix:%s,server,nowait" % MON] + NET,
     stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
 
 

@@ -218,7 +218,21 @@ __attribute__((aligned(4096))) static uint32_t rndis_in_trbs[RING_SIZE * 4];
 __attribute__((aligned(4096))) static uint32_t rndis_out_trbs[RING_SIZE * 4];
 __attribute__((aligned(64)))   static uint8_t  rndis_dev_ctx[2048];
 __attribute__((aligned(64)))   static uint8_t  rndis_ctrl[512];     // control OUT data
-__attribute__((aligned(64)))   static uint8_t  rndis_rxbuf[2048];   // one RX transfer
+// Receiving: RNDIS_RX_BUFS transfers are kept with the controller at once,
+// each RNDIS_RX_SIZE bytes -- which is also the MaxTransferSize the phone is
+// told in INITIALIZE, so it is the most one transfer from it can hold.
+//
+// Both numbers matter. A phone sends as soon as it has packets; with one
+// small buffer posted only when the browser next polled, whatever came in
+// between waited in the phone's short queue or was dropped, and every drop
+// cost a TCP retransmission timeout -- pages took minutes. And many Android
+// phones put several packets into one transfer when the host allows it,
+// which the INITIALIZE here always did: into a 2 KiB buffer, of which only
+// the first packet was read.
+#define RNDIS_RX_BUFS 8
+#define RNDIS_RX_SIZE 16384
+__attribute__((aligned(RNDIS_RX_SIZE)))
+static uint8_t rndis_rxbufs[RNDIS_RX_BUFS][RNDIS_RX_SIZE];
 struct rndis_dev {
     struct ring in, out;
     int slot, in_dci, out_dci, comm_if, port;
@@ -252,24 +266,38 @@ static int port_is_mouse(int port) {
     return mdev.ready && mdev.port == port;
 }
 
-// RX is non-blocking: one bulk-IN transfer is kept posted, and whichever event
-// drainer (wait_event during a TX, xhci_poll from the timer, or rndis_recv's own
-// scan) observes its completion records it here. rndis_recv then consumes it.
-static volatile int      rndis_rx_done = 0;
-static volatile uint32_t rndis_rx_resid = 0;
-static int               rndis_rx_posted = 0;
+// RX is non-blocking. The buffers go round in order: each is free, with the
+// controller, or full and waiting to be read; bulk IN transfers on one
+// endpoint complete in the order they were posted, so the next completion is
+// always rndis_rx_fill's. Whichever event drainer sees a completion (wait_
+// completion during a TX, xhci_poll from the timer, or rndis_recv's own scan)
+// records it here; rndis_recv reads the packets out.
+#define RX_FREE   0
+#define RX_POSTED 1
+#define RX_FULL   2
+static volatile uint8_t  rndis_rx_state[RNDIS_RX_BUFS];
+static volatile uint32_t rndis_rx_got[RNDIS_RX_BUFS];   // bytes in a full one
+static volatile int      rndis_rx_fill;   // the next to complete
+static int               rndis_rx_post;   // the next to hand to the controller
+static int               rndis_rx_read;   // the next to read packets from
+static uint32_t          rndis_rx_off;    // where in it
 
-// Called by every event-ring drainer for each transfer event it consumes, so a
-// RNDIS bulk-IN completion is never silently dropped no matter who saw it.
-static inline void rndis_note_event(uint32_t ctrl, uint32_t status) {
-    if (!rndis_found) return;
-    if (TRB_TYPE_OF(ctrl) != TRB_TRANSFER_EVENT) return;
+// Called by every event-ring drainer for each event it consumes, so a RNDIS
+// bulk-IN completion is never silently dropped no matter who saw it. 1 if the
+// event was that.
+static inline int rndis_note_event(uint32_t ctrl, uint32_t status) {
+    if (!rndis_found) return 0;
+    if (TRB_TYPE_OF(ctrl) != TRB_TRANSFER_EVENT) return 0;
     uint32_t slot = (ctrl >> 24) & 0xFF;
     uint32_t ep   = (ctrl >> 16) & 0x1F;
-    if ((int)slot == rndis.slot && (int)ep == rndis.in_dci) {
-        rndis_rx_resid = status & 0xFFFFFF;
-        rndis_rx_done = 1;
-    }
+    if ((int)slot != rndis.slot || (int)ep != rndis.in_dci) return 0;
+    int i = rndis_rx_fill;
+    uint32_t cc = (status >> 24) & 0xFF, missing = status & 0xFFFFFF;
+    rndis_rx_got[i] = (cc == CC_SUCCESS || cc == CC_SHORT_PKT) && missing <= RNDIS_RX_SIZE
+                      ? RNDIS_RX_SIZE - missing : 0;
+    rndis_rx_state[i] = RX_FULL;
+    rndis_rx_fill = (i + 1) % RNDIS_RX_BUFS;
+    return 1;
 }
 
 static void delay_ms(uint32_t ms) {
@@ -780,7 +808,7 @@ static int rndis_control_init(void) {
     put32(m + 8, 1);               // RequestId
     put32(m + 12, 1);              // MajorVersion
     put32(m + 16, 0);              // MinorVersion
-    put32(m + 20, 0x4000);         // MaxTransferSize
+    put32(m + 20, RNDIS_RX_SIZE);  // MaxTransferSize: one receive buffer's worth
     if (rndis_encap_out(m, 24) != CC_SUCCESS) { rndis_stage = "init-send"; return 0; }
     delay_ms(2);
     if (rndis_encap_in() != 0) { rndis_stage = "init-resp"; return 0; }
@@ -1596,24 +1624,34 @@ int rndis_send(const void *frame, int len) {
     return r;
 }
 
-// Receive one framed packet, non-blocking. Keeps exactly one bulk-IN transfer
-// posted; returns the Ethernet frame length into buf when it completes, else 0.
-// The completion may be observed here or by any other event drainer (see
-// rndis_note_event), so nothing is lost while a TX or the timer runs.
+// Hand every free receive buffer to the controller, in order.
+static void rndis_rx_refill(void) {
+    int posted = 0;
+    while (rndis_rx_state[rndis_rx_post] == RX_FREE) {
+        uint64_t b = (uint64_t)(uintptr_t)rndis_rxbufs[rndis_rx_post];
+        rndis_rx_state[rndis_rx_post] = RX_POSTED;
+        ring_push(&rndis.in, (uint32_t)b, (uint32_t)(b >> 32), RNDIS_RX_SIZE,
+                  TRB_TYPE(TRB_NORMAL) | TRB_IOC);
+        rndis_rx_post = (rndis_rx_post + 1) % RNDIS_RX_BUFS;
+        posted = 1;
+    }
+    if (posted) ring_doorbell(rndis.slot, rndis.in_dci);
+}
+
+// Receive one Ethernet frame, non-blocking: its length, into buf, or 0 when
+// nothing has come. One transfer may carry several REMOTE_NDIS_PACKET_MSGs
+// back to back, each saying its own length; they are handed out one per call,
+// and a buffer goes back to the controller once all of its are.
 int rndis_recv(void *buf, int max) {
     if (!rndis.ready) return 0;
     int n = 0;
     __asm__ volatile ("cli");
 
-    if (!rndis_rx_posted) {
-        uint64_t b = (uint64_t)(uintptr_t)rndis_rxbuf;
-        ring_push(&rndis.in, (uint32_t)b, (uint32_t)(b >> 32),
-                  sizeof(rndis_rxbuf), TRB_TYPE(TRB_NORMAL) | TRB_IOC);
-        ring_doorbell(rndis.slot, rndis.in_dci);
-        rndis_rx_posted = 1;
-    }
+    rndis_rx_refill();
 
-    // Consume any events currently on the ring (records our RX completion).
+    // Consume the events on the ring: our completions are recorded, and
+    // anything else is dealt with -- a keyboard's report thrown away here
+    // would leave it silent for good (see wait_completion).
     for (int g = 0; g < RING_SIZE; g++) {
         uint32_t *e = &evt_ring[evt_deq * 4];
         uint32_t ctrl = e[3];
@@ -1623,25 +1661,35 @@ int rndis_recv(void *buf, int max) {
         evt_deq++;
         if (evt_deq == RING_SIZE) { evt_deq = 0; evt_cycle ^= 1; }
         w64(rt, RT_ERDP, ((uint64_t)(uintptr_t)&evt_ring[evt_deq * 4]) | (1u << 3));
-        rndis_note_event(ctrl, status);
+        if (!rndis_note_event(ctrl, status) && TRB_TYPE_OF(ctrl) == TRB_TRANSFER_EVENT)
+            hid_event((ctrl >> 24) & 0xFF, (ctrl >> 16) & 0x1F, status);
     }
 
-    if (rndis_rx_done) {
-        rndis_rx_done = 0;
-        rndis_rx_posted = 0;
-        uint32_t got = sizeof(rndis_rxbuf) - rndis_rx_resid;
-        if (get32(rndis_rxbuf) == 0x00000001) {          // REMOTE_NDIS_PACKET_MSG
-            uint32_t doff = get32(rndis_rxbuf + 8);
-            uint32_t dlen = get32(rndis_rxbuf + 12);
-            uint32_t start = 8 + doff;
-            if (dlen > 0 && start + dlen <= got && start + dlen <= sizeof(rndis_rxbuf)) {
-                if ((int)dlen > max) dlen = max;
+    while (!n && rndis_rx_state[rndis_rx_read] == RX_FULL) {
+        const uint8_t *b = rndis_rxbufs[rndis_rx_read];
+        uint32_t got = rndis_rx_got[rndis_rx_read], at = rndis_rx_off;
+        if (at + 16 <= got && get32(b + at) == 0x00000001) {   // REMOTE_NDIS_PACKET_MSG
+            uint32_t mlen  = get32(b + at + 4);
+            uint32_t start = at + 8 + get32(b + at + 8);       // DataOffset, from +8
+            uint32_t dlen  = get32(b + at + 12);
+            if (dlen > 0 && start + dlen <= got) {
+                if ((int)dlen > max) dlen = (uint32_t)max;
                 uint8_t *out = buf;
-                for (uint32_t i = 0; i < dlen; i++) out[i] = rndis_rxbuf[start + i];
+                for (uint32_t i = 0; i < dlen; i++) out[i] = b[start + i];
                 n = (int)dlen;
             }
+            // A length that cannot be right ends the buffer rather than
+            // sending the parse into the middle of a packet.
+            rndis_rx_off = (mlen >= 16 && at + mlen > at) ? at + mlen : got;
+            if (rndis_rx_off < got) continue;
         }
+        // This buffer is done with: back to the controller.
+        rndis_rx_state[rndis_rx_read] = RX_FREE;
+        rndis_rx_read = (rndis_rx_read + 1) % RNDIS_RX_BUFS;
+        rndis_rx_off = 0;
     }
+
+    rndis_rx_refill();
     __asm__ volatile ("sti");
     return n;
 }
