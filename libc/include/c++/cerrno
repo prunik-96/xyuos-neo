@@ -1,0 +1,2 @@
+// The C++ spelling of <errno.h>. See cassert.
+#include <errno.h>

@@ -1,0 +1,47 @@
+// The C++ spelling of <math.h>. See cassert.
+//
+// The one real difference from the C header: C makes isnan and its relatives
+// macros, C++ makes them functions -- and a macro called isnan would rewrite
+// every std::isnan into nonsense. So they stop being macros here and become
+// overloads, in std and, as C++ allows, in the global namespace as well.
+#include <math.h>
+
+#undef isnan
+#undef isinf
+#undef isfinite
+#undef isnormal
+#undef signbit
+
+namespace std {
+#define XY_CLASSIFY(name)                                                    \
+    constexpr inline bool name(float x)       { return __builtin_##name(x); } \
+    constexpr inline bool name(double x)      { return __builtin_##name(x); } \
+    constexpr inline bool name(long double x) { return __builtin_##name(x); }
+XY_CLASSIFY(isnan)
+XY_CLASSIFY(isinf)
+XY_CLASSIFY(isfinite)
+XY_CLASSIFY(isnormal)
+XY_CLASSIFY(signbit)
+#undef XY_CLASSIFY
+
+using ::acos;  using ::asin;  using ::atan;  using ::atan2; using ::atan2f;
+using ::ceil;  using ::ceilf; using ::cos;   using ::cosf;  using ::cosh;
+using ::exp;   using ::expf;  using ::fabs;  using ::fabsf; using ::floor;
+using ::floorf; using ::fmod; using ::fmodf; using ::frexp; using ::ldexp;
+using ::ldexpf; using ::log;  using ::log10; using ::log2;  using ::logf;
+using ::modf;  using ::pow;   using ::powf;  using ::round; using ::sin;
+using ::sinf;  using ::sinh;  using ::sqrt;  using ::sqrtf; using ::tan;
+using ::tanh;  using ::trunc; using ::copysign; using ::cbrt;
+using ::tanf;  using ::atanf; using ::roundf; using ::truncf;
+using ::hypot; using ::hypotf;
+
+inline float abs(float x)             { return __builtin_fabsf(x); }
+inline double abs(double x)           { return __builtin_fabs(x); }
+inline long double abs(long double x) { return __builtin_fabsl(x); }
+}
+
+using std::isnan;
+using std::isinf;
+using std::isfinite;
+using std::isnormal;
+using std::signbit;

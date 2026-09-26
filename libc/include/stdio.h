@@ -10,6 +10,10 @@ extern "C" {
 
 #define EOF (-1)
 
+/* The size of a buffer worth reading a file through. Streams here are
+ * unbuffered, so this is only ever a hint to the caller. */
+#define BUFSIZ 4096
+
 #ifndef SEEK_SET
 #define SEEK_SET 0
 #define SEEK_CUR 1

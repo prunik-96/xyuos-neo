@@ -1,0 +1,27 @@
+// The C++ spelling of <stdlib.h>. See cassert.
+//
+// Unlike the others this one exists in the toolchain already, as the
+// freestanding subset: abort, exit, atexit and the integer abs overloads. It
+// does not know our <stdlib.h> is there, so malloc and the rest are missing
+// from it. This keeps theirs and adds ours.
+#include_next <cstdlib>
+#include <stdlib.h>
+
+namespace std {
+using ::malloc;
+using ::calloc;
+using ::realloc;
+using ::free;
+using ::atoi;
+using ::atol;
+using ::atof;
+using ::strtol;
+using ::strtoul;
+using ::strtoll;
+using ::strtoull;
+using ::strtod;
+using ::strtof;
+using ::qsort;
+using ::bsearch;
+using ::getenv;
+}

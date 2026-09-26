@@ -1,0 +1,8 @@
+// The C++ spelling of <assert.h>.
+//
+// The C++ library in the toolchain is libstdc++'s freestanding build (see
+// toolchain/build_libstdcxx.sh), which leaves out every header that wraps the
+// C library -- it cannot know which C library there will be. The headers in
+// this directory are those wrappers, over ours. They hold only what code
+// built here has asked for; a missing name is a compile error, not a guess.
+#include <assert.h>

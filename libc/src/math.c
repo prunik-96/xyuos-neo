@@ -719,6 +719,29 @@ float sinf(float x)             { return (float)sin((double)x); }
 float cosf(float x)             { return (float)cos((double)x); }
 float atan2f(float y, float x)  { return (float)atan2((double)y, (double)x); }
 float fmodf(float x, float y)   { return (float)fmod((double)x, (double)y); }
+float tanf(float x)             { return (float)tan((double)x); }
+float atanf(float x)            { return (float)atan((double)x); }
+float roundf(float x)           { return (float)round((double)x); }
+float truncf(float x)           { return (float)trunc((double)x); }
+
+/* Scaled by the larger side first: squaring 1e200 directly is infinity even
+ * though the answer is an ordinary number. */
+double hypot(double x, double y) {
+    if (isinf(x) || isinf(y)) return INFINITY;
+    if (isnan(x) || isnan(y)) return NAN;
+    x = fabs(x);
+    y = fabs(y);
+    double big = x > y ? x : y, small = x > y ? y : x;
+    if (big == 0.0) return 0.0;
+    double r = small / big;
+    return big * sqrt(1.0 + r * r);
+}
+
+/* In double, where the squares of any two floats fit with room to spare. */
+float hypotf(float x, float y) {
+    double dx = x, dy = y;
+    return (float)sqrt(dx * dx + dy * dy);
+}
 
 /* --- two that arrived with a JavaScript engine ----------------------------
  *

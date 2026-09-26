@@ -98,6 +98,14 @@ float  cosf(float x);
 float  atan2f(float y, float x);
 float  fmodf(float x, float y);
 float  ldexpf(float x, int exp);
+float  tanf(float x);
+float  atanf(float x);
+float  roundf(float x);
+float  truncf(float x);
+
+/* The length of the vector (x, y), without overflowing on the way there. */
+double hypot(double x, double y);
+float  hypotf(float x, float y);
 
 long double ldexpl(long double x, int exp);
 
