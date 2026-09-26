@@ -1,12 +1,17 @@
 # xyuOS Neo
 
 An x86_64 operating system written from nothing: own kernel, own libc, own
-window manager, own TCP/IP stack, own TLS 1.3, own font rasteriser, own PNG
-and JPEG decoders. No parts taken from another OS.
+window manager, own TCP/IP stack, own TLS 1.3, own PNG and JPEG decoders.
+No parts taken from another OS.
 
 It boots on real hardware (UEFI, Ryzen 7 7700) and in QEMU, and it runs a
-port of the NetSurf browser that fetches real sites over https and executes
-JavaScript.
+port of the NetSurf browser that fetches real sites over https, executes
+JavaScript, and sets text in every major script of the world.
+
+Libraries by other people that programs link against are named where they
+are used: FreeType, HarfBuzz, SheenBidi and libunibreak under the text, the
+Noto fonts on the disk, and the programs ported to the system (NetSurf,
+DOOM, MicroPython, TinyCC).
 
 ## Safety
 
@@ -18,8 +23,8 @@ must stay true of anything added here.
 ## Building from nothing on a new machine
 
 The repository holds about 12 MB: everything that was actually written here.
-The 5.1 GB cross-compiler and the two upstream clones are not in it, because
-both can be put back exactly.
+The 5.1 GB cross-compiler, the upstream clones and the fonts are not in it,
+because all of them can be put back exactly.
 
 Requires Debian or Ubuntu (WSL is fine) with `build-essential`, `bison`,
 `flex`, `libgmp-dev`, `libmpc-dev`, `libmpfr-dev`, `texinfo`, `grub-pc-bin`,
@@ -30,8 +35,9 @@ git clone <this repo> ~/xyuos-neo     # the path matters -- see below
 cd ~/xyuos-neo
 
 ./toolchain/build.sh                  # binutils 2.42 + GCC 13.2.0 + C++ runtime, ~50 min
-python3 tools/vendor.py               # DOOM and MicroPython, at pinned commits
-make                                  # kernel, libc, userland, ISO, disk image
+python3 tools/vendor.py               # DOOM, MicroPython, the text libraries at
+                                      # pinned commits; 48 Noto fonts by checksum
+make                                  # kernel, libc, libtext, userland, ISO, disk image
 ```
 
 That is enough to boot. To rebuild the browser as well:
@@ -62,7 +68,8 @@ pointed elsewhere:
 | | |
 |---|---|
 | `kernel/` | the kernel: `arch/`, `mm/`, `fs/`, `net/`, `gfx/`, `wm/`, `crypto/`, `drivers/` |
-| `libc/` | the C library, written here |
+| `libc/` | the C library, written here; `libc/include/c++/` wraps it for C++ |
+| `libtext/` | text for programs: fonts chosen per character, shaping, bidi, line breaking — over FreeType, HarfBuzz, SheenBidi and libunibreak |
 | `userland/` | programs, and the GUI toolkit they share |
 | `disk/` | files that ship on the disk image |
 | `assets/` | icons, sounds, wallpapers, the DOOM shareware WAD |
@@ -78,16 +85,22 @@ user code is parallel and the kernel is not), threads, signals, System V
 shared memory, per-process address spaces with demand paging, mmap and W^X,
 C++ with exceptions and RTTI, ext2 and FAT32, xHCI and USB, a window manager
 with real windows, DHCP, DNS, TCP with several connections at once, TLS 1.3
-with certificate chain validation, HTTP with keep-alive, DOOM, MicroPython,
-and NetSurf with JavaScript.
+with certificate chain validation, HTTP with keep-alive, text shaping for
+every major script (kerning, ligatures, Arabic joining, Indic reordering,
+bidirectional text, Unicode line breaking), DOOM, MicroPython, and NetSurf
+with JavaScript.
 
 The platform work between here and a modern browser engine was planned as
-eight layers. Five are done: parallel sockets, virtual memory, threads and
-scheduling on every core, processes and IPC, and the C++ runtime. Three are
-left: text shaping, a path rasteriser, and a bigger disk.
+eight layers. Seven are done: parallel sockets, virtual memory, threads and
+scheduling on every core, processes and IPC, the C++ runtime, text, and a
+bigger disk -- 128 MiB, still loaded into memory by GRUB, since the kernel
+reaches only the low 4 GiB (see `DISK_MB` in the Makefile). One is left: a
+path rasteriser.
 
 The tests are programs on the disk (`fstest`, `sigtest`, `shmtest`,
-`thrtest`, `partest`, `cpptest`, `memtest`, `vmtest`), driven from the host by
-`tools/seqrun.py`, which types commands into the shell and photographs the
-screen. Set `SEQRUN_SMP=8` to run them on eight cores: QEMU gives one unless
-told otherwise.
+`thrtest`, `partest`, `cpptest`, `texttest`, `memtest`, `vmtest`), driven
+from the host by `tools/seqrun.py`, which types commands into the shell and
+photographs the screen. Set `SEQRUN_SMP=8` to run them on eight cores: QEMU
+gives one unless told otherwise. `SEQRUN_RAMDISK=1` runs from the in-memory
+disk alone, as real hardware does. `fonts` opens a window of text in every
+script, for the eye.
