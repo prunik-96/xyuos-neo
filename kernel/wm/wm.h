@@ -18,6 +18,10 @@ void wm_start(void);
 // pane, and repaint if anything changed. Cheap and non-blocking when idle.
 void wm_poll(void);
 
+// Hold off every repaint (1) and allow them again (0). For the screen-off
+// sleep: the screen stays black until whoever blanked it says otherwise.
+void wm_set_asleep(int on);
+
 // Repaint the whole screen right now.
 void wm_refresh(void);
 

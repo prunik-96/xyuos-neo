@@ -2,6 +2,7 @@
 #include "../../kernel/kio.h"
 #include "../../kernel/process.h"
 #include "../../kernel/shm.h"
+#include "../../kernel/bkl.h"
 #include "../../kernel/devices.h"
 #include "../../mm/vmm.h"
 #include "../../mm/pmm.h"
@@ -415,14 +416,18 @@ static uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 // on keyboard_poll_event() would never see the wake key. The ASCII
                 // ring is filled by the same keypress and nothing else consumes it
                 // while the shell is parked here.
+                wm_set_asleep(1);
                 fb_fill_rect(0, 0, fb_get_width(), fb_get_height(), 0x00000000);
                 fb_present();
                 keyboard_flush();
                 char c;
-                while (!keyboard_poll(&c)) {
-                    __asm__ volatile ("sti; hlt");
-                }
+                // Waiting with the kernel lock let go of. The keypress that
+                // ends this arrives on the bootstrap core, and its handler
+                // needs the lock: on any other core, `hlt` with the lock held
+                // would wait for a key that could never be delivered.
+                while (!keyboard_poll(&c)) bkl_wait_interrupt();
                 keyboard_flush();   // drop the wake key so it doesn't hit the shell
+                wm_set_asleep(0);
                 wm_refresh();
             }
             return 0;
@@ -824,6 +829,10 @@ static uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
 // about to return through.
 uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                           struct syscall_frame *f) {
+    // The kernel is entered here, so the kernel lock is taken here: nothing
+    // below this line runs on two cores at once. See bkl.h.
+    bkl_enter();
+
     // Anything pending that needs no user code happens BEFORE the call the
     // process was about to make. This is a safe point: no fd is open, no
     // buffer half written. Never returns when what is pending ends it.
@@ -833,5 +842,12 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
 
     // And on the way out, where there is a frame to bend, a handler can run.
     signal_on_syscall_return(f, num, ret);
+
+    // Given back here, in C, because -- unlike an interrupt -- a system call
+    // that comes back at all comes back to the process that made it. The
+    // stack under this frame belongs to a process RUNNING on this core, and
+    // no other core will touch it. The ways out that DO leave a stack behind
+    // (blocking, exiting) never return here; they go through the scheduler.
+    bkl_exit();
     return ret;
 }

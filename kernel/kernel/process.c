@@ -9,6 +9,8 @@
 
 #include "process.h"
 #include "signal.h"
+#include "bkl.h"
+#include "panic.h"
 #include "elf.h"
 #include "kio.h"
 #include "../arch/x86_64/syscall.h"
@@ -46,7 +48,17 @@ extern void sched_resume(uint64_t rsp) __attribute__((noreturn));
 #define RFLAGS_IF 0x202  /* IF set, bit 1 reserved-one */
 
 static process_t proc_table[MAX_PROCESSES];
-static process_t *current = NULL;
+
+// The process on THIS core. It lives in the per-CPU block: a single global
+// here was the one-processor assumption in its purest form. It is still an
+// lvalue, so `current = p` reads exactly as it always did.
+//
+// Never hold on to it across a block: the process that blocks on one core
+// may be resumed on another, and then this names that other core's process.
+// (Code that needs "the process I was" keeps its own pointer, which is on
+// that process's own stack and so travels with it.)
+#define current (this_cpu()->current_proc)
+
 static int next_pid = 1;
 
 // --- pipes -----------------------------------------------------------------
@@ -67,8 +79,8 @@ static struct pipe pipes[MAX_PIPES];
 static int  process_block_on_pipe(void);
 static void process_wake_pipe(void);
 
-// Where to go when nothing is left to run, and the address space to go back to.
-static uint64_t idle_ctx[8];
+// Where each core goes when it has nothing to run is its own -- see
+// cpu_loop() and struct percpu's idle_ctx.
 
 // Set while the CPU is halted in the idle loop; the PIT samples it to estimate
 // CPU utilisation. Global so the timer handler can read it cheaply.
@@ -590,14 +602,18 @@ long process_write_stdout(const void *buf, uint64_t len) {
 
 // --- scheduling ------------------------------------------------------------
 
+// The slot most recently put on a core, by any core.
+static int rr_last = MAX_PROCESSES - 1;
+
 static process_t *pick_next(process_t *after) {
-    // Round robin: start looking just past `after` and wrap.
-    int start = 0;
-    if (after) {
-        for (int i = 0; i < MAX_PROCESSES; i++) {
-            if (&proc_table[i] == after) { start = i + 1; break; }
-        }
-    }
+    // Round robin: start looking just past `after` -- or, for a core that
+    // comes here with nothing in hand, just past whatever was picked last
+    // anywhere, so that no core always starts from slot 0 and favours it.
+    //
+    // Only READY is ever taken. A process running on another core is
+    // RUNNING, so two cores can never pick the same one.
+    int start = (rr_last + 1) % MAX_PROCESSES;
+    if (after) start = (int)(after - proc_table) + 1;
     for (int n = 0; n < MAX_PROCESSES; n++) {
         process_t *p = &proc_table[(start + n) % MAX_PROCESSES];
         if (p->state == PROC_READY && !p->stopped) return p;
@@ -610,6 +626,7 @@ static process_t *pick_next(process_t *after) {
 static void activate(process_t *p) {
     current = p;
     p->state = PROC_RUNNING;
+    rr_last = (int)(p - proc_table);
     paging_switch(p->pml4);
     tss_set_kernel_stack(p->kstack_top);
     this_cpu()->kstack_top = p->kstack_top;   // where THIS core runs p's syscalls
@@ -645,6 +662,20 @@ uint64_t sched_on_tick(uint64_t cur_rsp, uint64_t cs) {
     signal_check();
 
     process_t *next = pick_next(current);
+
+    // Suspended -- by SIGSTOP or the task manager. With something else to
+    // run, the switch below takes it off like any other process. With
+    // nothing else, the old code kept running it: a suspended program went
+    // on running for as long as it was alone, which on a machine with idle
+    // cores is most of the time. Park it instead, and let this core's loop
+    // idle. It is picked up again, on whichever core, once it is continued.
+    if (current->stopped && !next) {
+        current->resume_kernel = 0;
+        current->state = PROC_READY;
+        __asm__ volatile ("fxsave (%0)" : : "r"(current->fxstate) : "memory");
+        kctx_restore(this_cpu()->idle_ctx, 1);      // never returns
+    }
+
     if (!next || next == current) {
         // Staying on the CPU. This is the frame that is about to go back to
         // ring 3, so it is the place to bend it into a signal handler.
@@ -678,33 +709,25 @@ uint64_t sched_on_tick(uint64_t cur_rsp, uint64_t cs) {
 static int block_current(void) {
     process_t *me = current;
 
-    while (me->state == PROC_BLOCKED) {
-        process_t *next = pick_next(me);
-        if (next) {
-            me->resume_kernel = 1;
-            __asm__ volatile ("fxsave (%0)" : : "r"(me->fxstate) : "memory");
-            if (kctx_save(me->kctx) == 0) {
-                resume_process(next);   // never returns
-            }
-            // Resumed: kctx_restore brought us back, and activate() has
-            // already restored our address space, stacks and FPU state.
-            break;
-        }
+    // Save where this process is, and leave its stack for the core's own.
+    //
+    // The old way stayed right here when nothing else could run: sat in `hlt`
+    // on this process's kernel stack until an interrupt woke it. With one
+    // core that was safe. With several it is the one thing that must never
+    // happen: the moment the lock is let go, another core can wake this
+    // process and resume it -- on this very stack, which this core would
+    // still be standing on. So a blocked process always saves itself and
+    // goes, and the waiting is done in cpu_loop(), on a stack that belongs to
+    // the core. When it is woken, whichever core picks it up brings it back
+    // to the line after kctx_save, holding the lock.
+    me->resume_kernel = 1;
+    __asm__ volatile ("fxsave (%0)" : : "r"(me->fxstate) : "memory");
+    if (kctx_save(me->kctx) == 0)
+        kctx_restore(this_cpu()->idle_ctx, 1);     // never returns
 
-        // Nothing else can run. Idle here with interrupts ENABLED until one of
-        // them wakes us -- we are in ring 0 on our own kernel stack, so this is
-        // a safe place to sit. (Syscalls normally run with IF clear; enabling
-        // it is exactly what makes the wakeup possible.)
-        //
-        // The loop matters: wm_poll() can act on a WM key binding that SPAWNS a
-        // process, so what was unrunnable a moment ago may now be runnable, and
-        // we have to go back and look again rather than idle through it.
-        __asm__ volatile ("sti");
-        wm_poll();
-        g_cpu_idle = 1;
-        __asm__ volatile ("hlt; cli");
-        g_cpu_idle = 0;
-    }
+    // Resumed -- possibly on another core. activate() has already put back
+    // this process's address space, kernel stack and FPU state; `me` is a
+    // local on this process's own stack, so it came along.
 
     // Woken. If something fatal arrived while we slept, act on it now instead
     // of resuming the syscall we blocked in -- this is the safe point for it.
@@ -968,16 +991,16 @@ void process_notify_exit(int code) {
         wm_notify_exit(dead->pid);  // hand the pane a fresh shell, if it had one
     }
 
-    // The address space can go now, but NOT the kernel stack: this code is
-    // running on it. The stack is freed when the process is reaped, which
-    // always happens from somebody else's context.
-    process_t *next = pick_next(dead);
-    if (next) {
-        activate(next);
-    } else {
-        current = NULL;
-        paging_switch(kernel_space);
-    }
+    // Out of the dead process's page tables before letting go of them: the
+    // last unref frees them, and a core must never stand in page tables that
+    // have been given back. The kernel stack underfoot is another matter --
+    // it is kernel memory, mapped the same in every address space -- and it
+    // is freed only when this process is reaped, which cannot happen while
+    // this core holds the lock and is standing on it.
+    current = NULL;
+    paging_switch(kernel_space);
+    this_cpu()->kstack_top = 0;
+
     // One fewer holder. When the last one goes the page tables and every
     // user page in them go with it; while others remain, nothing happens
     // here at all.
@@ -999,15 +1022,10 @@ void process_notify_exit(int code) {
     // started a thread left its whole address space behind when it ended.
     if (!dead->parent_pid && !dead->is_thread) proc_reap(dead);
 
-    if (next) {
-        if (next->resume_kernel) kctx_restore(next->kctx, 1);
-        sched_resume(next->saved_rsp);
-    }
-
-    // Nothing READY right now. Hand control back to the scheduler loop, which
-    // decides whether to idle (someone is merely asleep) or finish. It runs on
-    // kmain's stack, so it is safe to get here from a dying process.
-    kctx_restore(idle_ctx, 1);
+    // This core's scheduler loop decides what runs next: another process,
+    // or nothing, in which case it sleeps there. It runs on the core's own
+    // stack, so it is safe to get there from a dying process.
+    kctx_restore(this_cpu()->idle_ctx, 1);
 }
 
 // Is any process still alive? A BLOCKED process counts -- it is waiting for an
@@ -1021,20 +1039,95 @@ static int any_alive(void) {
     return 0;
 }
 
-// Resume the next runnable process (never returning), or -- when everything
-// alive is asleep -- idle with interrupts enabled until an IRQ wakes someone.
-// Returns only once no process is left at all.
-static void schedule_or_idle(void) {
+// One core's scheduler loop, on the core's own stack.
+//
+// Every way of giving the processor up ends here: a process that blocks jumps
+// here after saving itself, one that exits jumps here instead of returning,
+// and a core with nothing to do sleeps here. It is entered holding the
+// kernel lock and lets go of it only to sleep.
+//
+// Resumes the next runnable process (never returning), or waits for one.
+// Returns only on the bootstrap core, and only once nothing is left alive.
+static void cpu_loop(void) {
+    int bsp = (this_cpu()->cpu_index == 0);
+
     for (;;) {
-        // Repaint and handle WM bindings BEFORE picking a process: this is the
-        // compositor's only chance to run, and a binding may spawn the very
-        // process we are about to look for.
-        wm_poll();
+        // No process on this core from here until one is picked.
+        current = NULL;
+        this_cpu()->kstack_top = 0;
+
         process_t *next = pick_next(NULL);
-        if (next) resume_process(next);     // never returns
-        if (!any_alive()) return;
+
+        // Only when there is nothing to run does the window manager get the
+        // processor -- exactly the rule the single-core loop kept. It is the
+        // compositor's chance to repaint and act on its key bindings, and a
+        // binding may spawn the very process there was none of a moment ago,
+        // so look again after it. Running it on every pass instead was tried:
+        // it put a repaint between every two processes, the timer ticks that
+        // piled up meanwhile all landed the instant the next one started, and
+        // a process could lose the processor within microseconds of getting
+        // it. On the bootstrap core only -- the window manager owns the
+        // framebuffer and the keyboard, and one core doing that is the
+        // arrangement everything in it was written for.
+        if (!next && bsp) {
+            wm_poll();
+            next = pick_next(NULL);
+        }
+
+        if (next) {
+            if (!bsp) smp_set_busy(1);
+            resume_process(next);           // never returns
+        }
+        if (bsp && !any_alive()) return;
+
+        // Nothing to run. Before sleeping, out of the last process's page
+        // tables: it may exit on another core while this one sleeps, and its
+        // tables be given back with this core still standing in them.
+        paging_switch(kernel_space);
+
+        // Let go of the kernel and sleep until an interrupt -- a key, a
+        // tick, a wake-up -- gives a reason to look again.
+        if (bsp) g_cpu_idle = 1; else smp_set_busy(0);
+        bkl_exit();
         __asm__ volatile ("sti; hlt; cli");
+
+        // Back for the lock. An idle application processor is also the
+        // compute pool, and shares need no lock -- so it keeps looking for
+        // them the whole time it waits, not only once on waking up. The core
+        // that hands out shares is holding the lock while it waits for them:
+        // an idle core that took one look, found nothing yet, and then spun
+        // on the lock would miss the job entirely. It did, every time -- the
+        // benchmark's single-core pass holds the lock long enough for every
+        // idle core to be woken by a tick and end up spinning here.
+        //
+        // Not the bootstrap core: it takes the device interrupts, and a
+        // share runs with them held off.
+        if (bsp) {
+            bkl_enter();
+            g_cpu_idle = 0;
+        } else {
+            for (;;) {
+                smp_idle_work();
+                if (bkl_try_enter()) break;
+                // The same one-instruction window bkl_enter keeps open, for
+                // the same reason: a shootdown must be able to reach a core
+                // that is waiting here.
+                __asm__ volatile ("sti; pause; cli" ::: "memory");
+            }
+        }
     }
+}
+
+// An application processor's way into the scheduler, once the bootstrap
+// core has started it. Never returns: cpu_loop() only ever returns on the
+// bootstrap core.
+void process_ap_run(void) __attribute__((noreturn));
+void process_ap_run(void) {
+    bkl_enter();
+    // Every block and every exit on this core comes back to this line.
+    kctx_save(this_cpu()->idle_ctx);
+    cpu_loop();
+    panic("scheduler loop returned on an application processor");
 }
 
 int process_run_all(void) {
@@ -1043,14 +1136,17 @@ int process_run_all(void) {
     kernel_space = paging_current();
     scheduler_active = 1;
 
-    // Processes come back here when they exit, via kctx_restore(idle_ctx).
-    // Both the first entry and every re-entry fall through to the scheduler.
-    kctx_save(idle_ctx);
+    // Every block and every exit on this core comes back here, onto kmain's
+    // stack, through kctx_restore(this_cpu()->idle_ctx). The first entry and
+    // every return alike fall through into the loop.
+    kctx_save(this_cpu()->idle_ctx);
 
-    current = NULL;
-    paging_switch(kernel_space);
-    this_cpu()->kstack_top = 0;
-    schedule_or_idle();
+    // The other cores join now: kernel_space is known, and there is a
+    // process table to pick from. Only the first time through -- a return
+    // here from kctx_restore finds them already running.
+    smp_start_scheduling();
+
+    cpu_loop();
 
     // Every process has exited. Anything still sitting in the table is a
     // zombie whose parent died before reaping it.

@@ -3,7 +3,32 @@
 #include "pmm.h"
 #include "../kernel/process.h"
 #include "../kernel/shm.h"
+#include "../arch/x86_64/smp.h"
 #include "heap.h"
+
+/* After taking a translation away -- or narrowing what it allows -- in page
+ * tables that another core may be running on.
+ *
+ * invlpg only reaches the core that runs it. Any other core running a thread
+ * of the same program still has the old translation cached, and would go on
+ * using it: reading memory that has been unmapped, writing to a page that has
+ * just been made read-only, or faulting on one that has just been made
+ * writable. So every other core is told to forget, and this waits until each
+ * one has.
+ *
+ * Only when more than one process holds the address space. With one holder
+ * the only process that can have these tables loaded is the one making this
+ * call, on this core: an idle core always loads the kernel's own tables
+ * before it lets go of the lock, and a core can only take another process's
+ * tables by running that process.
+ *
+ * The frames taken out may already have been given back by the time this
+ * runs, and a stale translation elsewhere could still write to one. That is
+ * safe for one reason: nothing can allocate them again until the kernel lock
+ * is let go, and this returns before that. */
+static void shootdown_if_shared(const process_t *p) {
+    if (p->as && p->as->refs > 1) smp_tlb_shootdown();
+}
 
 #define PAGE 4096ULL
 
@@ -179,6 +204,7 @@ int vmm_munmap(uint64_t addr, uint64_t len) {
     if (r->shm) return vmm_munmap_shared(addr);
 
     paging_unmap(p->pml4, r->base, r->len);
+    shootdown_if_shared(p);
     r->base = 0;
     r->len = 0;
     return 0;
@@ -192,6 +218,7 @@ int vmm_munmap_shared(uint64_t addr) {
         vm_region_t *r = &p->as->vm[i];
         if (r->base != addr || !r->shm) continue;
         paging_detach(p->pml4, r->base, r->len);
+        shootdown_if_shared(p);
         int id = (int)r->shm - 1;
         r->base = 0; r->len = 0; r->shm = 0;
         shm_dropped(id);
@@ -212,6 +239,7 @@ int vmm_mprotect(uint64_t addr, uint64_t len, uint32_t prot) {
     /* The pages that exist change now; the ones that do not will be built
      * with the new rights when they are touched. */
     paging_protect(p->pml4, r->base, r->len, flags_of(prot));
+    shootdown_if_shared(p);
     return 0;
 }
 

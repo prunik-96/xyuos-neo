@@ -26,6 +26,8 @@ proc = subprocess.Popen(
     ["qemu-system-x86_64", "-enable-kvm", "-cpu", "host",
      "-cdrom", XYUOS + "/build/xyuos_neo.iso",
      "-serial", "file:" + SER, "-m", "512M", "-display", "none",
+     # QEMU gives one core unless told otherwise; XYUOS_SMP says how many.
+     "-smp", os.environ.get("XYUOS_SMP", "1"),
      "-drive", "file=%s/disk.img,if=none,id=d0,format=raw" % OUT,
      "-device", "virtio-blk-pci,drive=d0",
      "-device", "qemu-xhci,id=xhci",

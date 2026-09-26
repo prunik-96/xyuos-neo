@@ -73,12 +73,21 @@ pointed elsewhere:
 
 ## Where things stand
 
-Working: SMP boot (8 cores online), paging with per-process address spaces,
-ext2 and FAT32, xHCI and USB, a window manager with real windows, DHCP, DNS,
-TCP, TLS 1.3 with certificate chain validation, HTTP with keep-alive, DOOM,
-MicroPython, and NetSurf with JavaScript.
+Working: programs running on every core at once (one big kernel lock, so
+user code is parallel and the kernel is not), threads, signals, System V
+shared memory, per-process address spaces with demand paging, mmap and W^X,
+C++ with exceptions and RTTI, ext2 and FAT32, xHCI and USB, a window manager
+with real windows, DHCP, DNS, TCP with several connections at once, TLS 1.3
+with certificate chain validation, HTTP with keep-alive, DOOM, MicroPython,
+and NetSurf with JavaScript.
 
-What is missing, and in what order to build it, is written down in the
-roadmap: eight layers of platform work between here and a modern browser
-engine — sockets, virtual memory, threads, processes, a C++ runtime, text
-shaping, a path rasteriser, and a bigger disk.
+The platform work between here and a modern browser engine was planned as
+eight layers. Five are done: parallel sockets, virtual memory, threads and
+scheduling on every core, processes and IPC, and the C++ runtime. Three are
+left: text shaping, a path rasteriser, and a bigger disk.
+
+The tests are programs on the disk (`fstest`, `sigtest`, `shmtest`,
+`thrtest`, `partest`, `cpptest`, `memtest`, `vmtest`), driven from the host by
+`tools/seqrun.py`, which types commands into the shell and photographs the
+screen. Set `SEQRUN_SMP=8` to run them on eight cores: QEMU gives one unless
+told otherwise.

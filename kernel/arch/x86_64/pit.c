@@ -55,10 +55,20 @@ uint64_t pit_now_us(void) {
     return rdtsc() / tsc_per_us;
 }
 
-static void pit_irq_handler(struct interrupt_frame *frame) {
-    (void)frame;
+// Called from irq_handler BEFORE the kernel lock is taken. Only what is safe
+// to do without it: the clock, the idle sample, and nothing that touches
+// anything another core might be using.
+void pit_tick_fast(void) {
     ticks++;
     if (g_cpu_idle) idle_ticks++;   // sample CPU utilisation
+    // Every other core's tick, passed on. Here and not under the lock: a core
+    // waiting for the lock would otherwise wait for its own tick as well.
+    smp_tick_broadcast();
+}
+
+// The rest of the tick, under the kernel lock.
+static void pit_irq_handler(struct interrupt_frame *frame) {
+    (void)frame;
     smp_sample_load();              // per-core load for the System Monitor
     // Only flips sleeping processes back to READY; the actual switch happens
     // in sched_on_tick, after this handler returns.

@@ -9,8 +9,16 @@
 #
 # Never returns.
 .global sched_resume
+.extern bkl_exit_to_user
 sched_resume:
     mov %rdi, %rsp
+    # The kernel lock goes here: after the stack switch, before the return to
+    # ring 3. From this instruction on this core is standing on the stack of
+    # the process it is resuming, which is marked RUNNING on this core, so no
+    # other core will touch it. Whatever stack the caller was on -- a process
+    # that just blocked or exited, or this core's idle stack -- is left behind
+    # while the lock is still held, which is the point.
+    call bkl_exit_to_user
 
     pop %r15
     pop %r14

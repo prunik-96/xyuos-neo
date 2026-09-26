@@ -10,6 +10,9 @@ out of the way before the next command.
 
 The pictures land in /tmp/seqrun as step0.png, step1.png, ... and, if
 SEQRUN_COPY names a directory, are copied there as well.
+
+SEQRUN_SMP sets the number of cores. QEMU gives ONE unless told otherwise,
+which is worth knowing: every test run without it is a single-core test.
 """
 import os, shutil, socket, subprocess, sys, time
 
@@ -17,6 +20,7 @@ XYUOS = os.environ.get(
     "XYUOS", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 OUT = "/tmp/seqrun"
 COPY = os.environ.get("SEQRUN_COPY")
+SMP = os.environ.get("SEQRUN_SMP", "1")
 RAM = sys.argv[1] if len(sys.argv) > 1 else "2G"
 STEPS = sys.argv[2:] or ["sigtest:25"]
 
@@ -30,6 +34,7 @@ proc = subprocess.Popen(
     ["qemu-system-x86_64", "-enable-kvm", "-cpu", "host",
      "-cdrom", XYUOS + "/build/xyuos_neo.iso",
      "-serial", "file:" + SER, "-m", RAM, "-display", "none",
+     "-smp", SMP,
      "-drive", "file=%s/disk.img,if=none,id=d0,format=raw" % OUT,
      "-device", "virtio-blk-pci,drive=d0",
      "-device", "qemu-xhci,id=xhci",
@@ -75,8 +80,11 @@ def cmd(c, settle=0.08):
         pass
 
 
+# QEMU names keys, not characters, and a name it does not know is dropped
+# without a word -- so every character a step may contain needs its key here.
 KEYS = {' ': 'spc', '.': 'dot', '/': 'slash', '-': 'minus', '\n': 'ret',
-        ':': 'shift-semicolon', '_': 'shift-minus', '=': 'equal'}
+        ':': 'shift-semicolon', '_': 'shift-minus', '=': 'equal',
+        '+': 'shift-equal', '*': 'shift-8', ',': 'comma'}
 
 
 def typ(t):

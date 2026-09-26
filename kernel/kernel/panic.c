@@ -54,6 +54,12 @@ static void reg(uint32_t x, uint32_t y, const char *label, uint64_t v, uint32_t 
     text(nx, y, h, s, WHITE);
 }
 
+void panic(const char *msg) {
+    __asm__ volatile ("cli");
+    kprintf("\n*** KERNEL PANIC: %s ***\n", msg);
+    for (;;) __asm__ volatile ("cli; hlt");
+}
+
 void panic_screen(const char *reason, struct interrupt_frame *frame) {
     if (!fb_available()) return;
 

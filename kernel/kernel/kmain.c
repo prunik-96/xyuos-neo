@@ -9,6 +9,7 @@
 #include "../arch/x86_64/idt.h"
 #include "../arch/x86_64/apic.h"
 #include "../arch/x86_64/smp.h"
+#include "../arch/x86_64/cpu.h"
 #include "../arch/x86_64/pit.h"
 #include "../arch/x86_64/gdt.h"
 #include "../arch/x86_64/syscall.h"
@@ -28,19 +29,6 @@
 #include <stdint.h>
 #include <stddef.h>
 
-// Enable SSE/FPU so the kernel can run floating-point code (the TrueType font
-// rasterizer). Safe here: the scheduler is cooperative and IRQ handlers never
-// touch SSE, so xmm state is never clobbered underneath the font renderer.
-static void enable_sse(void) {
-    uint64_t cr0, cr4;
-    __asm__ volatile ("mov %%cr0, %0" : "=r"(cr0));
-    cr0 &= ~(1UL << 2);   // clear EM (no FPU emulation)
-    cr0 |=  (1UL << 1);   // set MP
-    __asm__ volatile ("mov %0, %%cr0" : : "r"(cr0));
-    __asm__ volatile ("mov %%cr4, %0" : "=r"(cr4));
-    cr4 |= (1UL << 9) | (1UL << 10);  // OSFXSR | OSXMMEXCPT
-    __asm__ volatile ("mov %0, %%cr4" : : "r"(cr4));
-}
 
 extern uint64_t p4_table[];   // the boot PML4
 extern uint64_t p3_table[];   // the boot PDPT: 1 GiB slots over the low 512 GiB
@@ -52,14 +40,6 @@ extern uint64_t p2_table[];   // the boot PDs: 2 MiB pages over the low 4 GiB
 // boot identity-maps, so its physical address equals its virtual one.
 static uint64_t fb_high_pdpt[512] __attribute__((aligned(4096)));
 
-// Program the PAT so a page with the PAT bit set (PCD=PWT=0) is Write-Combining.
-// IA32_PAT (MSR 0x277): make entry PA4 = WC (0x01); leave the rest at reset
-// defaults. No existing mapping sets the PAT bit, so nothing else is affected.
-static void pat_set_wc(void) {
-    uint32_t lo = 0x00070406;   // PA3..PA0 = UC, UC-, WT, WB  (reset default)
-    uint32_t hi = 0x00070401;   // PA7..PA4 = UC, UC-, WT, WC  (PA4 changed to WC)
-    __asm__ volatile ("wrmsr" :: "c"(0x277u), "a"(lo), "d"(hi) : "memory");
-}
 
 // Make the framebuffer Write-Combining. Its default type is wrong for a linear
 // framebuffer: below 4 GiB boot maps it Write-Back (pixel writes sit in cache,
@@ -135,7 +115,7 @@ static void find_framebuffer(uint32_t multiboot_addr) {
             // Ensure the framebuffer is reachable BEFORE fb_init hands it to the
             // console -- it may sit above 512 GiB on real UEFI hardware.
             uint64_t fb_size = (uint64_t)fb->framebuffer_pitch * fb->framebuffer_height;
-            pat_set_wc();                                   // enable the WC memory type
+            cpu_set_pat();                                  // enable the WC memory type
             map_device_region(fb->framebuffer_addr, fb_size);  // high FB: mapped WC
             fb_map_wc(fb->framebuffer_addr, fb_size);          // low/mid FB: flip to WC
             fb_init(fb->framebuffer_addr, fb->framebuffer_pitch,
@@ -255,10 +235,18 @@ static void map_high_memory(void) {
 }
 
 void kernel_main(uint32_t multiboot_addr) {
+    // Before anything else, the bootstrap core's per-CPU block: interrupt
+    // handlers and the kernel lock find the core they are on through it, and
+    // the first interrupt can come sooner than one might think.
+    smp_early_init();
     serial_init();
     map_high_memory();       // before the first framebuffer write
     find_framebuffer(multiboot_addr);
-    enable_sse();
+    // SSE/FPU on, so the kernel can run floating-point code (the TrueType font
+    // rasterizer). Safe here: IRQ handlers never touch SSE, so xmm state is
+    // never clobbered underneath the font renderer. Every other core does the
+    // same for itself in ap_entry().
+    cpu_enable_sse();
     fb_set_color(0x0000FF80, 0x00000000);
 
     kprintf("xyuOS Neo -- booting...\n");
