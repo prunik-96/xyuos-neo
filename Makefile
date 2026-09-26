@@ -68,10 +68,12 @@ LIBC_C_PROGS    := files note view taskmgr play hello_c fstest spin parent keywa
                    plasma devmgr control web ftest netlog memtest vmtest thrtest \
                    sigtest sigchild shmtest shmchild partest
 LIBC_CXX_PROGS  := hello_cpp cpptest
+# Built on libtext (see "the text stack" below).
+TEXT_PROGS      := texttest fonts
 # The interactive shell / file manager / editor now live in the kernel WM pane
 # engine (kernel/wm/), so there are no separate userland shell binaries; these
 # remaining userland programs are just the boot demos.
-ALL_USER_PROGS  := $(RAW_USER_PROGS) $(LIBC_C_PROGS) $(LIBC_CXX_PROGS)
+ALL_USER_PROGS  := $(RAW_USER_PROGS) $(LIBC_C_PROGS) $(LIBC_CXX_PROGS) $(TEXT_PROGS)
 USER_ELFS       := $(patsubst %,build/%.elf,$(ALL_USER_PROGS))
 
 LIBC_SRCS := libc/src/syscalls.c libc/src/stdio.c libc/src/stdlib.c libc/src/string.c \
@@ -207,6 +209,111 @@ build/$(1).elf: build/$(1)_libcuser.o $(CRT0) $(LIBC_A) userland/link.ld
 endef
 $(foreach p,$(LIBC_CXX_PROGS),$(eval $(call LIBC_CXX_LINK_RULE,$(p))))
 
+# --- the text stack -----------------------------------------------------------
+#
+# Four libraries that belong to other people (tools/vendor.py puts them back)
+# and libtext/, which is ours and makes them one thing: see libtext/include/
+# text.h. All of it wants SSE -- HarfBuzz does floating point -- and none of
+# it gets -g: the debugging information for HarfBuzz alone would be larger
+# than every program on the disk put together.
+TEXT_CFLAGS   := -ffreestanding -fno-stack-protector -fno-pic -fno-pie \
+                 -mno-red-zone -msse -msse2 -std=gnu11 -O2 -Ilibc/include
+TEXT_CXXFLAGS := -ffreestanding -fno-stack-protector -fno-pic -fno-pie \
+                 -mno-red-zone -msse -msse2 -std=gnu++17 -O2 \
+                 -fno-exceptions -fno-rtti -fno-threadsafe-statics \
+                 -Ilibc/include/c++ -Ilibc/include
+
+FT_DIR  := third_party/freetype
+HB_DIR  := third_party/harfbuzz
+SB_DIR  := third_party/sheenbidi
+UB_DIR  := third_party/libunibreak
+
+# FreeType, reading TrueType and CFF; the module list is libtext/ft/.
+FT_SRCS := base/ftsystem base/ftinit base/ftdebug base/ftbase base/ftbbox \
+           base/ftglyph base/ftbitmap base/ftmm base/ftsynth truetype/truetype \
+           cff/cff sfnt/sfnt psaux/psaux pshinter/pshinter psnames/psnames \
+           smooth/smooth autofit/autofit gzip/ftgzip
+FT_OBJS := $(patsubst %,build/ft/%.o,$(FT_SRCS))
+
+build/ft/%.o: $(FT_DIR)/src/%.c libtext/ft/xy-ftmodule.h
+	mkdir -p $(dir $@)
+	$(CC) $(TEXT_CFLAGS) -w -Ilibtext/ft -I$(FT_DIR)/include \
+	    -DFT2_BUILD_LIBRARY '-DFT_CONFIG_MODULES_H=<xy-ftmodule.h>' -c $< -o $@
+
+build/libfreetype.a: $(FT_OBJS)
+	rm -f $@
+	$(CROSS)ar rcs $@ $^
+
+# HarfBuzz as its authors ship it for this: one file that includes the rest.
+# No threads to guard against, no locale to ask.
+build/hb/harfbuzz.o: $(HB_DIR)/src/harfbuzz.cc $(wildcard libc/include/c++/*)
+	mkdir -p build/hb
+	$(CXX) $(TEXT_CXXFLAGS) -w -DHB_NO_MT -DHB_NO_SETLOCALE -c $< -o $@
+
+build/libharfbuzz.a: build/hb/harfbuzz.o
+	rm -f $@
+	$(CROSS)ar rcs $@ $^
+
+# SheenBidi also comes as one file. Its scratch pool lives in thread-local
+# storage; it is only a speed-up, so it is switched off rather than trusted.
+build/sb/sheenbidi.o: $(SB_DIR)/Source/SheenBidi.c
+	mkdir -p build/sb
+	$(CC) $(TEXT_CFLAGS) -w -I$(SB_DIR)/Headers -I$(SB_DIR)/Source \
+	    -DSB_CONFIG_UNITY -DSB_CONFIG_DISABLE_SCRATCH_MEMORY -c $< -o $@
+
+build/libsheenbidi.a: build/sb/sheenbidi.o
+	rm -f $@
+	$(CROSS)ar rcs $@ $^
+
+# libunibreak's own list: the *data.c files it leaves out are #included.
+UB_SRCS := linebreak linebreakdata linebreakdef wordbreak graphemebreak \
+           eastasianwidthdef emojidef unibreakbase unibreakdef
+UB_OBJS := $(patsubst %,build/ub/%.o,$(UB_SRCS))
+
+build/ub/%.o: $(UB_DIR)/src/%.c
+	mkdir -p build/ub
+	$(CC) $(TEXT_CFLAGS) -w -c $< -o $@
+
+build/libunibreak.a: $(UB_OBJS)
+	rm -f $@
+	$(CROSS)ar rcs $@ $^
+
+TEXT_INC  := -Ilibtext/include -Ilibtext/src -I$(FT_DIR)/include -I$(HB_DIR)/src \
+             -I$(SB_DIR)/Headers -I$(UB_DIR)/src
+TEXT_SRCS := $(wildcard libtext/src/*.c)
+TEXT_OBJS := $(patsubst libtext/src/%.c,build/txt/%.o,$(TEXT_SRCS))
+-include $(TEXT_OBJS:.o=.d)
+
+build/txt/%.o: libtext/src/%.c
+	mkdir -p build/txt
+	$(CC) $(TEXT_CFLAGS) $(DEPFLAGS) -Wall -Wextra $(TEXT_INC) -c $< -o $@
+
+build/libtext.a: $(TEXT_OBJS)
+	rm -f $@
+	$(CROSS)ar rcs $@ $^
+
+# Which characters each font has, so libtext can choose a font without
+# reading every one: see tools/fontindex.py.
+build/fonts.idx: $(wildcard assets/fonts/*.ttf assets/fonts/*.otf) tools/fontindex.py
+	python3 tools/fontindex.py assets/fonts $@
+
+# In link order: libtext calls the other four, and they call only libc.
+TEXT_LIBS := build/libtext.a build/libharfbuzz.a build/libfreetype.a \
+             build/libsheenbidi.a build/libunibreak.a
+
+# Programs built on libtext. HarfBuzz is C++, so the C++ runtime comes too,
+# and libc once more after it for what that runtime asks of it.
+build/%_txtuser.o: userland/%.c libtext/include/text.h $(wildcard libc/include/*.h) $(wildcard userland/*.h)
+	mkdir -p build
+	$(CC) $(TEXT_CFLAGS) -Wall -Wextra -Ilibtext/include -c $< -o $@
+
+define TEXT_LINK_RULE
+build/$(1).elf: build/$(1)_txtuser.o $(CRT0) $(LIBC_A) $(TEXT_LIBS) userland/link.ld
+	$(LD) $(LIBC_LDFLAGS) $(CRT0) build/$(1)_txtuser.o $(TEXT_LIBS) $(LIBC_A) \
+	    $(CXX_RUNTIME) $(LIBC_A) -o $$@ -lgcc
+endef
+$(foreach p,$(TEXT_PROGS),$(eval $(call TEXT_LINK_RULE,$(p))))
+
 build/%.elf: build/%_user.o userland/link.ld
 	$(LD) $(USER_LDFLAGS) $< -o $@
 
@@ -293,6 +400,7 @@ assets/icons.bin: $(wildcard assets/icons/*.png) tools/mkicons.py
 disk.img: disk/hello.txt disk/about.txt disk/t1.c disk/demo.c disk/calc.c \
           disk/bad1.c disk/bad2.c disk/readme.txt assets/icons.bin \
           $(wildcard assets/pics/*) $(wildcard assets/sounds/*) \
+          $(wildcard assets/fonts/*) build/fonts.idx \
           $(USER_ELFS) build/tcc.elf build/python.elf $(wildcard disk/python/*.py) \
           build/doom.elf assets/doom1.wad \
           $(CRT0) $(LIBC_A) $(wildcard libc/include/*.h) \
@@ -325,6 +433,13 @@ disk.img: disk/hello.txt disk/about.txt disk/t1.c disk/demo.c disk/calc.c \
 	for f in assets/pics/*; do \
 	    debugfs -w -R "write $$f /pics/`basename $$f`" disk.img; \
 	done
+	# The fonts libtext draws with, and their licences beside them, which
+	# the Open Font License asks for. tools/vendor.py fetches them.
+	debugfs -w -R "mkdir /fonts" disk.img
+	for f in assets/fonts/*; do \
+	    debugfs -w -R "write $$f /fonts/`basename $$f`" disk.img; \
+	done
+	debugfs -w -R "write build/fonts.idx /fonts/index" disk.img
 	debugfs -w -R "write disk/readme.txt /home/readme.txt" disk.img
 	for p in $(ALL_USER_PROGS); do \
 	    debugfs -w -R "write build/$$p.elf /bin/$$p" disk.img; \

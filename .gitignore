@@ -37,6 +37,12 @@
 # micropython/ports/xyuos and was invisible to version control the whole time.
 /third_party/doomgeneric/
 /third_party/micropython/
+/third_party/freetype/
+/third_party/harfbuzz/
+/third_party/sheenbidi/
+/third_party/libunibreak/
+# The fonts, pinned by URL and checksum in the same script.
+/assets/fonts/
 
 # --- what is not here at all -----------------------------------------------
 # The NetSurf sources and the eight libraries it needs live outside the

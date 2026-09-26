@@ -6,7 +6,8 @@
 Each step is COMMAND:SECONDS -- what to type, and how long to let it run
 before the screen is photographed. A step with nothing before the colon just
 presses Enter, which is how a message box left by a deliberate crash is got
-out of the way before the next command.
+out of the way before the next command. A step starting with @ names keys
+instead of typing text: "@pgdn pgdn:2" presses Page Down twice.
 
 The pictures land in /tmp/seqrun as step0.png, step1.png, ... and, if
 SEQRUN_COPY names a directory, are copied there as well.
@@ -90,7 +91,9 @@ def cmd(c, settle=0.08):
 # without a word -- so every character a step may contain needs its key here.
 KEYS = {' ': 'spc', '.': 'dot', '/': 'slash', '-': 'minus', '\n': 'ret',
         ':': 'shift-semicolon', '_': 'shift-minus', '=': 'equal',
-        '+': 'shift-equal', '*': 'shift-8', ',': 'comma'}
+        '+': 'shift-equal', '*': 'shift-8', ',': 'comma',
+        '|': 'shift-backslash', '>': 'shift-dot', '<': 'shift-comma',
+        '"': 'shift-apostrophe', "'": 'apostrophe', '&': 'shift-7'}
 
 
 def typ(t):
@@ -101,7 +104,13 @@ def typ(t):
 
 for i, step in enumerate(STEPS):
     line, _, wait = step.rpartition(":")
-    typ(line + "\n")
+    if line.startswith("@"):
+        # Keys by QEMU's names, pressed and not typed: "@pgdn pgdn:2" pages
+        # down twice, with no Enter after.
+        for k in line[1:].split():
+            cmd("sendkey " + k, 0.15)
+    else:
+        typ(line + "\n")
     time.sleep(float(wait))
     cmd("screendump %s/step%d.ppm" % (OUT, i), 1.5)
 
