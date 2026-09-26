@@ -79,7 +79,8 @@ TEXT_PROGS      := texttest fonts
 ALL_USER_PROGS  := $(RAW_USER_PROGS) $(LIBC_C_PROGS) $(LIBC_CXX_PROGS) $(TEXT_PROGS)
 USER_ELFS       := $(patsubst %,build/%.elf,$(ALL_USER_PROGS))
 
-LIBC_SRCS := libc/src/syscalls.c libc/src/stdio.c libc/src/stdlib.c libc/src/string.c \
+LIBC_SRCS := libc/src/syscalls.c libc/src/stdio.c libc/src/stdlib.c libc/src/malloc.c \
+             libc/src/string.c \
              libc/src/string_extra.c libc/src/posix.c libc/src/scanf.c \
              libc/src/math.c libc/src/readline.c libc/src/dirstat.c \
              libc/src/inet.c libc/src/regex.c libc/src/thread.c \
