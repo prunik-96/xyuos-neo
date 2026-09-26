@@ -13,6 +13,9 @@ SEQRUN_COPY names a directory, are copied there as well.
 
 SEQRUN_SMP sets the number of cores. QEMU gives ONE unless told otherwise,
 which is worth knowing: every test run without it is a single-core test.
+
+SEQRUN_RAMDISK=1 leaves out the virtio disk, so the system runs from the copy
+of the image GRUB loads into memory -- the only disk it has on real hardware.
 """
 import os, shutil, socket, subprocess, sys, time
 
@@ -21,6 +24,7 @@ XYUOS = os.environ.get(
 OUT = "/tmp/seqrun"
 COPY = os.environ.get("SEQRUN_COPY")
 SMP = os.environ.get("SEQRUN_SMP", "1")
+RAMDISK = os.environ.get("SEQRUN_RAMDISK") == "1"
 RAM = sys.argv[1] if len(sys.argv) > 1 else "2G"
 STEPS = sys.argv[2:] or ["sigtest:25"]
 
@@ -28,16 +32,18 @@ os.makedirs(OUT, exist_ok=True)
 for f in list(os.listdir(OUT)):
     os.unlink(OUT + "/" + f)
 SER, MON = OUT + "/serial.log", OUT + "/mon.sock"
-subprocess.run(["cp", XYUOS + "/disk.img", OUT + "/disk.img"], check=True)
+DISK = []
+if not RAMDISK:
+    subprocess.run(["cp", XYUOS + "/disk.img", OUT + "/disk.img"], check=True)
+    DISK = ["-drive", "file=%s/disk.img,if=none,id=d0,format=raw" % OUT,
+            "-device", "virtio-blk-pci,drive=d0"]
 
 proc = subprocess.Popen(
     ["qemu-system-x86_64", "-enable-kvm", "-cpu", "host",
      "-cdrom", XYUOS + "/build/xyuos_neo.iso",
      "-serial", "file:" + SER, "-m", RAM, "-display", "none",
-     "-smp", SMP,
-     "-drive", "file=%s/disk.img,if=none,id=d0,format=raw" % OUT,
-     "-device", "virtio-blk-pci,drive=d0",
-     "-device", "qemu-xhci,id=xhci",
+     "-smp", SMP] + DISK +
+    ["-device", "qemu-xhci,id=xhci",
      "-device", "usb-kbd,bus=xhci.0", "-device", "usb-mouse,bus=xhci.0",
      "-monitor", "unix:%s,server,nowait" % MON],
     stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)

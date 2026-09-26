@@ -45,6 +45,22 @@ OBJ   := $(SRC_C:.c=.o) $(SRC_S:.S=.o)
 KERNEL := build/xyuos_neo.elf
 ISO    := build/xyuos_neo.iso
 
+# The disk, in MiB. On bare metal the whole image is loaded into RAM by GRUB
+# as a module and is the only disk there is, so two things bound it:
+#
+#   Boot time. GRUB reads every byte through the firmware before the kernel
+#   starts, empty blocks included. From a USB stick that is a few seconds per
+#   hundred megabytes.
+#
+#   The kernel's memory. It reaches physical memory only through the identity
+#   map of the low 4 GiB, and [1 GiB, 2 GiB) of that is the program window
+#   (kernel/mm/paging.h). The RAM on the machine beyond 4 GiB does not help.
+#   The image comes out of what is left, and so does every program.
+#
+# 128 MiB holds the fonts (the CJK face alone is 16 MiB) with room to spare.
+# In QEMU the disk is virtio-blk and the kernel hands the module's memory back.
+DISK_MB := 128
+
 RAW_USER_PROGS  := test1
 LIBC_C_PROGS    := files note view taskmgr play hello_c fstest spin parent keywait sh fm edit cc run \
                    ls cat echo wc grep head tail sort uniq tee hexdump \
@@ -283,10 +299,8 @@ disk.img: disk/hello.txt disk/about.txt disk/t1.c disk/demo.c disk/calc.c \
           $(wildcard third_party/nsxyuos/netsurf.elf) \
           $(wildcard third_party/nsxyuos/res/*)
 	rm -f disk.img
-	# 32 MiB: holds /bin (tcc ~378K, doom ~600K), the DOOM WAD (~4 MiB), /lib,
-	# the headers, and user files. On bare metal the whole image is loaded into
-	# RAM as an initrd shipped inside the ISO, so every megabyte is boot time.
-	dd if=/dev/zero of=disk.img bs=1M count=32 status=none
+	# See DISK_MB above for why this size and not a bigger one.
+	dd if=/dev/zero of=disk.img bs=1M count=$(DISK_MB) status=none
 	mke2fs -q -F -b 1024 -O ^resize_inode disk.img
 	debugfs -w -R "write disk/hello.txt hello.txt" disk.img
 	debugfs -w -R "write disk/about.txt about.txt" disk.img
