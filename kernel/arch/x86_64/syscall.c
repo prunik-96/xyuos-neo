@@ -416,6 +416,7 @@ static uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 // on keyboard_poll_event() would never see the wake key. The ASCII
                 // ring is filled by the same keypress and nothing else consumes it
                 // while the shell is parked here.
+                wm_set_asleep(1);
                 fb_fill_rect(0, 0, fb_get_width(), fb_get_height(), 0x00000000);
                 fb_present();
                 keyboard_flush();
@@ -426,6 +427,7 @@ static uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 // would wait for a key that could never be delivered.
                 while (!keyboard_poll(&c)) bkl_wait_interrupt();
                 keyboard_flush();   // drop the wake key so it doesn't hit the shell
+                wm_set_asleep(0);
                 wm_refresh();
             }
             return 0;

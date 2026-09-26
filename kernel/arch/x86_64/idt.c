@@ -321,9 +321,15 @@ void isr_handler(struct interrupt_frame *frame) {
 // Returns the stack pointer to resume on -- normally the frame we were handed,
 // but the timer may hand back another process's saved frame instead, which is
 // how preemption happens. See irq_common_stub in isr.S.
+// Returned by irq_handler, OR-ed into the frame address, when it did NOT take
+// the kernel lock -- so the stub must not give it back. Frames are 16-byte
+// aligned, so the low bit is free to carry this.
+#define IRQ_NO_LOCK 1ULL
+
 uint64_t irq_handler(struct interrupt_frame *frame) {
     uint64_t vec = frame->int_no;
     uint64_t irq = vec - 32;
+    int timer = (vec == 32 || vec == SMP_TICK_VECTOR);
 
     // The part of a timer tick that must not wait for anybody: the clock
     // itself, and passing the tick on to the other cores. Kernel code on
@@ -332,19 +338,62 @@ uint64_t irq_handler(struct interrupt_frame *frame) {
     // the lock, it would wait for ever for a clock that was waiting for it.
     if (vec == 32) pit_tick_fast();
 
-    bkl_enter();          // given back by the stub, after any stack switch
+    // End of interrupt NOW, before the lock rather than after the handler.
+    //
+    // A Local APIC holds back any interrupt in the same priority class as
+    // one it is still servicing, and the timer, the keyboard and the mouse
+    // are all in one class. So an interrupt left un-acknowledged while its
+    // handler waits for the lock holds the TIMER back too -- for as long as
+    // some other core keeps the lock -- and the clock stops. That is not
+    // hypothetical: the SMP benchmark, run from a program on another core,
+    // measured 430 ms of work as 10.
+    //
+    // Early EOI is safe here because every device interrupt this kernel takes
+    // is edge-triggered (the PIT and the two PS/2 lines): the device will not
+    // raise it again until it has something new. A level-triggered device
+    // would re-raise at once and must not be added without changing this.
+    if (apic_active()) lapic_eoi();
+    else pic_send_eoi((uint8_t)irq);
+
+    struct percpu *c = this_cpu();
+
+    if (vec == SMP_TICK_VECTOR) {
+        // An application processor's tick only ever takes its process off
+        // the processor. If another core has the lock that is simply skipped:
+        // the next tick will do it, and waiting instead would pile tick upon
+        // tick on this core's stack for as long as the lock was held.
+        if (!bkl_try_enter())
+            return (uint64_t)(uintptr_t)frame | IRQ_NO_LOCK;
+    } else if (vec == 32) {
+        // The bootstrap core's tick is different, and must not be skipped:
+        // it polls the USB keyboard and mouse, wakes the sleepers and plays
+        // the speaker. Skipping it was tried. A key's release is seen only a
+        // couple of polls after its press, and with polls being skipped while
+        // a compile on another core kept the lock busy, the window manager's
+        // key repeat decided Enter was being held and typed it four times.
+        //
+        // So it waits -- but only one at a time. A tick that arrives while an
+        // earlier one is still waiting or working has already moved the
+        // clock above, and leaves the rest to that one. That is what keeps a
+        // long wait from stacking up ticks.
+        if (c->in_timer)
+            return (uint64_t)(uintptr_t)frame | IRQ_NO_LOCK;
+        c->in_timer = 1;
+        bkl_enter();
+    } else {
+        bkl_enter();          // given back by the stub, after any stack switch
+    }
 
     if (irq < 16 && irq_handlers[irq]) {
         irq_handlers[irq](frame);
     }
-    // EOI before any switch: the controller must be released even if we never
-    // come back to this frame. The APIC owns delivery once it is up.
-    if (apic_active()) lapic_eoi();
-    else pic_send_eoi((uint8_t)irq);
 
     // The bootstrap core's own timer, and the tick it hands on to the rest:
     // either way, this core's chance to take its process off the processor.
-    if (vec == 32 || vec == SMP_TICK_VECTOR) {
+    // (in_timer is cleared first: what follows may switch to another process
+    // and never come back here.)
+    if (timer) {
+        c->in_timer = 0;
         return sched_on_tick((uint64_t)(uintptr_t)frame, frame->cs);
     }
     return (uint64_t)(uintptr_t)frame;

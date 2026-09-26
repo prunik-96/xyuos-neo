@@ -39,6 +39,15 @@
 // Take the lock, or take it once more if this core already has it.
 void bkl_enter(void);
 
+// Take it only if nobody else has it. 1 if it is now held (depth counted as
+// for bkl_enter), 0 if another core holds it -- in which case nothing was
+// taken and there is nothing to give back.
+//
+// For the application processors' timer tick, which only ever preempts and
+// so is better skipped than kept waiting: see irq_handler. (The bootstrap
+// core's tick polls the devices and does wait.)
+int bkl_try_enter(void);
+
 // Let go of it once. The last one out releases it.
 void bkl_exit(void);
 

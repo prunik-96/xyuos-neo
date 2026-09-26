@@ -10,6 +10,7 @@
 #include "process.h"
 #include "signal.h"
 #include "bkl.h"
+#include "panic.h"
 #include "elf.h"
 #include "kio.h"
 #include "../arch/x86_64/syscall.h"
@@ -661,6 +662,20 @@ uint64_t sched_on_tick(uint64_t cur_rsp, uint64_t cs) {
     signal_check();
 
     process_t *next = pick_next(current);
+
+    // Suspended -- by SIGSTOP or the task manager. With something else to
+    // run, the switch below takes it off like any other process. With
+    // nothing else, the old code kept running it: a suspended program went
+    // on running for as long as it was alone, which on a machine with idle
+    // cores is most of the time. Park it instead, and let this core's loop
+    // idle. It is picked up again, on whichever core, once it is continued.
+    if (current->stopped && !next) {
+        current->resume_kernel = 0;
+        current->state = PROC_READY;
+        __asm__ volatile ("fxsave (%0)" : : "r"(current->fxstate) : "memory");
+        kctx_restore(this_cpu()->idle_ctx, 1);      // never returns
+    }
+
     if (!next || next == current) {
         // Staying on the CPU. This is the frame that is about to go back to
         // ring 3, so it is the place to bend it into a signal handler.
@@ -1059,7 +1074,10 @@ static void cpu_loop(void) {
             next = pick_next(NULL);
         }
 
-        if (next) resume_process(next);     // never returns
+        if (next) {
+            if (!bsp) smp_set_busy(1);
+            resume_process(next);           // never returns
+        }
         if (bsp && !any_alive()) return;
 
         // Nothing to run. Before sleeping, out of the last process's page
@@ -1069,12 +1087,47 @@ static void cpu_loop(void) {
 
         // Let go of the kernel and sleep until an interrupt -- a key, a
         // tick, a wake-up -- gives a reason to look again.
-        if (bsp) g_cpu_idle = 1;
+        if (bsp) g_cpu_idle = 1; else smp_set_busy(0);
         bkl_exit();
         __asm__ volatile ("sti; hlt; cli");
-        bkl_enter();
-        if (bsp) g_cpu_idle = 0;
+
+        // Back for the lock. An idle application processor is also the
+        // compute pool, and shares need no lock -- so it keeps looking for
+        // them the whole time it waits, not only once on waking up. The core
+        // that hands out shares is holding the lock while it waits for them:
+        // an idle core that took one look, found nothing yet, and then spun
+        // on the lock would miss the job entirely. It did, every time -- the
+        // benchmark's single-core pass holds the lock long enough for every
+        // idle core to be woken by a tick and end up spinning here.
+        //
+        // Not the bootstrap core: it takes the device interrupts, and a
+        // share runs with them held off.
+        if (bsp) {
+            bkl_enter();
+            g_cpu_idle = 0;
+        } else {
+            for (;;) {
+                smp_idle_work();
+                if (bkl_try_enter()) break;
+                // The same one-instruction window bkl_enter keeps open, for
+                // the same reason: a shootdown must be able to reach a core
+                // that is waiting here.
+                __asm__ volatile ("sti; pause; cli" ::: "memory");
+            }
+        }
     }
+}
+
+// An application processor's way into the scheduler, once the bootstrap
+// core has started it. Never returns: cpu_loop() only ever returns on the
+// bootstrap core.
+void process_ap_run(void) __attribute__((noreturn));
+void process_ap_run(void) {
+    bkl_enter();
+    // Every block and every exit on this core comes back to this line.
+    kctx_save(this_cpu()->idle_ctx);
+    cpu_loop();
+    panic("scheduler loop returned on an application processor");
 }
 
 int process_run_all(void) {
@@ -1087,6 +1140,12 @@ int process_run_all(void) {
     // stack, through kctx_restore(this_cpu()->idle_ctx). The first entry and
     // every return alike fall through into the loop.
     kctx_save(this_cpu()->idle_ctx);
+
+    // The other cores join now: kernel_space is known, and there is a
+    // process table to pick from. Only the first time through -- a return
+    // here from kctx_restore finds them already running.
+    smp_start_scheduling();
+
     cpu_loop();
 
     // Every process has exited. Anything still sitting in the table is a

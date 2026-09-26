@@ -48,9 +48,10 @@ struct percpu {
     // This core's GDT and task state segment. Opaque here; gdt.c owns it.
     void *desc;
 
-    // The address space whose page tables are in this core's CR3, or 0 for
-    // the kernel's own. A shootdown has to reach every core in this set.
-    void *loaded_as;
+    // Set while this core's timer interrupt is waiting for the kernel lock
+    // or doing its work. A tick that arrives meanwhile moves the clock and
+    // leaves -- see irq_handler.
+    int in_timer;
 };
 
 // The per-CPU block of the core this runs on.
@@ -79,9 +80,32 @@ void smp_early_init(void);
 int  smp_init(void);
 int  smp_cpu_count(void);
 
-// Run `fn(core, ncores, arg)` on every online core and block until all finish
-// (a strided-partition parallel-for over the compute pool).
-void smp_run(void (*fn)(int core, int ncores, void *arg), void *arg);
+// Split pure computation into one share per core: `fn(share, nshares, arg)`
+// for share = 0..nshares-1, done by the caller and whichever cores are idle,
+// and return once every share is done. The shares must touch nothing shared
+// with the rest of the kernel -- they run on other cores without its lock.
+void smp_run(void (*fn)(int share, int nshares, void *arg), void *arg);
+
+// An idle core's part in the above: take shares while there are any. Called
+// from the idle loop, without the kernel lock, with interrupts off.
+void smp_idle_work(void);
+
+// Start the application processors on processes. Called once, by the
+// bootstrap core, when its own scheduler starts.
+void smp_start_scheduling(void);
+
+// Pass the timer tick on to every other core. From the bootstrap core's timer
+// interrupt, before the kernel lock is taken.
+void smp_tick_broadcast(void);
+
+// Make every other core forget its cached translations, and wait until each
+// has. Called by the holder of the kernel lock after it has removed or
+// restricted a mapping in page tables that another core may be using.
+void smp_tlb_shootdown(void);
+
+// Mark THIS core as running something (1) or idle (0), for the per-core load
+// in the System Monitor. The bootstrap core's comes from its idle flag.
+void smp_set_busy(int busy);
 
 // Result of the built-in parallel benchmark (counts primes below n on one core,
 // then on all cores, timing each). Layout mirrored by libc's struct smp_result.

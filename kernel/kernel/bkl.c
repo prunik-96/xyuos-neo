@@ -49,6 +49,21 @@ void bkl_enter(void) {
     c->bkl_depth = 1;
 }
 
+int bkl_try_enter(void) {
+    struct percpu *c = this_cpu();
+    int me = (int)c->cpu_index;
+    if (__atomic_load_n(&owner, __ATOMIC_RELAXED) == me) {
+        c->bkl_depth++;
+        return 1;
+    }
+    int expect = -1;
+    if (!__atomic_compare_exchange_n(&owner, &expect, me, 0,
+                                     __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+        return 0;
+    c->bkl_depth = 1;
+    return 1;
+}
+
 void bkl_exit(void) {
     struct percpu *c = this_cpu();
     if (c->bkl_depth <= 0)

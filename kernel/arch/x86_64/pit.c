@@ -61,6 +61,9 @@ uint64_t pit_now_us(void) {
 void pit_tick_fast(void) {
     ticks++;
     if (g_cpu_idle) idle_ticks++;   // sample CPU utilisation
+    // Every other core's tick, passed on. Here and not under the lock: a core
+    // waiting for the lock would otherwise wait for its own tick as well.
+    smp_tick_broadcast();
 }
 
 // The rest of the tick, under the kernel lock.

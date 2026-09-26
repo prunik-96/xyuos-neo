@@ -192,6 +192,11 @@ irq_common_stub:
     PUSH_REGS
     mov %rsp, %rdi
     call irq_handler
+    # A tick that found the kernel lock taken did nothing and took nothing:
+    # irq_handler says so by setting bit 0 of the (16-byte aligned) frame
+    # address. Same frame, no switch, and no lock to give back.
+    btr $0, %rax
+    jc .Lirq_no_lock
     # irq_handler returns the stack pointer to resume on: the same frame in the
     # ordinary case, or another process's saved frame when the scheduler
     # decided to rotate. Adopting it here IS the context switch.
@@ -203,6 +208,10 @@ irq_common_stub:
     # kernel stack. (The frame at %rsp is 16-byte aligned, so this is a
     # well-formed call.)
     call bkl_exit
+    jmp .Lirq_pop
+.Lirq_no_lock:
+    mov %rax, %rsp
+.Lirq_pop:
     POP_REGS
     add $16, %rsp
     testb $3, 8(%rsp)          # CS we are returning to (may be a different process)

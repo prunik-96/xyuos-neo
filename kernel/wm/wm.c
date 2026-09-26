@@ -3390,7 +3390,17 @@ static void do_binding(int b) {
     }
 }
 
+// Set while the screen is deliberately blank (SYS_POWER sleep). The screen is
+// someone else's until it is cleared -- with several cores, the idle core that
+// runs this would otherwise repaint the desktop over the black the moment it
+// had nothing better to do.
+static volatile int screen_asleep = 0;
+
+void wm_set_asleep(int on) { screen_asleep = on; }
+
 void wm_poll(void) {
+    if (screen_asleep) return;
+
     // The pointer is drained here rather than in wm_route_input(): that runs
     // off the keyboard IRQ, so with no typing the mouse would never be read.
     struct mouse_event me;

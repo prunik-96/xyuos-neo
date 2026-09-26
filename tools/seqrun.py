@@ -80,8 +80,11 @@ def cmd(c, settle=0.08):
         pass
 
 
+# QEMU names keys, not characters, and a name it does not know is dropped
+# without a word -- so every character a step may contain needs its key here.
 KEYS = {' ': 'spc', '.': 'dot', '/': 'slash', '-': 'minus', '\n': 'ret',
-        ':': 'shift-semicolon', '_': 'shift-minus', '=': 'equal'}
+        ':': 'shift-semicolon', '_': 'shift-minus', '=': 'equal',
+        '+': 'shift-equal', '*': 'shift-8', ',': 'comma'}
 
 
 def typ(t):
