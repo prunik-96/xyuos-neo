@@ -391,7 +391,7 @@ int net_ping(uint32_t ip, uint32_t *rtt_us) {
 // range noted, so that when the hole is filled the acknowledgement jumps over
 // all of it and nothing is sent twice.
 
-#define TCP_CONNS   8         // as many as a page has hosts, near enough
+#define TCP_CONNS   16        // every slot's kept connection, and room to spare
 #define TCP_HELD    8         // ranges kept past a gap, per connection
 
 enum { TCP_CLOSED, TCP_SYN_SENT, TCP_ESTABLISHED, TCP_CLOSING };
@@ -963,11 +963,12 @@ static int dns_query(const char *name, uint32_t *ip) {
 // machine for all of them, so each one runs as a coroutine on its own stack
 // and hands the processor back every few milliseconds.
 //
-// There are four of them now. A page is a document and then twenty files, and
+// There are six of them now. A page is a document and then twenty files, and
 // with one slot those twenty went in single file -- twenty-one round trips
-// end to end, most of the time spent with nothing on the wire at all. Four
-// slots means four TCP connections, four TLS sessions and four stacks, and
-// the twenty files overlap.
+// end to end, most of the time spent with nothing on the wire at all. Each
+// slot has its own TCP connection, TLS session and stack, and the twenty
+// files overlap. Six is what browsers settled on per host; four was enough
+// only while the browser itself was the slow part.
 //
 // What makes this safe without a single lock is that the tasks are
 // cooperative: a slot only ever gives up the processor inside net_poll(),
@@ -982,7 +983,7 @@ enum { AF_IDLE, AF_RUN, AF_DONE };
 // enough that a window redrawing at 60Hz does not visibly stutter.
 #define AF_SLICE_US 4000
 #define AF_STACK    (64 * 1024)
-#define AF_SLOTS    4
+#define AF_SLOTS    TLS_SESSIONS     // a slot is a TLS session and a stack
 #define AF_BUF_MAX  (1024 * 1024)
 
 // Set while a fetch task is the one holding the processor, and the moment it
@@ -1065,9 +1066,19 @@ static void af_copy(char *dst, int cap, const char *src) {
 int net_fetch_start(const char *host, const char *path, uint16_t port,
                     int tls, int keep_headers, const char *body, int blen,
                     const char *xhdr, int xhdrlen) {
-    int slot = -1;
-    for (int i = 0; i < AF_SLOTS; i++)
-        if (afs[i].state == AF_IDLE) { slot = i; break; }
+    // Which idle slot. Each keeps the connection its last https request
+    // used, so one already open to this host skips the TCP and TLS handshakes
+    // -- two round trips, which on a phone is most of a small file. Failing
+    // that, one holding nothing, so that no connection another request could
+    // have reused is closed for this one. Plain http keeps no connection and
+    // takes the emptiest slot, leaving the others to whoever can use them.
+    int slot = -1, best = -1;
+    for (int i = 0; i < AF_SLOTS; i++) {
+        if (afs[i].state != AF_IDLE) continue;
+        int fit = tls_pool_suits(i, host, port);
+        if (!tls) fit = fit == 1 ? 2 : 0;
+        if (fit > best) { best = fit; slot = i; }
+    }
     if (slot < 0) return -1;
 
     af_slot_t *a = &afs[slot];

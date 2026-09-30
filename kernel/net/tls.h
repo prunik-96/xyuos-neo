@@ -42,6 +42,14 @@ int tls_https_get(const char *host, uint32_t ip, uint16_t port,
 /* Close the kept-open connection, if there is one. */
 void tls_pool_flush(void);
 
+// One session per fetch slot in net.c, which sizes its slots by this.
+#define TLS_SESSIONS 6
+
+// How well session `slot` suits a request to host:port, without making it
+// the session in play: 2 if it holds an open connection there, 1 if it holds
+// none, 0 if it holds one to somewhere else that taking it would close.
+int tls_pool_suits(int slot, const char *host, uint16_t port);
+
 // Make session `slot` (0..TLS_SESSIONS-1) the one every call above works on,
 // creating it on first use. Returns 1, or 0 if the slot is out of range or
 // there is no memory for it.

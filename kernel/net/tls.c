@@ -91,8 +91,8 @@ typedef struct {
  * cooperative scheduling is what makes that safe. Sessions are allocated on
  * first use because most of the time only one of them is ever needed, and
  * each is the better part of a hundred kilobytes before the response buffer.
+ * How many there are is in tls.h: net.c has one fetch slot per session.
  */
-#define TLS_SESSIONS 4
 
 typedef struct {
     int      live;
@@ -770,6 +770,14 @@ static void pool_drop(void) {
 }
 
 void tls_pool_flush(void) { if (tls_need_session()) pool_drop(); }
+
+int tls_pool_suits(int slot, const char *host, uint16_t port) {
+    if (slot < 0 || slot >= TLS_SESSIONS || !sessions[slot]) return 1;
+    const tls_state_t *s = sessions[slot];
+    const tls_pool_t *q = &pools[slot];
+    if (!q->live || !s->open || s->peer_closed || net_tcp_closed(s->sock)) return 1;
+    return (q->port == port && host_same(q->host, host)) ? 2 : 0;
+}
 
 int tls_https_get(const char *host, uint32_t ip, uint16_t port,
                   const char *path, char *buf, int max, int keep_headers,
