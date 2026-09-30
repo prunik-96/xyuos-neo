@@ -411,6 +411,7 @@ typedef struct {
     // already in rx at rx_head + rx_len + (held_lo - rcv_nxt).
     int      nheld;
     uint32_t held_lo[TCP_HELD], held_hi[TCP_HELD];
+    int      adv_win;         // the window the peer was last told about
 } tcp_conn_t;
 
 static tcp_conn_t conns[TCP_CONNS];
@@ -455,6 +456,7 @@ static void tcp_out(tcp_conn_t *c, uint8_t flags, const void *data, int len) {
         if (space > 65535) space = 65535;
         if (space < 0) space = 0;
         t->window = htons((uint16_t)space);
+        c->adv_win = space;
     }
     t->checksum = 0;
     t->urgent = 0;
@@ -757,6 +759,20 @@ void net_tcp_consume(int h, int n) {
     // Empty: start from the front again -- unless data held past a gap is
     // sitting further along, addressed from where the unread bytes end.
     if (c->rx_len == 0 && c->nheld == 0) c->rx_head = 0;
+
+    // Tell the sender about room it cannot see yet. It learns the window only
+    // from our acknowledgements, and those go out when data arrives. So once
+    // a fast sender has filled the buffer and the window has shrunk to a few
+    // hundred bytes, nothing more arrives, nothing goes back, and the sender
+    // sits out its persist timer while the reader has long since made room.
+    // Measured on a kept connection to GitHub's CDN: a 624 KB file whose
+    // last two kilobytes came five seconds after the rest. A window grown by
+    // two segments is worth saying so (RFC 1122, 4.2.3.3).
+    if (c->state == TCP_ESTABLISHED && !c->remote_closed) {
+        int win = c->rx_cap - c->rx_len;          // as tcp_out reckons it
+        if (win > 65535) win = 65535;
+        if (win - c->adv_win >= 2 * 1460) tcp_out(c, TCP_ACK, NULL, 0);
+    }
 }
 
 int net_tcp_fill(int h, int want, uint32_t timeout_ms) {
