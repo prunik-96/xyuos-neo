@@ -106,6 +106,7 @@ static int               codec_addr = -1;
 static int               dac_nid, pin_nid;
 static int               have_hda;
 static int               wpos;            /* our write cursor into buf */
+static int               cleared;         /* played bytes are silenced up to here */
 static int               volume = 80;
 
 /* --- MMIO helpers -------------------------------------------------------- */
@@ -332,7 +333,27 @@ static void speaker_tone(uint16_t hz) {
     speaker_on = 1;
 }
 
+/* Silence what the codec has already played. The ring is 340 ms long and
+ * the codec goes round it for as long as the stream runs, so audio that is
+ * left in it plays again on every lap: a track that ended kept sounding its
+ * last third of a second over and over until the player was closed. The
+ * guard in audio_write covers only an underrun of a few milliseconds. What
+ * lies behind the play position has been heard and cannot be anything the
+ * writer is still waiting to have played -- the writer only ever fills the
+ * part ahead of it -- so it is safe to zero, and after one lap an idle ring
+ * is nothing but silence. Called every tick, under the kernel lock, as
+ * audio_write is. */
+static int play_pos(void);
+static void silence_played(void) {
+    int lp = play_pos();
+    int n = lp - cleared;
+    if (n < 0) n += BUF_BYTES;
+    for (int i = 0; i < n; i++) buf[(cleared + i) % BUF_BYTES] = 0;
+    cleared = lp;
+}
+
 void audio_tick(void) {
+    if (have_hda) silence_played();
     if (!melody_len) return;
     if (pit_get_ticks() * 10 < melody_until) return;
     if (melody_at >= melody_len) {
@@ -439,6 +460,7 @@ int audio_init(void) {
     stream_start();
     have_hda = 1;
     wpos = 0;
+    cleared = 0;
     kprintf("hda: ready, 48 kHz stereo\n");
     return 1;
 }
@@ -492,6 +514,7 @@ void audio_stop(void) {
     if (!have_hda) return;
     for (int i = 0; i < BUF_BYTES; i++) buf[i] = 0;
     wpos = play_pos();
+    cleared = wpos;
 }
 
 /* --- system sounds --------------------------------------------------------
