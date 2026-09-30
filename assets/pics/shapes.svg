@@ -1,0 +1,80 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- What librast draws: a page of the things SVG asks for. Open it with
+     `view /pics/shapes.svg`. -->
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"
+     width="640" height="400" viewBox="0 0 640 400">
+  <defs>
+    <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1b2a4a"/>
+      <stop offset="1" stop-color="#3d5a80"/>
+    </linearGradient>
+    <linearGradient id="warm" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#ffd166"/>
+      <stop offset="50%" stop-color="#ef476f"/>
+      <stop offset="100%" stop-color="#7b2cbf"/>
+    </linearGradient>
+    <linearGradient id="warm-flip" xlink:href="#warm" x1="100%" x2="0%"/>
+    <radialGradient id="ball" cx="50%" cy="50%" r="50%" fx="35%" fy="30%">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="0.35" stop-color="#8ecae6"/>
+      <stop offset="1" stop-color="#023047"/>
+    </radialGradient>
+    <linearGradient id="bands" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="18" y2="0"
+                    spreadMethod="reflect" gradientTransform="rotate(35)">
+      <stop offset="0" stop-color="#06d6a0"/>
+      <stop offset="1" stop-color="#118ab2"/>
+    </linearGradient>
+    <clipPath id="porthole">
+      <circle cx="560" cy="80" r="52"/>
+    </clipPath>
+  </defs>
+
+  <rect width="640" height="400" fill="url(#sky)"/>
+
+  <!-- gradients -->
+  <rect x="20" y="20" width="140" height="110" rx="18" fill="url(#warm)"/>
+  <rect x="180" y="20" width="140" height="110" rx="18" fill="url(#warm-flip)" opacity="0.85"/>
+  <circle cx="400" cy="75" r="55" fill="url(#ball)"/>
+
+  <!-- a clip path over a pattern of stripes -->
+  <g clip-path="url(#porthole)">
+    <rect x="500" y="20" width="120" height="120" fill="url(#bands)"/>
+  </g>
+  <circle cx="560" cy="80" r="52" fill="none" stroke="#e0e1dd" stroke-width="4"/>
+
+  <!-- joins and caps -->
+  <g fill="none" stroke="#ffd166" stroke-width="14">
+    <polyline points="30,230 70,160 110,230" stroke-linejoin="miter"/>
+    <polyline points="140,230 180,160 220,230" stroke-linejoin="round" stroke-linecap="round"/>
+    <polyline points="250,230 290,160 330,230" stroke-linejoin="bevel" stroke-linecap="square"/>
+  </g>
+  <path d="M30 260 C 110 200, 220 320, 330 260" fill="none" stroke="#e0e1dd"
+        stroke-width="5" stroke-dasharray="14 8" stroke-linecap="round"/>
+
+  <!-- a pie chart of arcs, one in each quarter and across them -->
+  <g transform="translate(430 250)" stroke="#1b2a4a" stroke-width="2" stroke-linejoin="round">
+    <path d="M0 0 L60 0 A60 60 0 0 1 -18.5 57.1 Z" fill="#ef476f"/>
+    <path d="M0 0 L-18.5 57.1 A60 60 0 0 1 -48.5 -35.3 Z" fill="#ffd166"/>
+    <path d="M0 0 L-48.5 -35.3 A60 60 0 0 1 30 -52 Z" fill="#06d6a0"/>
+    <path d="M0 0 L30 -52 A60 60 0 0 1 60 0 Z" fill="#118ab2"/>
+  </g>
+
+  <!-- a star under both rules -->
+  <path d="M560 185 L585 260 L520 213 L600 213 L535 260 Z" fill="#8ecae6"
+        fill-rule="evenodd" stroke="#e0e1dd" stroke-width="2"/>
+
+  <!-- nested transforms and translucency -->
+  <g transform="translate(90 330) rotate(-12)">
+    <ellipse cx="0" cy="0" rx="60" ry="26" fill="#7b2cbf" fill-opacity="0.7"/>
+    <g transform="scale(1.4 0.8) skewX(20)">
+      <rect x="10" y="-20" width="60" height="40" fill="#06d6a0" fill-opacity="0.6"/>
+    </g>
+  </g>
+  <g color="#ffd166">
+    <line x1="220" y1="300" x2="360" y2="380" stroke="currentColor" stroke-width="3"/>
+    <line x1="220" y1="380" x2="360" y2="300" stroke="currentColor" stroke-width="1"/>
+  </g>
+  <polygon points="540,300 610,330 580,390 510,370" fill="none" stroke="#ef476f"
+           stroke-width="6" stroke-linejoin="round" stroke-dasharray="2 10"
+           stroke-linecap="round"/>
+</svg>

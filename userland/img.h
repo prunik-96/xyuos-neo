@@ -37,15 +37,22 @@
 #include <string.h>
 
 typedef struct {
-    int           w, h;
-    unsigned int *px;        /* ARGB 0x00RRGGBB, w*h */
+    int            w, h;
+    unsigned int  *px;       /* 0x00RRGGBB, w*h, laid on img_background */
+    /* How much of each pixel the picture covers, 0..255, for a caller that
+     * can draw it over what is really behind it; NULL when it covers all of
+     * every one. px is flattened either way, so a caller that ignores this
+     * still gets the old picture. */
+    unsigned char *alpha;
 } image_t;
 
 static const char *img_err = "";
 
 static void img_free(image_t *im) {
     free(im->px);
+    free(im->alpha);
     im->px = 0;
+    im->alpha = 0;
     im->w = im->h = 0;
 }
 
@@ -230,6 +237,7 @@ static int png_decode(const unsigned char *d, unsigned long n, image_t *out) {
 
     int maxv = (1 << depth) - 1;
     if (depth == 16) maxv = 255;
+    unsigned char *alpha = 0;           /* made at the first pixel that needs it */
 
     for (int y = 0; y < h; y++) {
         const unsigned char *row = lines + stride * (unsigned long)y;
@@ -251,9 +259,14 @@ static int png_decode(const unsigned char *d, unsigned long n, image_t *out) {
                 b = png_sample(row, x * chan + 2, depth);
                 if (ctype == 6) a = png_sample(row, x * chan + 3, depth);
             }
-            /* The surface has no alpha channel, so this lands on whatever
-             * the caller said was behind it. */
+            /* Laid on whatever the caller said was behind it, and the
+             * coverage kept for a caller that knows better. */
             px[(unsigned long)y * w + x] = img_flatten_px(r, g, b, a);
+            if (a != 255 && !alpha) {
+                alpha = (unsigned char *)malloc((unsigned long)w * h);
+                if (alpha) memset(alpha, 255, (unsigned long)w * h);
+            }
+            if (alpha) alpha[(unsigned long)y * w + x] = (unsigned char)a;
         }
     }
     free(lines);
@@ -261,6 +274,7 @@ static int png_decode(const unsigned char *d, unsigned long n, image_t *out) {
     out->w = w;
     out->h = h;
     out->px = px;
+    out->alpha = alpha;
     return 1;
 }
 
@@ -710,6 +724,7 @@ static int img_load(const void *data, unsigned long len, image_t *out) {
     const unsigned char *d = (const unsigned char *)data;
     img_err = "";
     out->px = 0;
+    out->alpha = 0;
     out->w = out->h = 0;
     if (len < 4) { img_err = "file too short"; return 0; }
     if (d[0] == 137 && d[1] == 'P')                  return png_decode(d, len, out);

@@ -749,11 +749,18 @@ static unsigned webp_u32(const unsigned char *p) {
 
 /* Lay the picture on whatever the caller said was behind it, the same way the
  * rest of img.h treats alpha. */
-static void webp_flatten(unsigned *px, long n) {
+static unsigned char *webp_flatten(unsigned *px, long n) {
+    unsigned char *alpha = 0;
     for (long i = 0; i < n; i++) {
-        unsigned v = px[i];
-        px[i] = img_flatten_px((v >> 16) & 0xFF, (v >> 8) & 0xFF, v & 0xFF, v >> 24);
+        unsigned v = px[i], a = v >> 24;
+        if (a != 255 && !alpha) {
+            alpha = (unsigned char *)malloc((unsigned long)n);
+            if (alpha) memset(alpha, 255, (unsigned long)n);
+        }
+        if (alpha) alpha[i] = (unsigned char)a;
+        px[i] = img_flatten_px((v >> 16) & 0xFF, (v >> 8) & 0xFF, v & 0xFF, a);
     }
+    return alpha;
 }
 
 static int webp_decode(const unsigned char *d, unsigned long len, image_t *out) {
@@ -792,6 +799,7 @@ static int webp_decode(const unsigned char *d, unsigned long len, image_t *out) 
     }
     if (!px) return 0;
 
+    unsigned char *alpha = 0;
 #ifdef WEBP_ALPHA_ONLY
     /* A seam for the host check: hand back the alpha plane as a grey picture,
      * so it can be compared on its own rather than through the flattening. */
@@ -800,11 +808,12 @@ static int webp_decode(const unsigned char *d, unsigned long len, image_t *out) 
         px[i] = (a << 16) | (a << 8) | a;
     }
 #else
-    webp_flatten(px, (long)w * h);
+    alpha = webp_flatten(px, (long)w * h);
 #endif
     out->w = w;
     out->h = h;
     out->px = px;
+    out->alpha = alpha;
     return 1;
 }
 

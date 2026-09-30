@@ -690,7 +690,7 @@ static int pic_slot(const char *url) {
     pic_t *p = &pics[npics];
     snprintf(p->url, sizeof p->url, "%s", url);
     p->state = PIC_WANT;
-    p->im.px = 0; p->im.w = p->im.h = 0;
+    p->im.px = 0; p->im.alpha = 0; p->im.w = p->im.h = 0;
     p->want_w = p->want_h = 0;
     return npics++;
 }
@@ -750,6 +750,9 @@ static int pic_fit(image_t *im, int maxw, int maxh) {
         }
     }
     free(im->px);
+    /* The coverage is of the old size, and nothing here draws with it. */
+    free(im->alpha);
+    im->alpha = 0;
     im->px = out; im->w = nw; im->h = nh;
     return 1;
 }
@@ -1553,7 +1556,7 @@ static int open_el(int node) {
         int total = hn + inner + 6;
 
         image_t im;
-        im.px = 0; im.w = im.h = 0;
+        im.px = 0; im.alpha = 0; im.w = im.h = 0;
         /* A drawing has no ground of its own; it is painted onto whatever the
          * page put behind it. */
         img_background = (cur_has_bg ? cur_bg : GC_WIN) & 0xFFFFFF;
