@@ -79,7 +79,7 @@ static void help_apps(void) {
     printf("  note [FILE]        the text editor (mouse caret, selection)\n");
     printf("  view [FILE]        pictures (PNG, JPEG, BMP) and text\n");
     printf("  taskmgr            processes: CPU, memory, end task, suspend\n");
-    printf("  play [FILE.wav]    the music player\n");
+    printf("  play [FILE]        the music player: WAV, MP3, Ogg Vorbis\n");
     printf("These open in their own windows. Ctrl+Esc opens the start menu,\n");
     printf("where typing a few letters finds any of them (and anything else\n");
     printf("in /bin).\n");

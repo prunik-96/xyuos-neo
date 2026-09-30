@@ -41,6 +41,8 @@
 /third_party/harfbuzz/
 /third_party/sheenbidi/
 /third_party/libunibreak/
+/third_party/minimp3/
+/third_party/stb/
 # The fonts, pinned by URL and checksum in the same script.
 /assets/fonts/
 

@@ -192,7 +192,7 @@ static int ext_is(const char *name, const char *ext) {
 static const char *app_for(const char *name) {
     if (ext_is(name, "png") || ext_is(name, "jpg") ||
         ext_is(name, "jpeg") || ext_is(name, "bmp")) return "/bin/view";
-    if (ext_is(name, "wav")) return "/bin/play";
+    if (ext_is(name, "wav") || ext_is(name, "mp3") || ext_is(name, "ogg")) return "/bin/play";
     if (ext_is(name, "sh") || ext_is(name, "bat")) return "/bin/sh";
     /* Source, so it opens in the editor rather than running: a script that
      * ran on every double-click would be a surprise while it is still being
@@ -321,7 +321,7 @@ static const char *icon_for(const char *name, int is_dir) {
     if (ext_is(name, "png"))  return "image-png";
     if (ext_is(name, "jpg") || ext_is(name, "jpeg")) return "image-jpg";
     if (ext_is(name, "bmp"))  return "image-bmp";
-    if (ext_is(name, "wav"))  return "audio";
+    if (ext_is(name, "wav") || ext_is(name, "mp3") || ext_is(name, "ogg")) return "audio";
     if (ext_is(name, "elf"))  return "program-elf";
     if (ext_is(name, "sh"))   return "script-sh";
     if (ext_is(name, "bat"))  return "script-bat";
@@ -368,7 +368,7 @@ static void icon_file(gui_t *g, int x, int y, int s, unsigned tint) {
 static unsigned tint_for(const char *name) {
     if (ext_is(name, "png") || ext_is(name, "jpg") || ext_is(name, "jpeg") ||
         ext_is(name, "bmp")) return 0x5AA469;
-    if (ext_is(name, "wav")) return 0xB05AC0;
+    if (ext_is(name, "wav") || ext_is(name, "mp3") || ext_is(name, "ogg")) return 0xB05AC0;
     if (ext_is(name, "elf")) return 0xC24A2F;
     if (ext_is(name, "c") || ext_is(name, "h") || ext_is(name, "py"))
         return 0x2A6FD6;

@@ -28,6 +28,13 @@ boots with OVMF instead of SeaBIOS, as the real machine does.
 
 SEQRUN_USBNET=1 puts the network on QEMU's USB RNDIS adapter instead of the
 e1000: the path a phone's USB tethering takes on real hardware.
+
+SEQRUN_AUDIO=/path/out.wav gives the machine an Intel HD Audio controller
+with a line-out codec, and QEMU writes everything played on it to that WAV
+file -- what the system actually sent to the speakers, to be checked.
+
+SEQRUN_PUT="host:guest,host2:guest2" copies files onto the run's copy of the
+disk first (never onto disk.img itself): test material that should not ship.
 """
 import os, shutil, socket, subprocess, sys, time
 
@@ -58,6 +65,11 @@ elif not RAMDISK:
     subprocess.run(["cp", XYUOS + "/disk.img", OUT + "/disk.img"], check=True)
     DISK = ["-drive", "file=%s/disk.img,if=none,id=d0,format=raw" % OUT,
             "-device", "virtio-blk-pci,drive=d0"]
+    for pair in filter(None, os.environ.get("SEQRUN_PUT", "").split(",")):
+        host, guest = pair.split(":", 1)
+        subprocess.run(["debugfs", "-w", "-R", "write %s %s" % (host, guest),
+                        OUT + "/disk.img"], check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 BOOT = [] if STICK else ["-cdrom", XYUOS + "/build/xyuos_neo.iso"]
 # SEQRUN_USBNET=1: the network through QEMU's USB RNDIS adapter instead of the
 # e1000 -- the path a tethered phone takes on real hardware.
@@ -65,6 +77,10 @@ NET = (["-nic", "none", "-netdev", "user,id=n0",
         "-device", "usb-net,bus=xhci.0,netdev=n0"]
        if os.environ.get("SEQRUN_USBNET") == "1" else [])
 FIRMWARE = ["-bios", "/usr/share/qemu/OVMF.fd"] if UEFI else []
+AUDIO_OUT = os.environ.get("SEQRUN_AUDIO")
+AUDIO = (["-audiodev", "wav,id=snd0,path=" + AUDIO_OUT,
+          "-device", "intel-hda", "-device", "hda-output,audiodev=snd0"]
+         if AUDIO_OUT else [])
 
 proc = subprocess.Popen(
     ["qemu-system-x86_64", "-enable-kvm", "-cpu", "host"] + BOOT + FIRMWARE +
@@ -73,7 +89,7 @@ proc = subprocess.Popen(
     ["-device", "qemu-xhci,id=xhci"] +
     (["-device", "usb-storage,bus=xhci.0,drive=stick,bootindex=0"] if STICK else []) +
     ["-device", "usb-kbd,bus=xhci.0", "-device", "usb-mouse,bus=xhci.0",
-     "-monitor", "unix:%s,server,nowait" % MON] + NET,
+     "-monitor", "unix:%s,server,nowait" % MON] + NET + AUDIO,
     stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
 
 

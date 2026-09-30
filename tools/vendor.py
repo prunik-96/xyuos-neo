@@ -65,6 +65,21 @@ VENDOR = [
         "why": "libunibreak 8.0: where a line may break, where a character "
                "ends.",
     },
+    # The music player's decoders: one header each, included by
+    # userland/play.c. Both are public domain (minimp3 CC0, stb_vorbis
+    # public domain or MIT).
+    {
+        "path": "third_party/minimp3",
+        "url": "https://github.com/lieff/minimp3.git",
+        "commit": "ea99364f61c14656440e8d77e9c233ccf3124633",
+        "why": "minimp3: MPEG-1/2 Layer III, for MP3.",
+    },
+    {
+        "path": "third_party/stb",
+        "url": "https://github.com/nothings/stb.git",
+        "commit": "2c980bb59875b0d32144a71867fbdebb2f77cd20",
+        "why": "stb_vorbis.c, for Ogg Vorbis.",
+    },
 ]
 
 # Noto, under the SIL Open Font License, which asks for the licence to travel

@@ -1,17 +1,23 @@
 /* play -- the music player.
  *
- * WAV, because it is the format a system with its own audio stack should be
- * able to play before it can play any other: everything else (MP3, Vorbis,
- * FLAC) is a decoder bolted onto this same pipe. What the file gives you is
- * some number of channels at some rate in some sample width; what the
- * hardware takes is exactly 48 kHz, 16-bit, stereo. Everything interesting
- * here is that conversion, done a block at a time so a forty-megabyte file
- * does not have to be resampled into memory before the first note.
+ * WAV, MP3 and Ogg Vorbis. Whatever the file, a source hands back the same
+ * thing -- interleaved signed 16-bit samples at the file's own rate and
+ * channel count -- and everything after that is one pipe: what the hardware
+ * takes is exactly 48 kHz, 16-bit, stereo, and the conversion is done a block
+ * at a time so a long file does not have to be resampled into memory before
+ * the first note.
+ *
+ * WAV is read from the file as it plays. MP3 and Vorbis are read into memory
+ * whole -- a song is a few megabytes, and a decoder that can see all of it
+ * knows exactly how long it is and can go back to the start -- and decoded a
+ * block at a time from there, by minimp3 and stb_vorbis (third_party/, see
+ * tools/vendor.py; both public domain).
  *
  * The resampler is nearest-neighbour on purpose. Linear interpolation is four
  * lines more and audibly better on a big rate change, but 44.1 -> 48 is a
  * ratio of 1.088: the error is a fraction of a sample and it costs a
  * multiply per output frame in a loop that has to keep ahead of the DMA. */
+
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -21,19 +27,58 @@
 #include "gui.h"
 #include "upath.h"
 
+/* The decoders, compiled into this program. Their own code is theirs, so
+ * their warnings are theirs too. */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wsign-compare"
+#pragma GCC diagnostic ignored "-Wunused-function"
+#pragma GCC diagnostic ignored "-Wunused-parameter"
+#pragma GCC diagnostic ignored "-Wunused-variable"
+#pragma GCC diagnostic ignored "-Wunused-but-set-variable"
+#pragma GCC diagnostic ignored "-Wimplicit-fallthrough"
+#pragma GCC diagnostic ignored "-Wmissing-field-initializers"
+#pragma GCC diagnostic ignored "-Wtype-limits"
+#pragma GCC diagnostic ignored "-Wmisleading-indentation"
+#pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
+#define MINIMP3_IMPLEMENTATION
+#define MINIMP3_NO_STDIO
+#include "minimp3_ex.h"
+#define STB_VORBIS_NO_STDIO
+#define STB_VORBIS_NO_PUSHDATA_API
+#include <alloca.h>
+#ifndef alloca
+#define alloca __builtin_alloca
+#endif
+#define get_bits stbv_get_bits      /* the toolkit has a get_bits of its own */
+#include "stb_vorbis.c"
+#undef get_bits
+#pragma GCC diagnostic pop
+
 #define OUT_RATE  48000
 #define CHUNK     4096            /* output frames per top-up */
 
 static char path[UPATH_MAX];
 static char status[200];
 
-/* --- the WAV header ------------------------------------------------------- */
+/* --- sources -------------------------------------------------------------- */
 
+enum { SRC_NONE, SRC_WAV, SRC_MP3, SRC_OGG };
+
+static int    src_kind;
+static int    src_ch;
+static long   src_rate;
+static long   total_frames, played_frames;   /* in the file's own frames */
+
+/* WAV: read from the file as it plays. */
 static long   fd = -1;
-static int    wav_ch, wav_bits;
-static long   wav_rate;
+static int    wav_bits;
 static long   data_start, data_bytes, data_pos;
-static long   total_frames, played_frames;
+
+/* MP3 and Vorbis: the whole file in memory, decoded from there. */
+static unsigned char *filebuf;
+static long           filelen;
+static mp3dec_ex_t    mp3;
+static stb_vorbis    *ogg;
 
 static unsigned rd16(const unsigned char *p) { return p[0] | (p[1] << 8); }
 static unsigned long rd32(const unsigned char *p) {
@@ -41,8 +86,18 @@ static unsigned long rd32(const unsigned char *p) {
            ((unsigned long)p[2] << 16) | ((unsigned long)p[3] << 24);
 }
 
-static int wav_open(const char *p) {
+static void src_close(void) {
     if (fd >= 0) { xyuos_close(fd); fd = -1; }
+    if (src_kind == SRC_MP3) mp3dec_ex_close(&mp3);
+    if (ogg) { stb_vorbis_close(ogg); ogg = NULL; }
+    free(filebuf);
+    filebuf = NULL;
+    filelen = 0;
+    src_kind = SRC_NONE;
+    total_frames = played_frames = 0;
+}
+
+static int wav_open(const char *p) {
     fd = xyuos_open(p);
     if (fd < 0) { snprintf(status, sizeof status, "cannot open %s", p); return 0; }
 
@@ -69,8 +124,8 @@ static int wav_open(const char *p) {
             unsigned char f[16];
             if (xyuos_read(fd, f, 16) != 16) break;
             unsigned fmt = rd16(f);
-            wav_ch   = (int)rd16(f + 2);
-            wav_rate = (long)rd32(f + 4);
+            src_ch   = (int)rd16(f + 2);
+            src_rate = (long)rd32(f + 4);
             wav_bits = (int)rd16(f + 14);
             if (fmt != 1 && fmt != 0xFFFE) {
                 snprintf(status, sizeof status, "compressed WAV (format %u)", fmt);
@@ -96,25 +151,126 @@ static int wav_open(const char *p) {
         xyuos_close(fd); fd = -1;
         return 0;
     }
-    if (wav_ch < 1 || wav_ch > 8) {
-        snprintf(status, sizeof status, "unsupported channel count (%d)", wav_ch);
+    if (src_ch < 1 || src_ch > 8 || src_rate <= 0) {
+        snprintf(status, sizeof status, "unsupported channel count (%d)", src_ch);
         xyuos_close(fd); fd = -1;
         return 0;
     }
 
-    int frame_bytes = wav_ch * wav_bits / 8;
+    int frame_bytes = src_ch * wav_bits / 8;
     total_frames = data_bytes / frame_bytes;
     data_pos = 0;
-    played_frames = 0;
     xyuos_seek(fd, data_start, SEEK_SET);
-    snprintf(path, sizeof path, "%s", p);
-    snprintf(status, sizeof status, "%ld Hz, %d ch, %d bit", wav_rate, wav_ch, wav_bits);
+    src_kind = SRC_WAV;
+    snprintf(status, sizeof status, "WAV, %ld Hz, %d ch, %d bit", src_rate, src_ch, wav_bits);
     return 1;
+}
+
+/* The whole file into filebuf. */
+static int load_file(const char *p) {
+    FILE *f = fopen(p, "rb");
+    if (!f) { snprintf(status, sizeof status, "cannot open %s", p); return 0; }
+    fseek(f, 0, SEEK_END);
+    long n = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (n <= 0 || n > 512L * 1024 * 1024) {
+        fclose(f);
+        snprintf(status, sizeof status, "file is empty or too large");
+        return 0;
+    }
+    filebuf = (unsigned char *)malloc((size_t)n);
+    if (!filebuf) { fclose(f); snprintf(status, sizeof status, "out of memory"); return 0; }
+    long got = (long)fread(filebuf, 1, (size_t)n, f);
+    fclose(f);
+    if (got != n) {
+        free(filebuf); filebuf = NULL;
+        snprintf(status, sizeof status, "could not read %s", p);
+        return 0;
+    }
+    filelen = n;
+    return 1;
+}
+
+static int mp3_open(const char *p) {
+    if (!load_file(p)) return 0;
+    /* Seek-to-sample mode scans the frame headers once, which is what gives
+     * the exact length -- a variable-bitrate file has no other honest one. */
+    if (mp3dec_ex_open_buf(&mp3, filebuf, (size_t)filelen, MP3D_SEEK_TO_SAMPLE) ||
+        mp3.info.channels < 1 || mp3.info.hz <= 0) {
+        free(filebuf); filebuf = NULL;
+        snprintf(status, sizeof status, "not an MP3 this decoder can read");
+        return 0;
+    }
+    src_kind = SRC_MP3;
+    src_ch = mp3.info.channels;
+    src_rate = mp3.info.hz;
+    total_frames = (long)(mp3.samples / (uint64_t)src_ch);
+    snprintf(status, sizeof status, "MP3, %ld Hz, %d ch, %d kbps",
+             src_rate, src_ch, mp3.info.bitrate_kbps);
+    return 1;
+}
+
+static int ogg_open(const char *p) {
+    if (!load_file(p)) return 0;
+    int err = 0;
+    ogg = stb_vorbis_open_memory(filebuf, (int)filelen, &err, NULL);
+    if (!ogg) {
+        free(filebuf); filebuf = NULL;
+        /* An Ogg file is a container; Opus comes in one too. */
+        snprintf(status, sizeof status, "not Ogg Vorbis (Opus is not supported)");
+        return 0;
+    }
+    stb_vorbis_info info = stb_vorbis_get_info(ogg);
+    src_kind = SRC_OGG;
+    src_ch = info.channels;
+    src_rate = (long)info.sample_rate;
+    total_frames = (long)stb_vorbis_stream_length_in_samples(ogg);
+    snprintf(status, sizeof status, "Ogg Vorbis, %ld Hz, %d ch", src_rate, src_ch);
+    return 1;
+}
+
+static int ends_with(const char *s, const char *ext) {
+    size_t n = strlen(s), e = strlen(ext);
+    if (n < e) return 0;
+    for (size_t i = 0; i < e; i++) {
+        char c = s[n - e + i];
+        if (c >= 'A' && c <= 'Z') c += 32;
+        if (c != ext[i]) return 0;
+    }
+    return 1;
+}
+
+/* By what the file starts with, not by its name -- a .mp3 that is really a
+ * WAV still plays -- and by the name only when the start says nothing. */
+static int src_open(const char *p) {
+    src_close();
+    unsigned char m[4] = { 0, 0, 0, 0 };
+    FILE *f = fopen(p, "rb");
+    if (!f) { snprintf(status, sizeof status, "cannot open %s", p); return 0; }
+    size_t got = fread(m, 1, 4, f);
+    fclose(f);
+
+    int ok;
+    if (got == 4 && !memcmp(m, "RIFF", 4))                       ok = wav_open(p);
+    else if (got == 4 && !memcmp(m, "OggS", 4))                  ok = ogg_open(p);
+    else if (got >= 3 && (!memcmp(m, "ID3", 3) ||
+                          (m[0] == 0xFF && (m[1] & 0xE0) == 0xE0))) ok = mp3_open(p);
+    else if (ends_with(p, ".mp3"))                               ok = mp3_open(p);
+    else if (ends_with(p, ".ogg") || ends_with(p, ".oga"))       ok = ogg_open(p);
+    else { snprintf(status, sizeof status, "not WAV, MP3 or Ogg Vorbis"); ok = 0; }
+
+    if (ok) {
+        played_frames = 0;
+        snprintf(path, sizeof path, "%s", p);
+    }
+    return ok;
 }
 
 /* --- decode + convert ------------------------------------------------------ */
 
-static unsigned char raw[CHUNK * 8 * 4];   /* worst case: 8ch x 32-bit */
+#define PCM_MAX (CHUNK * 2 + 16)          /* input frames per block, enough up to 96 kHz */
+static unsigned char raw[PCM_MAX * 8 * 4];  /* worst case: 8ch x 32-bit */
+static short         pcm[PCM_MAX * 8];      /* the source's frames, as 16-bit */
 static short         out[CHUNK * 2];
 
 /* One sample, whatever width it was stored at, as signed 16-bit. */
@@ -127,36 +283,54 @@ static int sample_at(const unsigned char *p, int bits) {
     }
 }
 
+/* Up to `frames` of the source into pcm. How many came; 0 at the end. */
+static long src_read(long frames) {
+    if (frames > PCM_MAX) frames = PCM_MAX;
+    switch (src_kind) {
+    case SRC_WAV: {
+        int frame_bytes = src_ch * wav_bits / 8;
+        long avail = (data_bytes - data_pos) / frame_bytes;
+        if (frames > avail) frames = avail;
+        if (frames <= 0) return 0;
+        long got = xyuos_read(fd, raw, (unsigned long)(frames * frame_bytes));
+        if (got <= 0) return 0;
+        long n = got / frame_bytes;
+        data_pos += n * frame_bytes;
+        for (long i = 0; i < n * src_ch; i++)
+            pcm[i] = (short)sample_at(raw + i * (wav_bits / 8), wav_bits);
+        return n;
+    }
+    case SRC_MP3: {
+        size_t got = mp3dec_ex_read(&mp3, pcm, (size_t)(frames * src_ch));
+        return (long)(got / (size_t)src_ch);
+    }
+    case SRC_OGG:
+        return stb_vorbis_get_samples_short_interleaved(ogg, src_ch, pcm,
+                                                        (int)(frames * src_ch));
+    default:
+        return 0;
+    }
+}
+
 /* Fill `out` with up to `want` output frames. Returns how many were produced;
  * 0 means the file is finished. */
 static int decode(int want) {
-    if (fd < 0 || data_pos >= data_bytes) return 0;
-
-    int frame_bytes = wav_ch * wav_bits / 8;
+    if (src_kind == SRC_NONE) return 0;
     /* How many INPUT frames this many output frames needs. */
-    long need_in = ((long)want * wav_rate + OUT_RATE - 1) / OUT_RATE + 1;
-    long avail = (data_bytes - data_pos) / frame_bytes;
-    if (need_in > avail) need_in = avail;
-    if (need_in <= 0) return 0;
-    if (need_in > (long)(sizeof raw) / frame_bytes) need_in = (long)(sizeof raw) / frame_bytes;
-
-    long got = xyuos_read(fd, raw, (unsigned long)(need_in * frame_bytes));
-    if (got <= 0) return 0;
-    long in_frames = got / frame_bytes;
-    data_pos += in_frames * frame_bytes;
+    long need_in = ((long)want * src_rate + OUT_RATE - 1) / OUT_RATE + 1;
+    long in_frames = src_read(need_in);
+    if (in_frames <= 0) return 0;
 
     int produced = 0;
     for (int i = 0; i < want; i++) {
-        long src = (long)i * wav_rate / OUT_RATE;
+        long src = (long)i * src_rate / OUT_RATE;
         if (src >= in_frames) break;
-        const unsigned char *f = raw + src * frame_bytes;
-        int l = sample_at(f, wav_bits);
-        int r = (wav_ch > 1) ? sample_at(f + wav_bits / 8, wav_bits) : l;
-        out[produced * 2 + 0] = (short)l;
-        out[produced * 2 + 1] = (short)r;
+        const short *f = pcm + src * src_ch;
+        out[produced * 2 + 0] = f[0];
+        out[produced * 2 + 1] = src_ch > 1 ? f[1] : f[0];
         produced++;
     }
-    played_frames += (long)produced * wav_rate / OUT_RATE;
+    played_frames += in_frames;
     return produced;
 }
 
@@ -223,8 +397,8 @@ static void draw(gui_t *g) {
     }
     {
         char t[80];
-        long secs = wav_rate ? played_frames / wav_rate : 0;
-        long tot  = wav_rate ? total_frames / wav_rate : 0;
+        long secs = src_rate ? played_frames / src_rate : 0;
+        long tot  = src_rate ? total_frames / src_rate : 0;
         snprintf(t, sizeof t, "%ld:%02ld / %ld:%02ld",
                  secs / 60, secs % 60, tot / 60, tot % 60);
         gui_text(g, 16, py + 24, t, GC_DIM);
@@ -240,17 +414,20 @@ static void draw(gui_t *g) {
 }
 
 static void restart(void) {
-    if (fd < 0) return;
-    xyuos_seek(fd, data_start, SEEK_SET);
-    data_pos = 0;
+    switch (src_kind) {
+    case SRC_WAV: xyuos_seek(fd, data_start, SEEK_SET); data_pos = 0; break;
+    case SRC_MP3: mp3dec_ex_seek(&mp3, 0); break;
+    case SRC_OGG: stb_vorbis_seek_start(ogg); break;
+    default: return;
+    }
     played_frames = 0;
 }
 
 static void do_button(int i) {
     switch (i) {
         case 0:
-            if (fd < 0) { snprintf(status, sizeof status, "nothing loaded"); break; }
-            if (data_pos >= data_bytes) restart();
+            if (src_kind == SRC_NONE) { snprintf(status, sizeof status, "nothing loaded"); break; }
+            if (played_frames >= total_frames) restart();
             playing = 1;
             break;
         case 1: playing = 0; audio_flush(); break;
@@ -276,8 +453,8 @@ int main(int argc, char **argv) {
     if (argc > 1) {
         char abs[UPATH_MAX];
         upath_resolve("/", argv[1], abs);
-        if (wav_open(abs)) playing = 1;
-        else message_box(MSG_ERROR, "WAV-OPEN", "Cannot play this file",
+        if (src_open(abs)) playing = 1;
+        else message_box(MSG_ERROR, "PLAY-OPEN", "Cannot play this file",
                          status, argv[1]);
     } else {
         /* Same idea as the viewer: with nothing named, play the first thing
@@ -295,12 +472,14 @@ int main(int argc, char **argv) {
                 if (len > 95) len = 95;
                 memcpy(name, buf + i, (size_t)len);
                 name[len] = 0;
-                upath_resolve("/sounds", name, pick);
+                if (ends_with(name, ".wav") || ends_with(name, ".mp3") ||
+                    ends_with(name, ".ogg"))
+                    upath_resolve("/sounds", name, pick);
             }
             i = j + 1;
         }
-        if (pick[0] && wav_open(pick)) playing = 1;
-        else snprintf(status, sizeof status, "usage: play <file.wav>");
+        if (pick[0] && src_open(pick)) playing = 1;
+        else snprintf(status, sizeof status, "usage: play <file.wav|mp3|ogg>");
     }
 
     int running = 1, dirty = 1, hover_btn = -2;
@@ -383,7 +562,7 @@ int main(int argc, char **argv) {
     }
 
     audio_flush();
-    if (fd >= 0) xyuos_close(fd);
+    src_close();
     gui_close(&g);
     return 0;
 }

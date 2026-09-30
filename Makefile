@@ -201,13 +201,15 @@ build/%_libcuser.o: userland/%.c $(wildcard libc/include/*.h) $(wildcard userlan
 # that libgcc for this target does not provide. Add a program here if it starts
 # using doubles. Programs that merely PASS doubles to printf are fine, since
 # the conversion happens inside libc.
-FP_USER_PROGS := fstest sleep ftest web sigtest
+FP_USER_PROGS := fstest sleep ftest web sigtest play
 
 define FP_OBJ_RULE
 build/$(1)_libcuser.o: userland/$(1).c $$(wildcard libc/include/*.h) $$(wildcard userland/*.h)
 	mkdir -p build
-	$$(CC) $$(LIBC_FP_CFLAGS) -c $$< -o $$@
+	$$(CC) $$(LIBC_FP_CFLAGS) $$(PROG_INC_$(1)) -c $$< -o $$@
 endef
+# The music player compiles its decoders in (see tools/vendor.py).
+PROG_INC_play := -Ithird_party/minimp3 -Ithird_party/stb
 $(foreach p,$(FP_USER_PROGS),$(eval $(call FP_OBJ_RULE,$(p))))
 
 build/%_libcuser.o: userland/%.cpp $(wildcard libc/include/*.h)
