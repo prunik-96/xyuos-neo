@@ -5,11 +5,12 @@
  * operations plain -- a rectangle is two loops -- and puts the whole cost of
  * a page redraw in this file, which is the honest place for it.
  *
- * Filled shapes go through one scanline filler. A polygon is the general
- * case, a circle is a polygon with enough sides not to look like one, and a
- * Bezier path is flattened to line segments and then filled the same way.
- * Writing three fillers would mean three places for the edge cases to be
- * wrong in different ways.
+ * Shapes -- polygons, discs, arcs, paths, and any line that is neither level
+ * nor upright -- are librast's: filled and stroked anti-aliased by exact
+ * area, so a bullet is round and a diagonal is a line rather than a stair.
+ * The level and upright solid lines that make up almost every border and
+ * rule stay what NetSurf means by them, whole pixels, filled as the
+ * rectangles they are.
  */
 
 #include <stdlib.h>
@@ -21,6 +22,7 @@
 
 #include "xy_front.h"
 #include "xy_bitmap.h"
+#include "rast.h"
 
 int xy_cx0, xy_cy0, xy_cx1, xy_cy1;
 
@@ -57,103 +59,88 @@ static void fill_rect(int x0, int y0, int x1, int y1, unsigned c) {
     }
 }
 
+/* --- librast ------------------------------------------------------------ */
+
+/* The surface, clipped as NetSurf last asked. */
+static rast_target surface(void) {
+    rast_target t;
+    rast_target_init(&t, (uint32_t *)xy_gui.px, xy_gui.w, xy_gui.h, xy_gui.w, RAST_XRGB);
+    t.cx0 = xy_cx0; t.cy0 = xy_cy0;
+    t.cx1 = xy_cx1; t.cy1 = xy_cy1;
+    return t;
+}
+
+static void paint_of(rast_paint *pt, colour c) {
+    rast_paint_solid(pt, 0xFF000000u | xy_colour(c));
+}
+
+/* One path, reused: NetSurf plots shapes one after another, never two at once. */
+static rast_path shape;
+
+#define PX(v)    RAST_INT(v)
+#define CENTRE(v) (RAST_INT(v) + RAST_ONE / 2)
+
+/* A stroke along the path in `shape`, in NetSurf's patterns. */
+static void stroke_shape(unsigned c, plot_operation_type_t type, rast_fx width,
+                         int cap, int join) {
+    rast_stroke s;
+    rast_stroke_init(&s, width < RAST_ONE ? RAST_ONE : width);
+    s.cap = cap;
+    s.join = join;
+    rast_fx dash[2];
+    if (type == PLOT_OP_TYPE_DOT) {
+        dash[0] = dash[1] = 2 * s.width;
+        s.dash = dash; s.ndash = 2;
+        s.cap = RAST_CAP_BUTT;
+    } else if (type == PLOT_OP_TYPE_DASH) {
+        dash[0] = 5 * s.width; dash[1] = 3 * s.width;
+        s.dash = dash; s.ndash = 2;
+        s.cap = RAST_CAP_BUTT;
+    }
+    rast_target t = surface();
+    rast_paint pt;
+    rast_paint_solid(&pt, 0xFF000000u | c);
+    rast_draw_stroke(&t, &shape, NULL, &s, &pt);
+}
+
 /* --- lines --------------------------------------------------------------- */
 
-/* Bresenham, with the dotted and dashed patterns NetSurf asks for. `phase`
- * counts pixels along the line so the gaps stay evenly spaced however the
- * line slopes. */
+/* A level or upright solid line covers whole pixels, the ones NetSurf named,
+ * `width` of them across. Dotted and dashed ones keep the pixel pattern
+ * they always had. Anything at an angle goes through the pixel centres to
+ * librast, with square ends so that both named end pixels are covered as
+ * they would have been. */
 static void draw_line(int x0, int y0, int x1, int y1, unsigned c,
                       plot_operation_type_t type, int width) {
     if (width < 1) width = 1;
 
-    int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
-    int dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
-    int err = dx + dy;
-    int phase = 0;
-
-    for (;;) {
-        int show = 1;
-        if (type == PLOT_OP_TYPE_DOT)  show = (phase & 2) == 0;
-        if (type == PLOT_OP_TYPE_DASH) show = (phase % 8) < 5;
-
-        if (show) {
-            if (width == 1) {
-                put(x0, y0, c);
-            } else {
-                int h = width / 2;
-                for (int oy = -h; oy <= h; oy++)
-                    for (int ox = -h; ox <= h; ox++)
-                        put(x0 + ox, y0 + oy, c);
-            }
-        }
-        phase++;
-
-        if (x0 == x1 && y0 == y1) break;
-        int e2 = 2 * err;
-        if (e2 >= dy) { err += dy; x0 += sx; }
-        if (e2 <= dx) { err += dx; y0 += sy; }
+    if ((x0 == x1 || y0 == y1) && type == PLOT_OP_TYPE_SOLID) {
+        int h = width / 2;
+        if (y0 == y1)
+            fill_rect(x0 < x1 ? x0 : x1, y0 - h, (x0 < x1 ? x1 : x0) + 1, y0 - h + width, c);
+        else
+            fill_rect(x0 - h, y0 < y1 ? y0 : y1, x0 - h + width, (y0 < y1 ? y1 : y0) + 1, c);
+        return;
     }
-}
 
-/* --- the one filler ------------------------------------------------------ */
-
-/* Scanline fill of a closed polygon, non-zero winding, which is the rule
- * NetSurf's documentation asks for. Crossings are gathered per row with the
- * direction each edge runs, and the span is inside wherever the running sum
- * is not zero.
- */
-typedef struct { int x; int dir; } crossing;
-
-static void fill_poly(const int *pts, unsigned n, unsigned c) {
-    if (n < 3) return;
-
-    int ymin = pts[1], ymax = pts[1];
-    for (unsigned i = 1; i < n; i++) {
-        int y = pts[i * 2 + 1];
-        if (y < ymin) ymin = y;
-        if (y > ymax) ymax = y;
+    if (x0 == x1 || y0 == y1) {
+        int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
+        int dy = abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+        int n = dx > dy ? dx : dy, h = width / 2;
+        for (int i = 0, phase = 0; i <= n; i++, phase++) {
+            int show = (type == PLOT_OP_TYPE_DOT) ? (phase & 2) == 0 : (phase % 8) < 5;
+            if (!show) continue;
+            int x = x0 + (dx ? sx * i : 0), y = y0 + (dy ? sy * i : 0);
+            if (y0 == y1) fill_rect(x, y - h, x + 1, y - h + width, c);
+            else          fill_rect(x - h, y, x - h + width, y + 1, c);
+        }
+        return;
     }
-    if (ymin < xy_cy0) ymin = xy_cy0;
-    if (ymax > xy_cy1) ymax = xy_cy1;
-    if (ymin >= ymax) return;
 
-    crossing *xs = malloc(sizeof *xs * n);
-    if (xs == NULL) return;
-
-    for (int y = ymin; y < ymax; y++) {
-        unsigned k = 0;
-        int cy = y * 2 + 1;                 /* sample down the row's middle */
-
-        for (unsigned i = 0; i < n; i++) {
-            unsigned j = (i + 1) % n;
-            int ay = pts[i * 2 + 1] * 2, by = pts[j * 2 + 1] * 2;
-            if (ay == by) continue;
-            int lo = ay < by ? ay : by, hi = ay < by ? by : ay;
-            if (cy < lo || cy >= hi) continue;
-
-            int ax = pts[i * 2], bx = pts[j * 2];
-            /* Where this edge is at the sample row. */
-            int x = ax + (int)((long)(bx - ax) * (cy - ay) / (by - ay));
-            xs[k].x = x;
-            xs[k].dir = (by > ay) ? 1 : -1;
-            k++;
-        }
-        if (k < 2) continue;
-
-        for (unsigned a = 1; a < k; a++) {   /* few crossings; insertion */
-            crossing t = xs[a];
-            unsigned b = a;
-            while (b > 0 && xs[b - 1].x > t.x) { xs[b] = xs[b - 1]; b--; }
-            xs[b] = t;
-        }
-
-        int wind = 0;
-        for (unsigned a = 0; a + 1 < k; a++) {
-            wind += xs[a].dir;
-            if (wind != 0) fill_rect(xs[a].x, y, xs[a + 1].x, y + 1, c);
-        }
-    }
-    free(xs);
+    rast_path_reset(&shape);
+    rast_move_to(&shape, CENTRE(x0), CENTRE(y0));
+    rast_line_to(&shape, CENTRE(x1), CENTRE(y1));
+    stroke_shape(c, type, PX(width), RAST_CAP_SQUARE, RAST_JOIN_MITER);
 }
 
 /* --- the operations ------------------------------------------------------ */
@@ -198,115 +185,83 @@ static nserror xyp_line(const struct redraw_context *ctx,
     return NSERROR_OK;
 }
 
+/* The points are pixel corners, so a polygon with level and upright sides
+ * lands exactly on pixels, and a slanted side is smoothed. */
 static nserror xyp_polygon(const struct redraw_context *ctx,
                            const plot_style_t *st, const int *p, unsigned n) {
     (void)ctx;
-    if (st->fill_type != PLOT_OP_TYPE_NONE)
-        fill_poly(p, n, xy_colour(st->fill_colour));
+    if (st->fill_type == PLOT_OP_TYPE_NONE || n < 3) return NSERROR_OK;
+    rast_path_reset(&shape);
+    for (unsigned i = 0; i < n; i++) {
+        if (i == 0) rast_move_to(&shape, PX(p[0]), PX(p[1]));
+        else rast_line_to(&shape, PX(p[i * 2]), PX(p[i * 2 + 1]));
+    }
+    rast_close(&shape);
+    rast_target t = surface();
+    rast_paint pt;
+    paint_of(&pt, st->fill_colour);
+    rast_fill(&t, &shape, NULL, RAST_NONZERO, &pt);
     return NSERROR_OK;
 }
 
-/* A circle is a polygon with enough sides. Sixteen is too few at any size a
- * page uses, so the count follows the radius and stops where more would not
- * show. */
-static int circle_points(int *out, int cap, int cx, int cy, int r,
-                         int a0, int a1) {
-    int sides = r * 2;
-    if (sides < 12) sides = 12;
-    if (sides > cap) sides = cap;
-
-    int span = a1 - a0;
-    while (span < 0) span += 360;
-    if (span == 0) span = 360;
-
-    for (int i = 0; i < sides; i++) {
-        /* Fixed point, because there is no floating point trigonometry here
-         * and none is needed: a table of the unit circle would be the same
-         * thing with a lookup. */
-        long deg = a0 + (long)span * i / (sides - 1);
-        long rad10000 = deg * 174533 / 10000;     /* degrees -> radians e4 */
-        /* Taylor is fine once the angle is folded into one quadrant. */
-        long t = rad10000 % 62832;
-        if (t < 0) t += 62832;
-        int quad = (int)(t / 15708);
-        long u = t % 15708;
-        long s = u - (u * u / 10000) * u / 60000;              /* sin, e4 */
-        long v = 15708 - u;
-        long co = v - (v * v / 10000) * v / 60000;
-        long sx, cxv;
-        switch (quad) {
-        case 0: sx =  s; cxv =  co; break;
-        case 1: sx =  co; cxv = -s; break;
-        case 2: sx = -s; cxv = -co; break;
-        default: sx = -co; cxv =  s; break;
-        }
-        out[i * 2]     = cx + (int)((long)r * cxv / 10000);
-        out[i * 2 + 1] = cy - (int)((long)r * sx / 10000);
-    }
-    return sides;
-}
-
+/* A disc is centred on the middle of the pixel NetSurf names. Filled, it
+ * reaches half a pixel past the radius -- the pixels the old one lit, now
+ * with a smooth edge; outlined, the ring runs through the pixels at that
+ * radius. */
 static nserror xyp_disc(const struct redraw_context *ctx,
                         const plot_style_t *st, int x, int y, int radius) {
     (void)ctx;
     if (radius <= 0) return NSERROR_OK;
-
+    rast_target t = surface();
+    rast_paint pt;
     if (st->fill_type != PLOT_OP_TYPE_NONE) {
-        /* Straight from the definition, which for a filled circle is both
-         * simpler and more exact than going round the edge. */
-        unsigned c = xy_colour(st->fill_colour);
-        for (int dy = -radius; dy <= radius; dy++) {
-            int half = 0;
-            while ((half + 1) * (half + 1) + dy * dy <= radius * radius) half++;
-            fill_rect(x - half, y + dy, x + half + 1, y + dy + 1, c);
-        }
+        rast_path_reset(&shape);
+        rast_ellipse(&shape, CENTRE(x), CENTRE(y), PX(radius) + RAST_ONE / 2,
+                     PX(radius) + RAST_ONE / 2);
+        paint_of(&pt, st->fill_colour);
+        rast_fill(&t, &shape, NULL, RAST_NONZERO, &pt);
     }
     if (st->stroke_type != PLOT_OP_TYPE_NONE) {
-        int cap = 512;
-        int *pts = malloc(sizeof(int) * 2 * cap);
-        if (pts != NULL) {
-            int n = circle_points(pts, cap, x, y, radius, 0, 360);
-            unsigned c = xy_colour(st->stroke_colour);
-            for (int i = 0; i < n; i++) {
-                int j = (i + 1) % n;
-                draw_line(pts[i * 2], pts[i * 2 + 1],
-                          pts[j * 2], pts[j * 2 + 1], c, st->stroke_type, 1);
-            }
-            free(pts);
-        }
+        rast_path_reset(&shape);
+        rast_ellipse(&shape, CENTRE(x), CENTRE(y), PX(radius), PX(radius));
+        stroke_shape(xy_colour(st->stroke_colour), st->stroke_type,
+                     (rast_fx)st->stroke_width << 6, RAST_CAP_BUTT, RAST_JOIN_ROUND);
     }
     return NSERROR_OK;
 }
 
+/* NetSurf's angles run anticlockwise from three o'clock, the way they do on
+ * paper; librast's run clockwise on the screen, the way y does. So they are
+ * turned over. */
 static nserror xyp_arc(const struct redraw_context *ctx,
                        const plot_style_t *st, int x, int y, int radius,
                        int angle1, int angle2) {
     (void)ctx;
     if (radius <= 0) return NSERROR_OK;
-    int cap = 512;
-    int *pts = malloc(sizeof(int) * 2 * cap);
-    if (pts == NULL) return NSERROR_NOMEM;
-    int n = circle_points(pts, cap, x, y, radius, angle1, angle2);
-    unsigned c = xy_colour(st->stroke_type != PLOT_OP_TYPE_NONE
-                           ? st->stroke_colour : st->fill_colour);
-    for (int i = 0; i + 1 < n; i++)
-        draw_line(pts[i * 2], pts[i * 2 + 1],
-                  pts[(i + 1) * 2], pts[(i + 1) * 2 + 1], c,
-                  PLOT_OP_TYPE_SOLID, 1);
-    free(pts);
+    if (angle2 < angle1) angle2 += 360;
+    rast_path_reset(&shape);
+    rast_arc(&shape, CENTRE(x), CENTRE(y), PX(radius), PX(-angle1), PX(-angle2));
+    colour c = st->stroke_type != PLOT_OP_TYPE_NONE ? st->stroke_colour : st->fill_colour;
+    stroke_shape(xy_colour(c), PLOT_OP_TYPE_SOLID, RAST_ONE, RAST_CAP_BUTT, RAST_JOIN_ROUND);
     return NSERROR_OK;
 }
 
 /* --- paths --------------------------------------------------------------- */
 
-/* NetSurf hands paths over as a stream of MOVE / LINE / CUBIC / CLOSE
- * commands with a transform. Curves are cut into straight pieces and the
- * result goes through the same filler as a polygon. The number of pieces
- * follows the size of the curve, so a small one does not pay for smoothness
- * nobody can see. */
-static void tx(const float m[6], float x, float y, int *ox, int *oy) {
-    *ox = (int)(m[0] * x + m[2] * y + m[4]);
-    *oy = (int)(m[1] * x + m[3] * y + m[5]);
+/* NetSurf hands paths over as a stream of MOVE / LINE / BEZIER / CLOSE with a
+ * transform. The transform is applied to the points here, so that the
+ * stroke width stays what it was given in: pixels. Curves stay curves --
+ * librast flattens them after the transform, to a tenth of a pixel. */
+static rast_fx fx_of(float v) {
+    float s = v * 65536.0f;
+    if (s > 1073741823.0f) return 0x3FFFFFFF;
+    if (s < -1073741823.0f) return -0x3FFFFFFF;
+    return (rast_fx)s;
+}
+
+static void tx(const float m[6], float x, float y, rast_fx *ox, rast_fx *oy) {
+    *ox = fx_of(m[0] * x + m[2] * y + m[4]);
+    *oy = fx_of(m[1] * x + m[3] * y + m[5]);
 }
 
 static nserror xyp_path(const struct redraw_context *ctx,
@@ -314,75 +269,43 @@ static nserror xyp_path(const struct redraw_context *ctx,
                         const float transform[6]) {
     (void)ctx;
     if (n == 0) return NSERROR_OK;
-
-    unsigned cap = 256, used = 0;
-    int *pts = malloc(sizeof(int) * 2 * cap);
-    if (pts == NULL) return NSERROR_NOMEM;
-
-    float cx = 0, cy = 0;
-
-#define PUSH(fx, fy) do {                                               \
-        if (used == cap) {                                              \
-            unsigned nc = cap * 2;                                      \
-            int *np = realloc(pts, sizeof(int) * 2 * nc);               \
-            if (np == NULL) { free(pts); return NSERROR_NOMEM; }        \
-            pts = np; cap = nc;                                         \
-        }                                                               \
-        tx(transform, (fx), (fy), &pts[used * 2], &pts[used * 2 + 1]);  \
-        used++;                                                         \
-    } while (0)
+    rast_path_reset(&shape);
 
     unsigned i = 0;
     while (i < n) {
         int op = (int)p[i];
+        rast_fx x1, y1, x2, y2, x3, y3;
         if (op == PLOTTER_PATH_MOVE && i + 2 < n) {
-            cx = p[i + 1]; cy = p[i + 2];
-            PUSH(cx, cy);
+            tx(transform, p[i + 1], p[i + 2], &x1, &y1);
+            rast_move_to(&shape, x1, y1);
             i += 3;
         } else if (op == PLOTTER_PATH_LINE && i + 2 < n) {
-            cx = p[i + 1]; cy = p[i + 2];
-            PUSH(cx, cy);
+            tx(transform, p[i + 1], p[i + 2], &x1, &y1);
+            rast_line_to(&shape, x1, y1);
             i += 3;
         } else if (op == PLOTTER_PATH_BEZIER && i + 6 < n) {
-            float x1 = p[i + 1], y1 = p[i + 2];
-            float x2 = p[i + 3], y2 = p[i + 4];
-            float x3 = p[i + 5], y3 = p[i + 6];
-
-            float dx = x3 - cx, dy = y3 - cy;
-            if (dx < 0) dx = -dx;
-            if (dy < 0) dy = -dy;
-            int steps = (int)((dx + dy) / 3.0f) + 4;
-            if (steps > 64) steps = 64;
-
-            for (int s = 1; s <= steps; s++) {
-                float t = (float)s / steps, u = 1.0f - t;
-                float bx = u*u*u*cx + 3*u*u*t*x1 + 3*u*t*t*x2 + t*t*t*x3;
-                float by = u*u*u*cy + 3*u*u*t*y1 + 3*u*t*t*y2 + t*t*t*y3;
-                PUSH(bx, by);
-            }
-            cx = x3; cy = y3;
+            tx(transform, p[i + 1], p[i + 2], &x1, &y1);
+            tx(transform, p[i + 3], p[i + 4], &x2, &y2);
+            tx(transform, p[i + 5], p[i + 6], &x3, &y3);
+            rast_cubic_to(&shape, x1, y1, x2, y2, x3, y3);
             i += 7;
         } else if (op == PLOTTER_PATH_CLOSE) {
+            rast_close(&shape);
             i += 1;
         } else {
             break;                        /* not a shape we can read */
         }
     }
-#undef PUSH
 
-    if (used >= 3) {
-        if (st->fill_type != PLOT_OP_TYPE_NONE)
-            fill_poly(pts, used, xy_colour(st->fill_colour));
-        if (st->stroke_type != PLOT_OP_TYPE_NONE) {
-            unsigned c = xy_colour(st->stroke_colour);
-            int w = plot_style_fixed_to_int(st->stroke_width);
-            for (unsigned k = 0; k + 1 < used; k++)
-                draw_line(pts[k * 2], pts[k * 2 + 1],
-                          pts[(k + 1) * 2], pts[(k + 1) * 2 + 1],
-                          c, st->stroke_type, w);
-        }
+    if (st->fill_type != PLOT_OP_TYPE_NONE) {
+        rast_target t = surface();
+        rast_paint pt;
+        paint_of(&pt, st->fill_colour);
+        rast_fill(&t, &shape, NULL, RAST_NONZERO, &pt);
     }
-    free(pts);
+    if (st->stroke_type != PLOT_OP_TYPE_NONE)
+        stroke_shape(xy_colour(st->stroke_colour), st->stroke_type,
+                     (rast_fx)st->stroke_width << 6, RAST_CAP_BUTT, RAST_JOIN_MITER);
     return NSERROR_OK;
 }
 

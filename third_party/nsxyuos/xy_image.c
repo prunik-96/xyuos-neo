@@ -11,19 +11,19 @@
  * five times when the decoder underneath is a single call that sniffs the
  * magic bytes and dispatches.
  *
- * TWO LIMITATIONS, both from the decoder rather than from here:
+ * There is no GIF: img_load does not recognise one, so an animated banner or
+ * an old spacer image will not appear. Everything else on a modern page is
+ * PNG, JPEG, WebP or SVG.
  *
- *   There is no GIF. img_load does not recognise one, so an animated banner
- *   or an old spacer image will not appear. Everything else on a modern page
- *   is PNG, JPEG or SVG.
+ * Transparency comes through. The decoders lay a picture on img_background
+ * and keep its coverage alongside; laid on black, what they hand back is the
+ * colour already multiplied by its coverage, so dividing it out again gives
+ * NetSurf the true colour with its alpha -- and a logo on a dark page is
+ * drawn on that page instead of on a white square.
  *
- *   Transparency is flattened at decode time against img_background, because
- *   image_t has no alpha channel -- one word per pixel, 0x00RRGGBB. A
- *   transparent PNG therefore arrives already composited onto a colour
- *   chosen before NetSurf said what was behind it. White is the right guess
- *   for most pages and the wrong one for a dark design, where the edges of a
- *   logo will show a pale halo. Fixing it properly means giving image_t an
- *   alpha channel, which is a change to the picture viewer as well.
+ * An SVG is a drawing, not pixels, so it is drawn again at whatever size the
+ * page shows it: a logo scaled to fit its box is as sharp as one drawn to
+ * size, because it is one.
  */
 
 #include <stdbool.h>
@@ -52,7 +52,51 @@
 typedef struct {
     struct content base;
     struct bitmap *bitmap;
+    bool           svg;         /* redrawn at the size it is shown */
+    int            bw, bh;      /* the size the bitmap was made at */
 } xy_image_content;
+
+/* A decoded picture into a NetSurf bitmap, replacing the one there was.
+ * NetSurf reads a bitmap as R, G, B, A (see pixel_to_colour in
+ * netsurf/plot_style.h). */
+static bool xyi_fill(xy_image_content *im, const image_t *pic) {
+    bool opaque = pic->alpha == NULL;
+    struct bitmap *bm = guit->bitmap->create(pic->w, pic->h,
+                                             BITMAP_NEW | (opaque ? BITMAP_OPAQUE : 0));
+    if (bm == NULL) return false;
+
+    unsigned char *out = guit->bitmap->get_buffer(bm);
+    size_t stride = guit->bitmap->get_rowstride(bm);
+    for (int y = 0; y < pic->h; y++) {
+        const unsigned int *src = pic->px + (size_t)y * pic->w;
+        const unsigned char *al = opaque ? NULL : pic->alpha + (size_t)y * pic->w;
+        unsigned char *dst = out + (size_t)y * stride;
+        for (int x = 0; x < pic->w; x++) {
+            unsigned int v = src[x], r = (v >> 16) & 0xFF, g = (v >> 8) & 0xFF, b = v & 0xFF;
+            unsigned int a = al ? al[x] : 255;
+            if (a == 0) {
+                r = g = b = 0;
+            } else if (a < 255) {
+                /* laid on black: the colour times its coverage */
+                r = (r * 255 + a / 2) / a; if (r > 255) r = 255;
+                g = (g * 255 + a / 2) / a; if (g > 255) g = 255;
+                b = (b * 255 + a / 2) / a; if (b > 255) b = 255;
+            }
+            *dst++ = (unsigned char)r;
+            *dst++ = (unsigned char)g;
+            *dst++ = (unsigned char)b;
+            *dst++ = (unsigned char)a;
+        }
+    }
+    guit->bitmap->set_opaque(bm, opaque);
+    guit->bitmap->modified(bm);
+
+    if (im->bitmap != NULL) guit->bitmap->destroy(im->bitmap);
+    im->bitmap = bm;
+    im->bw = pic->w;
+    im->bh = pic->h;
+    return true;
+}
 
 static nserror xyi_create(const content_handler *handler,
                           lwc_string *imime_type,
@@ -83,45 +127,30 @@ static bool xyi_convert(struct content *c) {
         return false;
     }
 
+    /* On black, so that what comes back with an alpha plane is the colour
+     * multiplied by it -- see xyi_fill. */
+    img_background = 0x000000;
     image_t pic;
     if (!img_load(data, (unsigned long)size, &pic) || pic.px == NULL) {
         /* img_err says which of the formats it tried and why it stopped. */
         content_broadcast_errorcode(c, NSERROR_INVALID);
         return false;
     }
-
-    im->bitmap = guit->bitmap->create(pic.w, pic.h, BITMAP_NEW | BITMAP_OPAQUE);
-    if (im->bitmap == NULL) {
+    if (!xyi_fill(im, &pic)) {
         img_free(&pic);
         content_broadcast_errorcode(c, NSERROR_NOMEM);
         return false;
     }
 
-    /* One word per pixel becomes four bytes per pixel. NetSurf reads a
-     * bitmap as R, G, B, A in that order (see pixel_to_colour in
-     * netsurf/plot_style.h); this decoder hands back 0x00RRGGBB in a word.
-     * Alpha is 255 throughout because the decoder has already flattened it. */
-    unsigned char *out = guit->bitmap->get_buffer(im->bitmap);
-    size_t stride = guit->bitmap->get_rowstride(im->bitmap);
-
-    for (int y = 0; y < pic.h; y++) {
-        const unsigned int *src = pic.px + (size_t)y * pic.w;
-        unsigned char *dst = out + (size_t)y * stride;
-        for (int x = 0; x < pic.w; x++) {
-            unsigned int v = src[x];
-            *dst++ = (unsigned char)((v >> 16) & 0xFF);   /* R */
-            *dst++ = (unsigned char)((v >> 8) & 0xFF);    /* G */
-            *dst++ = (unsigned char)(v & 0xFF);           /* B */
-            *dst++ = 0xFF;                                /* A */
-        }
-    }
-
-    c->width = pic.w;
-    c->height = pic.h;
+    /* A drawing's size is what it says it is, not the larger size it was
+     * rendered at for sharpness; the page is laid out with the former. */
+    int w = pic.w, h = pic.h;
+    bool binary = data[0] == 137 || data[0] == 0xFF || (data[0] == 'B' && data[1] == 'M') ||
+                  (size > 4 && data[0] == 'R' && data[1] == 'I');
+    im->svg = !binary && svg_size(data, (unsigned long)size, &w, &h) != 0;
+    c->width = w;
+    c->height = h;
     c->size += (size_t)pic.w * pic.h * 4;
-
-    guit->bitmap->set_opaque(im->bitmap, true);
-    guit->bitmap->modified(im->bitmap);
     img_free(&pic);
 
     char *title = messages_get_buff("BMPTitle",
@@ -144,6 +173,23 @@ static bool xyi_redraw(struct content *c, struct content_redraw_data *data,
     (void)clip;
     xy_image_content *im = (xy_image_content *)c;
     if (im->bitmap == NULL) return false;
+
+    /* A drawing shown at a size it was not drawn at is drawn again at that
+     * size. Only one size is kept: the same picture shown at two sizes on
+     * one page is drawn twice per redraw, which is rare and still cheap. */
+    if (im->svg && data->width > 0 && data->height > 0 &&
+        data->width <= 2048 && data->height <= 2048 &&
+        (data->width != im->bw || data->height != im->bh)) {
+        size_t size = 0;
+        const uint8_t *src = (const uint8_t *)content__get_source_data(c, &size);
+        image_t pic;
+        img_background = 0x000000;
+        if (src != NULL && size > 0 &&
+            svg_render(src, (unsigned long)size, data->width, data->height, &pic)) {
+            xyi_fill(im, &pic);
+            img_free(&pic);
+        }
+    }
 
     bitmap_flags_t flags = BITMAPF_NONE;
     if (data->repeat_x) flags |= BITMAPF_REPEAT_X;
