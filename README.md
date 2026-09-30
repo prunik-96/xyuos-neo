@@ -55,7 +55,7 @@ cd ~/xyuos-neo
 ./toolchain/build.sh                  # binutils 2.42 + GCC 13.2.0 + C++ runtime, ~50 min
 python3 tools/vendor.py               # DOOM, MicroPython, the text libraries at
                                       # pinned commits; 48 Noto fonts by checksum
-make                                  # kernel, libc, libtext, userland, ISO, disk image
+make                                  # kernel, libc, librast, libtext, userland, ISO, disk image
 ```
 
 That is enough to boot. To rebuild the browser as well:
@@ -87,6 +87,7 @@ pointed elsewhere:
 |---|---|
 | `kernel/` | the kernel: `arch/`, `mm/`, `fs/`, `net/`, `gfx/`, `wm/`, `crypto/`, `drivers/` |
 | `libc/` | the C library, written here; `libc/include/c++/` wraps it for C++ |
+| `librast/` | shapes for programs: paths, curves and arcs filled and stroked, anti-aliased by exact area, with gradients and clipping -- all integer |
 | `libtext/` | text for programs: fonts chosen per character, shaping, bidi, line breaking — over FreeType, HarfBuzz, SheenBidi and libunibreak |
 | `userland/` | programs, and the GUI toolkit they share |
 | `disk/` | files that ship on the disk image |
@@ -105,15 +106,16 @@ C++ with exceptions and RTTI, ext2 and FAT32, xHCI and USB, a window manager
 with real windows, DHCP, DNS, TCP with several connections at once, TLS 1.3
 with certificate chain validation, HTTP with keep-alive, text shaping for
 every major script (kerning, ligatures, Arabic joining, Indic reordering,
-bidirectional text, Unicode line breaking), DOOM, MicroPython, and NetSurf
-with JavaScript.
+bidirectional text, Unicode line breaking), vector graphics (anti-aliased
+paths, strokes with joins, caps and dashes, gradients, clip paths -- SVG is
+drawn with them), DOOM, MicroPython, and NetSurf with JavaScript.
 
 The platform work between here and a modern browser engine was planned as
-eight layers. Seven are done: parallel sockets, virtual memory, threads and
-scheduling on every core, processes and IPC, the C++ runtime, text, and a
-bigger disk -- a 1 GiB partition on the boot stick, persistent, with a
-128 MiB image in memory as the fallback (see `STICK_MB` and `DISK_MB` in the
-Makefile). One is left: a path rasteriser.
+eight layers, and all eight are done: parallel sockets, virtual memory,
+threads and scheduling on every core, processes and IPC, the C++ runtime,
+text, a bigger disk -- a 1 GiB partition on the boot stick, persistent, with
+a 128 MiB image in memory as the fallback (see `STICK_MB` and `DISK_MB` in
+the Makefile) -- and a path rasteriser, `librast`.
 
 The tests are programs on the disk (`fstest`, `sigtest`, `shmtest`,
 `thrtest`, `partest`, `cpptest`, `texttest`, `memtest`, `vmtest`), driven
@@ -123,4 +125,8 @@ gives one unless told otherwise. `SEQRUN_STICK=1` boots the way real hardware
 does, from the ISO as a USB stick, and `SEQRUN_UEFI=1` with UEFI firmware;
 `SEQRUN_KEEP=1` keeps the stick from the last run, to see what survived.
 `SEQRUN_RAMDISK=1` runs from the in-memory disk. `fonts` opens a window of
-text in every script, for the eye.
+text in every script, for the eye, and `view /pics/shapes.svg` a page of
+everything `librast` draws. Some parts are checked on the host instead:
+`tools/rasttest.c` measures `librast` against geometry, `tools/malloctest.c`
+runs the heap through millions of operations, `tools/hidtest.c` reads mouse
+descriptors.
