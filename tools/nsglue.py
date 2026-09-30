@@ -34,6 +34,7 @@ INC = ["-I" + HOME + "/libc/include",
        "-I" + HOME + "/third_party/shim/include",
        "-I" + HOME + "/userland",          # inflate.h
        "-I" + HOME + "/libtext/include",   # text.h
+       "-I" + HOME + "/librast/include",   # rast.h
        "-I" + GLUE,
        "-I" + NS, "-I" + NS + "/include",
        "-I" + NS + "/content/handlers",

@@ -68,6 +68,8 @@ LIBS = [
     HOME + "/build/libfreetype.a",
     HOME + "/build/libsheenbidi.a",
     HOME + "/build/libunibreak.a",
+    # Shapes into pixels: the plotters and the SVG decoder.
+    HOME + "/build/librast.a",
     HOME + "/build/libc.a",
 ]
 for p in LIBS:

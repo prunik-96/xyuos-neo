@@ -19,7 +19,7 @@ USER_CFLAGS  := -ffreestanding -fno-stack-protector -fno-pic -fno-pie \
 USER_LDFLAGS := -T userland/link.ld -ffreestanding -nostdlib -no-pie -static -O2
 
 # libc itself, and libc-based userland programs.
-LIBC_CFLAGS   := $(USER_CFLAGS) -Ilibc/include
+LIBC_CFLAGS   := $(USER_CFLAGS) -Ilibc/include -Ilibrast/include
 # C++ with the language switched all the way on. -fno-exceptions and
 # -fno-rtti were here because there was nothing to link against; libsupc++ is
 # built now (toolchain/build_libstdcxx.sh), so throw, catch, typeid and
@@ -127,7 +127,7 @@ build/libc_%.o: libc/src/%.c
 # user code runs. An explicit target rule beats the pattern rule above.
 LIBC_FP_CFLAGS := -ffreestanding -fno-stack-protector -fno-pic -fno-pie \
                   -mno-red-zone -msse -msse2 -Wall -Wextra -std=gnu11 -O2 -g \
-                  -Ilibc/include
+                  -Ilibc/include -Ilibrast/include
 
 build/libc_posix.o: libc/src/posix.c
 	mkdir -p build
@@ -173,6 +173,23 @@ build/libc_sigtramp.o: libc/src/sigtramp.S
 $(LIBC_A): $(LIBC_OBJS) $(LIBC_CXX_OBJS) $(LIBC_ASM_OBJS)
 	$(CROSS)ar rcs $@ $(LIBC_OBJS) $(LIBC_CXX_OBJS) $(LIBC_ASM_OBJS)
 
+# --- librast: shapes into pixels (librast/include/rast.h) ---
+#
+# Built like libc -- no floating point, so it is fit for web, which has none,
+# and one day for the kernel -- and linked into every libc program after the
+# program itself: a static archive gives only what is asked for, so a program
+# that draws no shapes gets none of it.
+RAST_SRCS := $(wildcard librast/src/*.c)
+RAST_OBJS := $(patsubst librast/src/%.c,build/rast/%.o,$(RAST_SRCS))
+RAST_A    := build/librast.a
+
+build/rast/%.o: librast/src/%.c librast/include/rast.h librast/src/rast_int.h
+	mkdir -p build/rast
+	$(CC) $(LIBC_CFLAGS) -Ilibrast/src -c $< -o $@
+
+$(RAST_A): $(RAST_OBJS)
+	$(CROSS)ar rcs $@ $(RAST_OBJS)
+
 # --- libc-based userland programs ---
 
 build/%_libcuser.o: userland/%.c $(wildcard libc/include/*.h) $(wildcard userland/*.h)
@@ -198,8 +215,8 @@ build/%_libcuser.o: userland/%.cpp $(wildcard libc/include/*.h)
 	$(CXX) $(LIBC_CXXFLAGS) -c $< -o $@
 
 define LIBC_LINK_RULE
-build/$(1).elf: build/$(1)_libcuser.o $(CRT0) $(LIBC_A) userland/link.ld
-	$(LD) $(LIBC_LDFLAGS) $(CRT0) build/$(1)_libcuser.o $(LIBC_A) -o $$@ -lgcc
+build/$(1).elf: build/$(1)_libcuser.o $(CRT0) $(RAST_A) $(LIBC_A) userland/link.ld
+	$(LD) $(LIBC_LDFLAGS) $(CRT0) build/$(1)_libcuser.o $(RAST_A) $(LIBC_A) -o $$@ -lgcc
 endef
 $(foreach p,$(LIBC_C_PROGS),$(eval $(call LIBC_LINK_RULE,$(p))))
 
