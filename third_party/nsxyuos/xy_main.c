@@ -228,42 +228,84 @@ static void on_key(const key_event_t *k) {
     }
 
     struct browser_window *bw = xy_tab_bw();
+    int ctrl = k->mods & XMOD_CTRL, alt = k->mods & XMOD_ALT, shift = k->mods & XMOD_SHIFT;
 
-    if (k->code == XKEY_CHAR) {
-        switch (k->ascii) {
-        case 'l': case '/': act(HIT_ADDRESS, 0);  return;
-        case 'r':           act(HIT_RELOAD, 0);   return;
-        case 'b':           act(HIT_BACK, 0);     return;
-        case 'f':           act(HIT_FORWARD, 0);  return;
-        case 'h':           act(HIT_HOME, 0);     return;
-        case 't':           act(HIT_TAB_NEW, 0);  return;
-        case 'w':           xy_tab_close(xy_tab); return;
-        case ']':
-            if (xy_ntabs > 1) { xy_tab = (xy_tab + 1) % xy_ntabs; xy_damage(); }
-            return;
-        case '[':
+    if (k->code == XKEY_RESIZE) { xy_clip_reset(); xy_damage(); return; }
+
+    /* The browser's own commands, held with Ctrl or Alt as in every other
+     * browser. A bare letter used to do these, and a letter typed into a
+     * search box on a page reloaded it or opened a tab instead of being
+     * typed. Ctrl+letter can arrive as the letter or as its control code. */
+    if (ctrl && k->code == XKEY_CHAR) {
+        int c = (unsigned char)k->ascii;
+        if (c >= 1 && c <= 26 && c != '\t') c = 'a' + c - 1;
+        if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+        uint32_t edit = 0;
+        switch (c) {
+        case 'l': act(HIT_ADDRESS, 0);  return;
+        case 'r': act(HIT_RELOAD, 0);   return;
+        case 't': act(HIT_TAB_NEW, 0);  return;
+        case 'w': xy_tab_close(xy_tab); return;
+        case '\t':                       /* Ctrl+Tab, Ctrl+Shift+Tab */
             if (xy_ntabs > 1) {
-                xy_tab = (xy_tab + xy_ntabs - 1) % xy_ntabs;
+                xy_tab = (xy_tab + (shift ? xy_ntabs - 1 : 1)) % xy_ntabs;
                 xy_damage();
             }
             return;
-        case ' ':           scroll_by(PAGE_H - 40); return;
-        default:
-            if (bw) browser_window_key_press(bw,
-                        (uint32_t)(unsigned char)k->ascii);
-            return;
+        /* Editing keys belong to whatever on the page has the caret. */
+        case 'a': edit = NS_KEY_SELECT_ALL;     break;
+        case 'c': edit = NS_KEY_COPY_SELECTION; break;
+        case 'v': edit = NS_KEY_PASTE;          break;
+        case 'x': edit = NS_KEY_CUT_SELECTION;  break;
+        case 'z': edit = NS_KEY_UNDO;           break;
+        case 'y': edit = NS_KEY_REDO;           break;
+        default: return;
         }
+        if (bw) browser_window_key_press(bw, edit);
+        return;
     }
+    if (alt && k->code == XKEY_LEFT)  { act(HIT_BACK, 0);    return; }
+    if (alt && k->code == XKEY_RIGHT) { act(HIT_FORWARD, 0); return; }
+    if (alt && k->code == XKEY_HOME)  { act(HIT_HOME, 0);    return; }
+    if (k->code == XKEY_F(5))         { act(HIT_RELOAD, 0);  return; }
+    if (k->code == XKEY_F(6))         { act(HIT_ADDRESS, 0); return; }
+
+    /* Everything else goes to the page first: a text field takes what it
+     * wants, letters, space, arrows and all. Only what it does not take
+     * moves the page. */
+    uint32_t key = 0;
+    switch (k->code) {
+    case XKEY_CHAR:
+        key = (unsigned char)k->ascii;
+        if (key == '\t' && shift) key = NS_KEY_SHIFT_TAB;
+        break;
+    case XKEY_ENTER: key = NS_KEY_NL;           break;
+    case XKEY_BKSP:  key = NS_KEY_DELETE_LEFT;  break;
+    case XKEY_DEL:   key = NS_KEY_DELETE_RIGHT; break;
+    case XKEY_LEFT:  key = ctrl ? NS_KEY_WORD_LEFT : NS_KEY_LEFT;   break;
+    case XKEY_RIGHT: key = ctrl ? NS_KEY_WORD_RIGHT : NS_KEY_RIGHT; break;
+    case XKEY_UP:    key = NS_KEY_UP;           break;
+    case XKEY_DOWN:  key = NS_KEY_DOWN;         break;
+    case XKEY_HOME:  key = ctrl ? NS_KEY_TEXT_START : NS_KEY_LINE_START; break;
+    case XKEY_END:   key = ctrl ? NS_KEY_TEXT_END : NS_KEY_LINE_END;     break;
+    case XKEY_PGUP:  key = NS_KEY_PAGE_UP;      break;
+    case XKEY_PGDN:  key = NS_KEY_PAGE_DOWN;    break;
+    case XKEY_ESC:   key = NS_KEY_ESCAPE;       break;
+    default: break;
+    }
+    if (key && bw && browser_window_key_press(bw, key)) return;
 
     switch (k->code) {
-    case XKEY_ESC:    running = false;        break;
+    case XKEY_CHAR:
+        if (k->ascii == ' ') scroll_by(shift ? -(PAGE_H - 40) : PAGE_H - 40);
+        break;
+    case XKEY_ESC:    act(HIT_STOP, 0);       break;   /* stop loading; never quit */
     case XKEY_UP:     scroll_by(-40);         break;
     case XKEY_DOWN:   scroll_by(40);          break;
     case XKEY_PGUP:   scroll_by(-(PAGE_H - 40)); break;
     case XKEY_PGDN:   scroll_by(PAGE_H - 40);    break;
     case XKEY_HOME:   if (xy_win) { xy_win->sy = 0; xy_damage(); } break;
     case XKEY_END:    scroll_by(xy_win ? xy_win->ch : 0); break;
-    case XKEY_RESIZE: xy_clip_reset(); xy_damage(); break;
     default: break;
     }
 }
