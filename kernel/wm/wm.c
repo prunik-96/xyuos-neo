@@ -15,6 +15,7 @@
 #include "../kernel/kio.h"
 #include "../drivers/mouse.h"
 #include "../drivers/audio.h"
+#include "../drivers/power.h"
 #include "../net/net.h"
 #include "ui.h"
 #include "wall.h"
@@ -594,8 +595,15 @@ struct pane_cache {
     uint32_t x, y, w, h;
     int      focus, theme;
     uint32_t look;             // caption buttons: which is lit, how far faded
+    int      gfx;              // a pixel surface rather than a character grid
+    uint32_t gen;              // ... and which of its frames was painted
 };
 static struct pane_cache pcache[MAX_PANES];
+
+// A graphics pane's pixels are not fingerprinted -- hashing a megabyte to
+// find out whether it changed costs about what painting it does. Each frame
+// a program hands over counts instead.
+static uint32_t gfx_gen[MAX_PANES];
 
 static void invalidate_pane_cache(void) {
     for (int i = 0; i < MAX_PANES; i++) pcache[i].valid = 0;
@@ -893,13 +901,16 @@ static int pane_changed(int n) {
     struct wm_node *nd = &nodes[n];
     struct pane *p = &panes[nd->pane_idx];
     struct pane_cache *pc = &pcache[nd->pane_idx];
-    // Graphics-mode panes are never skipped: their pixels are not part of
-    // the fingerprint.
-    if (p->gfx_on || !pc->valid) return 1;
-    uint64_t f0 = rdtsc();
-    uint64_t fp = pane_fingerprint(p);
-    pf_fp += rdtsc() - f0;
-    return pc->fp != fp || pc->x != nd->x || pc->y != nd->y || pc->w != nd->w ||
+    if (!pc->valid || pc->gfx != p->gfx_on) return 1;
+    if (p->gfx_on) {
+        if (pc->gen != gfx_gen[nd->pane_idx]) return 1;
+    } else {
+        uint64_t f0 = rdtsc();
+        uint64_t fp = pane_fingerprint(p);
+        pf_fp += rdtsc() - f0;
+        if (pc->fp != fp) return 1;
+    }
+    return pc->x != nd->x || pc->y != nd->y || pc->w != nd->w ||
            pc->h != nd->h || pc->focus != (n == focused) || pc->theme != theme ||
            pc->look != win_look(n);
 }
@@ -908,7 +919,9 @@ static void pane_painted(int n) {
     struct wm_node *nd = &nodes[n];
     struct pane *p = &panes[nd->pane_idx];
     struct pane_cache *pc = &pcache[nd->pane_idx];
-    pc->valid = !p->gfx_on;
+    pc->valid = 1;
+    pc->gfx = p->gfx_on;
+    pc->gen = gfx_gen[nd->pane_idx];
     pc->fp = p->gfx_on ? 0 : pane_fingerprint(p);
     pc->x = nd->x; pc->y = nd->y; pc->w = nd->w; pc->h = nd->h;
     pc->focus = (n == focused);
@@ -2113,37 +2126,554 @@ static void start_build(void) {
     }
 }
 
-// Index of the `want`-th item matching the current query, or -1.
-static int start_nth(int want) {
-    int seen = 0;
+// --- the menu itself: Windows 10's, in glass --------------------------------
+//
+// A narrow strip of icons at the left (you, documents, pictures, settings,
+// power), the programs in the middle under a search box -- by letter, or
+// whatever the search matches -- and tiles at the right: live ones that show
+// the time, the memory, the processor, the network and what is playing, and
+// the programs a person opens most.
+//
+// Geometry is worked out in one place for drawing and clicking alike.
+
+#define SM_STRIP   48
+#define SM_LIST    296
+#define SM_TILE    100              // a medium tile; a wide one is two and a gap
+#define SM_GAP     4
+#define SM_TILES_W (3 * SM_TILE + 2 * SM_GAP)
+#define SM_PAD     18
+#define SM_ROW     36
+#define SM_HEAD    30
+#define SM_SEARCH  34
+
+// One line of the list: a program, or the letter that heads a run of them.
+#define SM_ROWS_MAX (START_MAX + 30)
+static struct { int item; char letter; } sm_rows[SM_ROWS_MAX];
+static int sm_nrows;
+static int sm_power_open;           // the shut-down / restart choice is showing
+static int menu_dirty;              // the menu, and only the menu, changed
+
+static int ci_cmp(const char *a, const char *b) {
+    while (*a && lower_c(*a) == lower_c(*b)) { a++; b++; }
+    return (int)(unsigned char)lower_c(*a) - (int)(unsigned char)lower_c(*b);
+}
+
+// How well a program matches the search, smaller is better, -1 not at all:
+// its name starts with it, a word of its name does, the name has it
+// somewhere, only the file name has it. "fi" should find Files before
+// bigfile.
+static int sm_rank(const struct start_item *it) {
+    const char *n = it->name;
+    int k = 0;
+    while (start_q[k] && lower_c(n[k]) == lower_c(start_q[k])) k++;
+    if (!start_q[k]) return it->featured ? 0 : 1;
+    for (int i = 1; n[i]; i++) {
+        if (n[i - 1] != ' ') continue;
+        k = 0;
+        while (start_q[k] && lower_c(n[i + k]) == lower_c(start_q[k])) k++;
+        if (!start_q[k]) return 2;
+    }
+    if (str_has(n, start_q)) return 3;
+    if (str_has(it->path, start_q)) return 4;
+    return -1;
+}
+
+// The list for the current search: with none, the programs worth naming
+// under their initials; with one, every program it matches, best first.
+static void sm_build_rows(void) {
+    int idx[START_MAX], rank[START_MAX], n = 0;
     for (int i = 0; i < start_count; i++) {
-        if (!str_has(start_items[i].name, start_q) &&
-            !str_has(start_items[i].path, start_q)) continue;
-        if (seen == want) return i;
-        seen++;
+        int r = 0;
+        if (start_qlen) {
+            r = sm_rank(&start_items[i]);
+            if (r < 0) continue;
+        } else if (!start_items[i].featured) {
+            continue;
+        }
+        rank[i] = r;
+        idx[n++] = i;
+    }
+    for (int i = 1; i < n; i++) {
+        int v = idx[i], j = i - 1;
+        while (j >= 0 && (rank[idx[j]] > rank[v] ||
+                          (rank[idx[j]] == rank[v] &&
+                           ci_cmp(start_items[idx[j]].name, start_items[v].name) > 0))) {
+            idx[j + 1] = idx[j];
+            j--;
+        }
+        idx[j + 1] = v;
+    }
+    sm_nrows = 0;
+    char last = 0;
+    for (int i = 0; i < n && sm_nrows < SM_ROWS_MAX - 1; i++) {
+        char c = start_items[idx[i]].name[0];
+        if (c >= 'a' && c <= 'z') c = (char)(c - 32);
+        if (!start_qlen && c != last) {
+            sm_rows[sm_nrows].item = -1;
+            sm_rows[sm_nrows].letter = c;
+            sm_nrows++;
+            last = c;
+        }
+        sm_rows[sm_nrows].item = idx[i];
+        sm_rows[sm_nrows].letter = 0;
+        sm_nrows++;
+    }
+}
+
+static int sm_first_item(void) {
+    for (int r = 0; r < sm_nrows; r++) if (sm_rows[r].item >= 0) return r;
+    return -1;
+}
+
+// Move the selection to the next program row in direction d.
+static void sm_step(int d) {
+    int r = start_sel;
+    for (;;) {
+        r += d;
+        if (r < 0 || r >= sm_nrows) return;
+        if (sm_rows[r].item >= 0) { start_sel = r; return; }
+    }
+}
+
+static void start_geom(int *x, int *y, int *w, int *h) {
+    int H = (int)fb_get_height();
+    *w = SM_STRIP + SM_LIST + SM_TILES_W + 2 * SM_PAD;
+    *h = 640;
+    if (*h > H - TASKBAR_H - 16) *h = H - TASKBAR_H - 16;
+    *x = 8;
+    *y = H - TASKBAR_H - 8 - *h;
+}
+
+// The list's box: below the search field, down to the bottom.
+static void sm_list_box(int *lx, int *ly, int *lw, int *lh) {
+    int x, y, w, h;
+    start_geom(&x, &y, &w, &h);
+    *lx = x + SM_STRIP;
+    *ly = y + 14 + SM_SEARCH + 10;
+    *lw = SM_LIST;
+    *lh = y + h - 10 - *ly;
+}
+
+static int sm_row_height(int r) { return sm_rows[r].item < 0 ? SM_HEAD : SM_ROW; }
+
+// Keep the selection in view.
+static void sm_scroll_to_sel(void) {
+    int lx, ly, lw, lh;
+    sm_list_box(&lx, &ly, &lw, &lh);
+    if (start_sel < 0) return;
+    if (start_sel < start_top) start_top = start_sel;
+    // A heading belongs with the program under it.
+    if (start_top == start_sel && start_sel > 0 && sm_rows[start_sel - 1].item < 0) start_top--;
+    for (;;) {
+        int yy = 0;
+        for (int r = start_top; r <= start_sel; r++) yy += sm_row_height(r);
+        if (yy <= lh || start_top >= start_sel) break;
+        start_top++;
+    }
+}
+
+// The row at screen y, or -1.
+static int sm_row_at(int my) {
+    int lx, ly, lw, lh;
+    sm_list_box(&lx, &ly, &lw, &lh);
+    int yy = ly;
+    for (int r = start_top; r < sm_nrows; r++) {
+        int rh = sm_row_height(r);
+        if (yy + rh > ly + lh) break;
+        if (my >= yy && my < yy + rh) return r;
+        yy += rh;
     }
     return -1;
 }
 
-static int start_matches(void) {
-    int n = 0;
-    while (start_nth(n) >= 0) n++;
-    return n;
+// --- tiles ---
+
+#define TILE_CLOCK 1
+#define TILE_MEM   2
+#define TILE_CPU   3
+#define TILE_NET   4
+#define TILE_MUSIC 5
+#define TILE_APP   6
+
+static const struct {
+    int kind, group, col, row, wide;
+    const char *name, *file;
+    uint32_t color;
+} sm_tiles[] = {
+    { TILE_CLOCK, 0, 0, 0, 1, "Clock",         0,         0x001F6FD1 },
+    { TILE_MEM,   0, 2, 0, 0, "Memory",        "taskmgr", 0x000F8A8A },
+    { TILE_CPU,   0, 0, 1, 0, "Processor",     "taskmgr", 0x005A47B8 },
+    { TILE_NET,   0, 1, 1, 0, "Network",       "netlog",  0x002E8B3E },
+    { TILE_MUSIC, 0, 2, 1, 0, "Music",         "play",    0x00D0542A },
+    { TILE_APP,   1, 0, 0, 0, "Browser",       "web",     0x001F6FD1 },
+    { TILE_APP,   1, 1, 0, 0, "Files",         "files",   0x00C88A14 },
+    { TILE_APP,   1, 2, 0, 0, "Terminal",      "sh",      0x0030363E },
+    { TILE_APP,   1, 0, 1, 0, "Notepad",       "note",    0x002F7FB8 },
+    { TILE_APP,   1, 1, 1, 0, "Task manager",  "taskmgr", 0x000F8A8A },
+    { TILE_APP,   1, 2, 1, 0, "Control panel", "control", 0x005A6878 },
+};
+#define SM_NTILES (int)(sizeof sm_tiles / sizeof sm_tiles[0])
+static const char *sm_groups[2] = { "Live", "Programs" };
+
+static void sm_group_y(int g, int *gy) {
+    int x, y, w, h;
+    start_geom(&x, &y, &w, &h);
+    *gy = y + 14 + g * (28 + 2 * SM_TILE + SM_GAP + 16);
 }
 
-#define SM_W       420
-#define SM_ROW_PAD 10
+static void sm_tile_rect(int i, int *tx, int *ty, int *tw, int *th) {
+    int x, y, w, h, gy;
+    start_geom(&x, &y, &w, &h);
+    sm_group_y(sm_tiles[i].group, &gy);
+    *tx = x + SM_STRIP + SM_LIST + SM_PAD + sm_tiles[i].col * (SM_TILE + SM_GAP);
+    *ty = gy + 28 + sm_tiles[i].row * (SM_TILE + SM_GAP);
+    *tw = sm_tiles[i].wide ? 2 * SM_TILE + SM_GAP : SM_TILE;
+    *th = SM_TILE;
+}
 
-static int sm_row_h(void) { return (int)GH + SM_ROW_PAD; }
+// --- the strip ---
 
-static void start_geom(int *x, int *y, int *w, int *h) {
-    int H = (int)fb_get_height();
-    int rows = 14;          // one line each now, so the list can be longer
-    *h = rows * sm_row_h() + (int)GH + 30 + 34;
-    *w = SM_W;
-    *x = 8;
-    *y = H - TASKBAR_H - *h;
-    if (*y < 4) { *y = 4; *h = H - TASKBAR_H - 4; }
+#define STRIP_USER  0
+#define STRIP_DOCS  1
+#define STRIP_PICS  2
+#define STRIP_SET   3
+#define STRIP_POWER 4
+#define STRIP_N     5
+static const char *strip_names[STRIP_N] = { "You", "Documents", "Pictures", "Settings", "Power" };
+
+static void sm_strip_rect(int i, int *bx, int *by, int *bw, int *bh) {
+    int x, y, w, h;
+    start_geom(&x, &y, &w, &h);
+    *bw = SM_STRIP - 8;
+    *bh = 40;
+    *bx = x + 4;
+    *by = y + h - 8 - (STRIP_N - i) * (*bh);
+}
+
+// The shut-down choice: two rows above the power button.
+#define POWER_ROWS 2
+static const char *power_names[POWER_ROWS] = { "Restart", "Shut down" };
+
+static void sm_power_rect(int i, int *px, int *py, int *pw, int *ph) {
+    int bx, by, bw, bh;
+    sm_strip_rect(STRIP_POWER, &bx, &by, &bw, &bh);
+    *pw = 168;
+    *ph = 36;
+    *px = bx + bw + 6;
+    *py = by + bh - (POWER_ROWS - i) * (*ph) - 8;
+}
+
+// What is under the pointer in the menu: a key for hover and click.
+#define KEY_SM(k, a) (0x30000 | ((k) << 10) | (a))
+#define SMK_ROW   1
+#define SMK_TILE  2
+#define SMK_STRIP 3
+#define SMK_POWER 4
+#define SMK_INSIDE 5
+
+static int sm_key_at(int mx, int my) {
+    int x, y, w, h;
+    start_geom(&x, &y, &w, &h);
+    if (sm_power_open) {
+        for (int i = 0; i < POWER_ROWS; i++) {
+            int px, py, pw, ph;
+            sm_power_rect(i, &px, &py, &pw, &ph);
+            if (mx >= px && mx < px + pw && my >= py && my < py + ph) return KEY_SM(SMK_POWER, i);
+        }
+    }
+    if (mx < x || my < y || mx >= x + w || my >= y + h) return -1;
+    for (int i = 0; i < STRIP_N; i++) {
+        int bx, by, bw, bh;
+        sm_strip_rect(i, &bx, &by, &bw, &bh);
+        if (mx >= bx && mx < bx + bw && my >= by && my < by + bh) return KEY_SM(SMK_STRIP, i);
+    }
+    int lx, ly, lw, lh;
+    sm_list_box(&lx, &ly, &lw, &lh);
+    if (mx >= lx && mx < lx + lw && my >= ly && my < ly + lh) {
+        int r = sm_row_at(my);
+        if (r >= 0 && sm_rows[r].item >= 0) return KEY_SM(SMK_ROW, r);
+    }
+    for (int i = 0; i < SM_NTILES; i++) {
+        int tx, ty, tw, th;
+        sm_tile_rect(i, &tx, &ty, &tw, &th);
+        if (mx >= tx && mx < tx + tw && my >= ty && my < ty + th) return KEY_SM(SMK_TILE, i);
+    }
+    return KEY_SM(SMK_INSIDE, 0);
+}
+
+// --- small pictures, drawn ---
+
+static void glyph_stroke(rast_path *p, rast_fx width, uint32_t argb) {
+    rast_stroke s;
+    rast_paint pt;
+    rast_stroke_init(&s, width);
+    s.cap = RAST_CAP_ROUND;
+    s.join = RAST_JOIN_ROUND;
+    rast_paint_solid(&pt, argb);
+    ui_rast_stroke(p, &s, &pt);
+}
+
+static void glyph_fill(rast_path *p, uint32_t argb) {
+    rast_paint pt;
+    rast_paint_solid(&pt, argb);
+    ui_rast_fill(p, &pt);
+}
+
+#define FX(v) RAST_INT(v)
+#define FXH(v) (RAST_INT(v) + RAST_ONE / 2)
+
+static void glyph_person(int cx, int cy, uint32_t c) {
+    rast_path p;
+    rast_path_init(&p);
+    rast_ellipse(&p, FXH(cx), FX(cy - 4), FX(4), FX(4));
+    glyph_fill(&p, c);
+    rast_path_reset(&p);
+    rast_move_to(&p, FX(cx - 7), FX(cy + 9));
+    rast_cubic_to(&p, FX(cx - 7), FX(cy + 1), FX(cx + 8), FX(cy + 1), FX(cx + 8), FX(cy + 9));
+    rast_close(&p);
+    glyph_fill(&p, c);
+    rast_path_free(&p);
+}
+
+static void glyph_folder(int cx, int cy, uint32_t c) {
+    rast_path p;
+    rast_path_init(&p);
+    rast_move_to(&p, FX(cx - 8), FX(cy - 6));
+    rast_line_to(&p, FX(cx - 3), FX(cy - 6));
+    rast_line_to(&p, FX(cx - 1), FX(cy - 4));
+    rast_line_to(&p, FX(cx + 8), FX(cy - 4));
+    rast_line_to(&p, FX(cx + 8), FX(cy + 7));
+    rast_line_to(&p, FX(cx - 8), FX(cy + 7));
+    rast_close(&p);
+    glyph_stroke(&p, RAST_FRAC(3, 2), c);
+    rast_path_reset(&p);
+    rast_move_to(&p, FX(cx - 8), FX(cy - 1));
+    rast_line_to(&p, FX(cx + 8), FX(cy - 1));
+    glyph_stroke(&p, RAST_FRAC(3, 2), c);
+    rast_path_free(&p);
+}
+
+static void glyph_picture(int cx, int cy, uint32_t c) {
+    rast_path p;
+    rast_path_init(&p);
+    rast_rect(&p, FX(cx - 8), FX(cy - 6), FX(16), FX(13));
+    glyph_stroke(&p, RAST_FRAC(3, 2), c);
+    rast_path_reset(&p);
+    rast_move_to(&p, FX(cx - 7), FX(cy + 5));
+    rast_line_to(&p, FX(cx - 2), FX(cy));
+    rast_line_to(&p, FX(cx + 1), FX(cy + 3));
+    rast_line_to(&p, FX(cx + 4), FX(cy + 1));
+    rast_line_to(&p, FX(cx + 7), FX(cy + 5));
+    glyph_stroke(&p, RAST_FRAC(3, 2), c);
+    rast_path_reset(&p);
+    rast_ellipse(&p, FX(cx + 3), FX(cy - 3), FX(1) + RAST_ONE / 2, FX(1) + RAST_ONE / 2);
+    glyph_fill(&p, c);
+    rast_path_free(&p);
+}
+
+static void glyph_gear(int cx, int cy, uint32_t c) {
+    rast_path p;
+    rast_path_init(&p);
+    // Eight teeth round a ring.
+    for (int k = 0; k < 8; k++) {
+        rast_fx a = RAST_INT(k * 45);
+        rast_fx ca = rast_cos(a), sa = rast_sin(a);
+        rast_fx x0 = FXH(cx) + rast_mulfx(ca, FX(5)), y0 = FXH(cy) + rast_mulfx(sa, FX(5));
+        rast_fx x1 = FXH(cx) + rast_mulfx(ca, FX(8)), y1 = FXH(cy) + rast_mulfx(sa, FX(8));
+        rast_move_to(&p, x0, y0);
+        rast_line_to(&p, x1, y1);
+    }
+    glyph_stroke(&p, FX(3), c);
+    rast_path_reset(&p);
+    rast_ellipse(&p, FXH(cx), FXH(cy), FX(5), FX(5));
+    glyph_stroke(&p, FX(3), c);
+    rast_path_free(&p);
+}
+
+static void glyph_power(int cx, int cy, uint32_t c) {
+    rast_path p;
+    rast_path_init(&p);
+    rast_arc(&p, FXH(cx), FXH(cy + 1), FX(7), RAST_INT(-55), RAST_INT(235));
+    glyph_stroke(&p, RAST_FRAC(9, 5), c);
+    rast_path_reset(&p);
+    rast_move_to(&p, FXH(cx), FX(cy - 8));
+    rast_line_to(&p, FXH(cx), FX(cy));
+    glyph_stroke(&p, RAST_FRAC(9, 5), c);
+    rast_path_free(&p);
+}
+
+static void glyph_search(int cx, int cy, uint32_t c) {
+    rast_path p;
+    rast_path_init(&p);
+    rast_ellipse(&p, FX(cx - 1), FX(cy - 1), FX(5), FX(5));
+    glyph_stroke(&p, RAST_FRAC(8, 5), c);
+    rast_path_reset(&p);
+    rast_move_to(&p, FX(cx + 3), FX(cy + 3));
+    rast_line_to(&p, FX(cx + 7), FX(cy + 7));
+    glyph_stroke(&p, FX(2), c);
+    rast_path_free(&p);
+}
+
+static void glyph_note(int cx, int cy, int s, uint32_t c) {
+    rast_path p;
+    rast_path_init(&p);
+    rast_ellipse(&p, FX(cx - s / 2), FX(cy + s), FX(s / 2 + 1), FX(s / 3 + 1));
+    rast_ellipse(&p, FX(cx + s + s / 2), FX(cy + s - s / 4), FX(s / 2 + 1), FX(s / 3 + 1));
+    glyph_fill(&p, c);
+    rast_path_reset(&p);
+    rast_move_to(&p, FX(cx), FX(cy + s));
+    rast_line_to(&p, FX(cx), FX(cy - s));
+    rast_line_to(&p, FX(cx + 2 * s), FX(cy - s - s / 3));
+    rast_line_to(&p, FX(cx + 2 * s), FX(cy + s - s / 4));
+    glyph_stroke(&p, FX(s / 4 + 1), c);
+    rast_path_free(&p);
+}
+
+// --- drawing ---
+
+static uint32_t sm_ink(void)  { return TH->dark ? 0x00F2F4F8 : 0x00141A20; }
+static uint32_t sm_dim(void)  { return TH->dark ? 0x009AA4B0 : 0x00586270; }
+
+// 0 = Sunday. Sakamoto's method.
+static int weekday(int y, int m, int d) {
+    static const int t[] = { 0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4 };
+    if (m < 3) y--;
+    return (y + y / 4 - y / 100 + y / 400 + t[(m - 1) % 12] + d) % 7;
+}
+
+static void tile_label(int tx, int ty, int th, const char *s) {
+    ui_text_glow(tx + 10, ty + th - 8 - ui_line_h(UI_F12), s, UI_F12, 0x00FFFFFF, 0, 90);
+}
+
+static void draw_tile(int i) {
+    int tx, ty, tw, th;
+    sm_tile_rect(i, &tx, &ty, &tw, &th);
+    int glow = glow_of(KEY_SM(SMK_TILE, i));
+    int pressed = press_key == KEY_SM(SMK_TILE, i);
+    uint32_t c = sm_tiles[i].color;
+    if (pressed) c = ui_mix(c, 0, 50);
+    else if (glow) c = ui_mix(c, 0x00FFFFFF, glow * 40 / 256);
+
+    // Tinted glass: the colour over the menu's glass, a gloss along the top.
+    ui_round_grad(tx, ty, tw, th, 4, UI_ALL, ui_mix(c, 0x00FFFFFF, 30), 235, ui_mix(c, 0, 20), 235);
+    ui_round_grad(tx, ty, tw, th / 2, 4, UI_TOP, 0x00FFFFFF, 50, 0x00FFFFFF, 0);
+    ui_rrect_line(tx, ty, tw, th, 4, UI_ALL, 0x00000000, 70);
+    ui_rrect_line(tx + 1, ty + 1, tw - 2, th - 2, 3, UI_ALL, 0x00FFFFFF, 50 + glow * 120 / 256);
+    if (glow) ui_rrect_line(tx + 2, ty + 2, tw - 4, th - 4, 2, UI_ALL, 0x00FFFFFF, glow * 90 / 256);
+
+    int saved[4];
+    ui_clip_get(saved);
+    ui_clip(tx + 1, ty + 1, tw - 2, th - 2);
+    char b[40];
+    switch (sm_tiles[i].kind) {
+    case TILE_CLOCK: {
+        static const char *days[7] = { "Sunday", "Monday", "Tuesday", "Wednesday",
+                                       "Thursday", "Friday", "Saturday" };
+        static const char *months[12] = { "January", "February", "March", "April", "May",
+                                          "June", "July", "August", "September", "October",
+                                          "November", "December" };
+        two_digits(b, wm_clock.hour); b[2] = ':'; two_digits(b + 3, wm_clock.min); b[5] = 0;
+        ui_text_glow(tx + 12, ty + 4, b, UI_F44, 0x00FFFFFF, 0, 70);
+        int wd = weekday(wm_clock.year, wm_clock.mon, wm_clock.day);
+        int q = 0;
+        sapp(b, &q, days[wd]); sapp(b, &q, ", ");
+        napp(b, &q, (unsigned)wm_clock.day); sapp(b, &q, " ");
+        sapp(b, &q, months[(wm_clock.mon + 11) % 12]);
+        ui_text_glow(tx + 14, ty + th - 10 - ui_line_h(UI_F13), b, UI_F13, 0x00FFFFFF, 0, 90);
+        break;
+    }
+    case TILE_MEM: {
+        uint64_t total = pmm_total_frame_count(), freef = pmm_free_frame_count();
+        unsigned pct = total ? (unsigned)((total - freef) * 100 / total) : 0;
+        int q = 0;
+        napp(b, &q, pct); sapp(b, &q, "%");
+        ui_text_glow(tx + 10, ty + 6, b, UI_F28, 0x00FFFFFF, 0, 70);
+        int bw2 = tw - 20;
+        ui_round_fill(tx + 10, ty + 48, bw2, 5, 2, 0x00FFFFFF, 70);
+        ui_round_fill(tx + 10, ty + 48, bw2 * (int)pct / 100 + 1, 5, 2, 0x00FFFFFF, 230);
+        q = 0;
+        napp(b, &q, (unsigned)((total - freef) * 4 / 1024)); sapp(b, &q, " of ");
+        napp(b, &q, (unsigned)(total * 4 / 1024)); sapp(b, &q, " MB");
+        ui_text(tx + 10, ty + 56, b, UI_F11, 0x00E8F0F8);
+        tile_label(tx, ty, th, sm_tiles[i].name);
+        break;
+    }
+    case TILE_CPU: {
+        int q = 0;
+        napp(b, &q, cur_cpu); sapp(b, &q, "%");
+        ui_text_glow(tx + 10, ty + 6, b, UI_F28, 0x00FFFFFF, 0, 70);
+        // The last minute of load, as a filled line across the tile.
+        int gx = tx + 2, gw = tw - 4, gy0 = ty + th - 30, gh = 28;
+        int cols = hist_count < 2 ? 0 : hist_count;
+        for (int k = 0; k < cols; k++) {
+            int v = cpu_hist[(hist_pos - cols + k + HIST * 4) % HIST];
+            int x0 = gx + k * gw / HIST + (HIST - cols) * gw / HIST;
+            int x1 = gx + (k + 1) * gw / HIST + (HIST - cols) * gw / HIST;
+            int bh = v * gh / 100;
+            if (bh < 1) bh = 1;
+            ui_blend(x0, gy0 + gh - bh, x1 - x0, bh, 0x00FFFFFF, 90);
+            ui_blend(x0, gy0 + gh - bh, x1 - x0, 1, 0x00FFFFFF, 220);
+        }
+        tile_label(tx, ty, th - 30, sm_tiles[i].name);
+        break;
+    }
+    case TILE_NET: {
+        int up = net_is_up();
+        for (int k = 0; k < 4; k++) {
+            int bh = 6 + k * 6, bx = tx + 12 + k * 9;
+            ui_fill(bx, ty + 34 - bh, 6, bh, (up || k == 0) ? 0x00FFFFFF : 0x0080A090);
+        }
+        ui_text_glow(tx + 10, ty + 40, up ? "Online" : "Offline", UI_F13B, 0x00FFFFFF, 0, 80);
+        if (up) {
+            uint32_t ip = 0;
+            net_config(&ip, 0, 0, 0);
+            int q = 0;
+            for (int k = 3; k >= 0; k--) {
+                napp(b, &q, (ip >> (k * 8)) & 255);
+                if (k) sapp(b, &q, ".");
+            }
+            ui_text(tx + 10, ty + 58, b, UI_F11, 0x00E8F0F8);
+        }
+        tile_label(tx, ty, th, sm_tiles[i].name);
+        break;
+    }
+    case TILE_MUSIC: {
+        const char *t = audio_title();
+        glyph_note(tx + 16, ty + 22, 6, 0xFFFFFFFF);
+        if (t[0]) {
+            ui_text_glow(tx + 10, ty + 44, "Playing", UI_F11, 0x00FFFFFF, 0, 80);
+            ui_text_fit(tx + 10, ty + 58, tw - 20, t, UI_F12, 0x00FFFFFF);
+        } else {
+            ui_text(tx + 10, ty + 48, "Nothing playing", UI_F11, 0x00E8F0F8);
+        }
+        tile_label(tx, ty, th, sm_tiles[i].name);
+        break;
+    }
+    default: {
+        // A program: its icon if it has one, its initial if not.
+        if (!icon_draw(tx + (tw - ICON_BIG) / 2, ty + 18, sm_tiles[i].file, ICON_BIG)) {
+            char ini[2] = { sm_tiles[i].name[0], 0 };
+            int iw = ui_text_w(ini, UI_F28);
+            ui_round_fill(tx + (tw - 40) / 2, ty + 14, 40, 40, 20, 0x00FFFFFF, 46);
+            ui_text_glow(tx + (tw - iw) / 2, ty + 14 + (40 - ui_line_h(UI_F28)) / 2, ini,
+                         UI_F28, 0x00FFFFFF, 0, 70);
+        }
+        tile_label(tx, ty, th, sm_tiles[i].name);
+        break;
+    }
+    }
+    ui_clip_set(saved);
+}
+
+static void draw_strip_glyph(int i, int cx, int cy, uint32_t c) {
+    uint32_t a = 0xFF000000 | c;
+    switch (i) {
+    case STRIP_USER:  glyph_person(cx, cy, a); break;
+    case STRIP_DOCS:  glyph_folder(cx, cy, a); break;
+    case STRIP_PICS:  glyph_picture(cx, cy, a); break;
+    case STRIP_SET:   glyph_gear(cx, cy, a); break;
+    default:          glyph_power(cx, cy, a); break;
+    }
 }
 
 static void draw_start_menu(void) {
@@ -2151,75 +2681,187 @@ static void draw_start_menu(void) {
     const theme_t *T = TH;
     int x, y, w, h;
     start_geom(&x, &y, &w, &h);
+    uint32_t ink = sm_ink(), dim = sm_dim();
 
+    int lim[4] = { 0, 0, (int)fb_get_width(), (int)fb_get_height() - TASKBAR_H };
+    ui_shadow(x, y, w, h, 10, 26, 140, 8, lim);
+
+    // The glass: lighter and milkier than a window's frame, so text reads.
+    ui_mat glass = { UI_GLASS, T->dark ? 0x00141A22 : 0x00F2F5F8, 0, T->dark ? 205 : 195, 0, 0, 0 };
+    ui_rrect(x, y, w, h, 10, UI_ALL, &glass);
+    ui_round_grad(x, y, w, 80, 10, UI_TOP, 0x00FFFFFF, T->dark ? 28 : 90, 0x00FFFFFF, 0);
+    ui_rrect_line(x, y, w, h, 10, UI_ALL, T->rim, T->dark ? 200 : 110);
+    ui_rrect_line(x + 1, y + 1, w - 2, h - 2, 9, UI_ALL, 0x00FFFFFF, T->dark ? 50 : 170);
+    // The strip is a shade darker than the rest.
+    ui_blend(x + 1, y + 1, SM_STRIP - 1, h - 2, T->dark ? 0x00000000 : 0x00C8D2DC,
+             T->dark ? 60 : 70);
+    ui_blend(x + SM_STRIP, y + 1, 1, h - 2, T->rim, 40);
+
+    // --- the strip ---
+    for (int i = 0; i < STRIP_N; i++) {
+        int bx, by, bw, bh;
+        sm_strip_rect(i, &bx, &by, &bw, &bh);
+        int glow = glow_of(KEY_SM(SMK_STRIP, i));
+        int on = (i == STRIP_POWER && sm_power_open);
+        if (glow || on) {
+            int a = on ? 256 : glow;
+            ui_round_fill(bx, by, bw, bh, 5, T->accent, (T->dark ? 60 : 50) * a / 256);
+            ui_rrect_line(bx, by, bw, bh, 5, UI_ALL, T->accent, 110 * a / 256);
+        }
+        draw_strip_glyph(i, bx + bw / 2, by + bh / 2, ink);
+    }
+    // The name of the icon under the pointer, in a pill beside it.
+    for (int i = 0; i < STRIP_N; i++) {
+        int glow = glow_of(KEY_SM(SMK_STRIP, i));
+        if (!glow || (i == STRIP_POWER && sm_power_open)) continue;
+        int bx, by, bw, bh;
+        sm_strip_rect(i, &bx, &by, &bw, &bh);
+        int tw = ui_text_w(strip_names[i], UI_F12) + 20, th = 24;
+        int px = bx + bw + 8, py = by + (bh - th) / 2;
+        ui_round_fill(px, py, tw, th, 6, T->dark ? 0x00283038 : 0x00FFFFFF, 235 * glow / 256);
+        ui_rrect_line(px, py, tw, th, 6, UI_ALL, T->rim, 90 * glow / 256);
+        ui_text(px + 10, py + (th - ui_line_h(UI_F12)) / 2, strip_names[i], UI_F12,
+                ui_mix(T->dark ? 0x00283038 : 0x00FFFFFF, ink, glow));
+    }
+
+    // --- the search field ---
+    int sx = x + SM_STRIP + 12, sy = y + 14, sw = SM_LIST - 24, sh = SM_SEARCH;
+    ui_round_fill(sx, sy, sw, sh, 6, T->dark ? 0x00000000 : 0x00FFFFFF, T->dark ? 90 : 210);
+    ui_rrect_line(sx, sy, sw, sh, 6, UI_ALL, start_qlen ? T->accent : T->rim,
+                  start_qlen ? 200 : 70);
+    glyph_search(sx + 16, sy + sh / 2, 0xFF000000 | dim);
+    {
+        int ty = sy + (sh - ui_line_h(UI_F13)) / 2;
+        if (start_qlen) {
+            int tw = ui_text(sx + 32, ty, start_q, UI_F13, ink);
+            ui_fill(sx + 33 + tw, sy + 8, 1, sh - 16, ink);         // the caret
+        } else {
+            ui_text(sx + 32, ty, "Type to search", UI_F13, dim);
+        }
+    }
+
+    // --- the list ---
+    int lx, ly, lw, lh;
+    sm_list_box(&lx, &ly, &lw, &lh);
+    int saved[4];
+    ui_clip_get(saved);
+    ui_clip(lx, ly, lw, lh);
+    int yy = ly;
+    for (int r = start_top; r < sm_nrows; r++) {
+        int rh = sm_row_height(r);
+        if (yy >= ly + lh) break;
+        if (sm_rows[r].item < 0) {
+            char lt[2] = { sm_rows[r].letter, 0 };
+            ui_text(lx + 16, yy + (rh - ui_line_h(UI_F13B)) / 2 + 2, lt, UI_F13B, T->accent);
+        } else {
+            const struct start_item *it = &start_items[sm_rows[r].item];
+            int glow = glow_of(KEY_SM(SMK_ROW, r));
+            int sel = (r == start_sel);
+            if (sel || glow) {
+                int a = sel ? (T->dark ? 70 : 60) : 0;
+                a += glow * (T->dark ? 40 : 50) / 256;
+                ui_round_fill(lx + 6, yy + 1, lw - 12, rh - 2, 5, T->accent, a);
+                if (sel) ui_rrect_line(lx + 6, yy + 1, lw - 12, rh - 2, 5, UI_ALL, T->accent, 120);
+            }
+            // The program's icon, or a coloured square with its initial.
+            int ix = lx + 14, iy = yy + (rh - 26) / 2;
+            if (!icon_draw(ix - 3, iy - 3, it->name_file, ICON_BIG)) {
+                ui_round_grad(ix, iy, 26, 26, 4, UI_ALL, ui_mix(T->accent, 0x00FFFFFF, 40), 255,
+                              ui_mix(T->accent, 0, 40), 255);
+                char ini[2] = { it->name[0], 0 };
+                if (ini[0] >= 'a' && ini[0] <= 'z') ini[0] = (char)(ini[0] - 32);
+                ui_text(ix + (26 - ui_text_w(ini, UI_F13B)) / 2,
+                        iy + (26 - ui_line_h(UI_F13B)) / 2, ini, UI_F13B, 0x00FFFFFF);
+            }
+            ui_text_fit(ix + 38, yy + (rh - ui_line_h(UI_F13)) / 2, lw - 70, it->name,
+                        UI_F13, ink);
+        }
+        yy += rh;
+    }
+    if (!sm_nrows)
+        ui_text(lx + 16, ly + 10, "No program matches.", UI_F13, dim);
+    ui_clip_set(saved);
+
+    // --- the tiles ---
+    for (int g = 0; g < 2; g++) {
+        int gy;
+        sm_group_y(g, &gy);
+        ui_text(x + SM_STRIP + SM_LIST + SM_PAD + 2, gy + 4, sm_groups[g], UI_F13B, ink);
+    }
+    for (int i = 0; i < SM_NTILES; i++) draw_tile(i);
+
+    // --- the shut-down choice, over everything ---
+    if (sm_power_open) {
+        int px, py, pw, ph;
+        sm_power_rect(0, &px, &py, &pw, &ph);
+        int bh = POWER_ROWS * ph + 12;
+        int boxy = py - 6;
+        ui_shadow(px, boxy, pw, bh, 8, 14, 110, 4, lim);
+        ui_mat pg = { UI_GLASS, T->dark ? 0x00182028 : 0x00F6F8FA, 0, 225, 0, 0, 0 };
+        ui_rrect(px, boxy, pw, bh, 8, UI_ALL, &pg);
+        ui_rrect_line(px, boxy, pw, bh, 8, UI_ALL, T->rim, 120);
+        ui_rrect_line(px + 1, boxy + 1, pw - 2, bh - 2, 7, UI_ALL, 0x00FFFFFF, T->dark ? 40 : 160);
+        for (int i = 0; i < POWER_ROWS; i++) {
+            int rx, ry, rw, rh;
+            sm_power_rect(i, &rx, &ry, &rw, &rh);
+            int glow = glow_of(KEY_SM(SMK_POWER, i));
+            if (glow) ui_round_fill(rx + 4, ry + 1, rw - 8, rh - 2, 5, T->accent, glow * 70 / 256);
+            ui_text(rx + 16, ry + (rh - ui_line_h(UI_F13)) / 2, power_names[i], UI_F13, ink);
+        }
+    }
+}
+
+// --- the frame under the menu ------------------------------------------------
+//
+// The menu is opaque glass, but its shadow and its rounded corners are laid
+// over whatever is behind it, so redrawing it in place would darken them a
+// little more every time. What was there is kept instead, from the frame it
+// was first drawn on, and put back before each redraw: hovering over the
+// list then costs the menu, not the desktop.
+
+static uint32_t *sm_under;
+static int sm_ux, sm_uy, sm_uw, sm_uh, sm_under_ok;
+
+static void sm_under_rect(int *ux, int *uy, int *uw, int *uh) {
+    int x, y, w, h;
+    start_geom(&x, &y, &w, &h);
+    // Wide enough for the menu's shadow and for the power choice beside it.
+    int x0 = x - 30, y0 = y - 30, x1 = x + w + 200, y1 = y + h + 40;
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > (int)fb_get_width()) x1 = (int)fb_get_width();
+    if (y1 > (int)fb_get_height() - TASKBAR_H) y1 = (int)fb_get_height() - TASKBAR_H;
+    *ux = x0; *uy = y0; *uw = x1 - x0; *uh = y1 - y0;
+}
+
+static void sm_save_under(void) {
+    int ux, uy, uw, uh;
+    sm_under_rect(&ux, &uy, &uw, &uh);
+    if (uw <= 0 || uh <= 0) { sm_under_ok = 0; return; }
+    if (!sm_under || sm_uw * sm_uh < uw * uh) {
+        if (sm_under) kfree(sm_under);
+        sm_under = (uint32_t *)kmalloc((size_t)uw * uh * 4);
+    }
+    if (!sm_under) { sm_under_ok = 0; return; }
     volatile uint8_t *base = fb_get_base();
     uint32_t pitch = fb_get_pitch();
-    for (int yy = y; yy < y + h; yy++) {
-        if (yy < 0 || (uint32_t)yy >= fb_get_height()) continue;
-        volatile uint32_t *row = (volatile uint32_t *)(base + (size_t)yy * pitch);
-        for (int xx = x; xx < x + w; xx++) {
-            if (xx < 0 || (uint32_t)xx >= fb_get_width()) continue;
-            row[xx] = mix(row[xx], T->menu_bg, 205);
-        }
+    for (int j = 0; j < uh; j++) {
+        const uint32_t *s = (const uint32_t *)(base + (size_t)(uy + j) * pitch) + ux;
+        for (int i = 0; i < uw; i++) sm_under[j * uw + i] = s[i];
     }
-    fb_fill_rect(x, y, w, 2, T->glow);
-    fb_fill_rect(x, y + h - 2, w, 2, T->glow);
-    fb_fill_rect(x, y, 2, h, T->glow);
-    fb_fill_rect(x + w - 2, y, 2, h, T->glow);
+    sm_ux = ux; sm_uy = uy; sm_uw = uw; sm_uh = uh;
+    sm_under_ok = 1;
+}
 
-    draw_text_t(x + 14, y + 12, "Programs", T->bar_dim);
-    fb_fill_rect(x + 12, y + 12 + (int)GH + 6, w - 24, 1, mix(T->glow, 0x00000000, 120));
-
-    int rh = sm_row_h();
-    int list_y = y + 12 + (int)GH + 14;
-    int list_h = h - (list_y - y) - ((int)GH + 30);
-    int vis = list_h / rh;
-    if (vis < 1) vis = 1;
-
-    int total = start_matches();
-    if (start_sel >= total) start_sel = total - 1;
-    if (start_sel < 0) start_sel = total ? 0 : -1;
-    if (start_sel >= 0) {
-        if (start_sel < start_top) start_top = start_sel;
-        if (start_sel >= start_top + vis) start_top = start_sel - vis + 1;
+static void sm_restore_under(void) {
+    if (!sm_under_ok) return;
+    volatile uint8_t *base = fb_get_base();
+    uint32_t pitch = fb_get_pitch();
+    for (int j = 0; j < sm_uh; j++) {
+        uint32_t *d = (uint32_t *)(base + (size_t)(sm_uy + j) * pitch) + sm_ux;
+        for (int i = 0; i < sm_uw; i++) d[i] = sm_under[j * sm_uw + i];
     }
-    if (start_top > total - vis) start_top = total - vis;
-    if (start_top < 0) start_top = 0;
-
-    for (int r = 0; r < vis; r++) {
-        int idx = start_top + r;
-        int it = start_nth(idx);
-        if (it < 0) break;
-        int ry = list_y + r * rh;
-        if (idx == start_sel) {
-            fill_vgrad(x + 8, ry, w - 16, rh, mix(T->glow, 0x00FFFFFF, 70), T->glow);
-            fb_fill_rect(x + 8, ry, w - 16, 1, T->title_hl);
-        }
-        // The icon is looked up by the program's FILE name, not its display
-        // name: "Task manager" is what a person reads, taskmgr.png is what was
-        // drawn for it. Small, because a row is one line high.
-        int tx0 = x + 18;
-        if (icon_draw(x + 14, ry + (rh - ICON_SMALL) / 2,
-                      start_items[it].name_file, ICON_SMALL))
-            tx0 = x + 14 + ICON_SMALL + 10;
-        draw_text_t(tx0, ry + (rh - (int)GH) / 2, start_items[it].name,
-                    idx == start_sel ? 0x00FFFFFF : T->bar_text);
-    }
-    if (!total)
-        draw_text_t(x + 18, list_y + 6, "No program matches.", T->bar_dim);
-
-    // The search box lives at the BOTTOM, next to the button that opened the
-    // menu -- the pointer is already down there.
-    int by = y + h - (int)GH - 22;
-    fb_fill_rect(x + 10, by - 6, w - 20, (int)GH + 14, mix(T->bar_a, 0x00000000, 90));
-    fb_fill_rect(x + 10, by - 6, w - 20, 1, T->glow);
-    char shown[32];
-    int i = 0;
-    while (start_q[i] && i < 27) { shown[i] = start_q[i]; i++; }
-    shown[i] = ((pit_get_ticks() / 50) & 1) ? '_' : ' ';
-    shown[i + 1] = 0;
-    draw_text_t(x + 18, by, start_qlen ? shown : "Search programs...",
-                start_qlen ? 0x00FFFFFF : T->bar_dim);
+    fb_mark_rect((uint32_t)sm_ux, (uint32_t)sm_uy, (uint32_t)sm_uw, (uint32_t)sm_uh);
 }
 
 static void draw_alttab(void) {
@@ -2484,14 +3126,26 @@ static void pf_report(void);
 // tint builds up until the screen is solid blue.
 //
 // So the rule is stated here rather than inherited from a side effect.
+//
+// The start menu is not on the list: it keeps what it covers (sm_save_under)
+// and redraws over that, so only a change UNDER it costs a full frame.
 static int overlay_needs_repaint(void) {
     return wm_message_pending() || snap_hint != SNAP_NONE || udrag_active ||
-           start_open || alttab_active;
+           alttab_active;
+}
+
+// Whether any visible window would paint differently now.
+static int windows_changed(void) {
+    int win[MAX_NODES];
+    int n = collect_windows(cur_ws, win, MAX_NODES);
+    for (int i = 0; i < n; i++)
+        if (nodes[win[i]].state != WIN_MIN && pane_changed(win[i])) return 1;
+    return 0;
 }
 
 static void render_all(void) {
     uint64_t t0 = pf_on ? rdtsc() : 0, t1, t2, t3, t4;
-    sample_stats();
+    if (sample_stats() && start_open) menu_dirty = 1;   // the live tiles moved on
     cursor_restore();   // put back what the arrow covered last frame, first
     outline_hide();     // and the drag outline, which sits under the arrow
     // Kernel logging draws straight into the back buffer, and a wallpaper
@@ -2499,6 +3153,21 @@ static void render_all(void) {
     // cached layers to be painted again.
     if (fb_console_wrote()) wp_dirty = 1;
     if (overlay_needs_repaint()) wp_dirty = 1;   // see the note above
+
+    // Only the menu changed -- a hover, a key, a tile ticking over: put back
+    // what it covered and draw it again. Nothing under it is touched.
+    if (start_open && !wp_dirty && sm_under_ok && !monitor_on && !windows_changed()) {
+        draw_taskbar();
+        if (menu_dirty) { sm_restore_under(); draw_start_menu(); }
+        menu_dirty = 0;
+        outline_show();
+        cursor_draw();
+        fb_present();
+        return;
+    }
+    // Anything else under an open menu: rebuild the frame clean, so what the
+    // menu saves of it is the desktop and not an old copy of itself.
+    if (start_open) wp_dirty = 1;
     if (wp_dirty) { invalidate_pane_cache(); tb_valid = 0; }
     draw_wallpaper();
     t1 = pf_on ? rdtsc() : 0;
@@ -2507,8 +3176,14 @@ static void render_all(void) {
     if (monitor_on) draw_gadget();
     draw_snap_preview();
     draw_alttab();
-    draw_start_menu();
     draw_taskbar();
+    if (start_open) {
+        sm_save_under();
+        draw_start_menu();
+        menu_dirty = 0;
+    } else {
+        sm_under_ok = 0;
+    }
     draw_drag_ghost();    // follows the cursor, above the windows
     draw_message_box();   // above everything: it is modal
     outline_show();     // the drag outline, above the windows it will land on
@@ -3151,6 +3826,9 @@ static int present_pane_only(int n) {
     draw_content(n, cx, cy, cw, ch, n == focused);
     cursor_draw();
     fb_present();
+    // This frame is on the screen now; the full path need not paint it again.
+    struct pane_cache *pc = &pcache[nodes[n].pane_idx];
+    if (pc->valid && pc->gfx) pc->gen = gfx_gen[nodes[n].pane_idx];
     return 1;
 }
 
@@ -3180,6 +3858,7 @@ int wm_pane_blit(struct pane *p, const uint32_t *src, int w, int h) {
         pf_blits++;
     }
     p->gfx_on = 1;
+    gfx_gen[p - panes]++;
     {   // Whoever is painting owns the surface for as long as they live.
         process_t *me = process_current();
         p->gfx_pid = me ? me->pid : 0;
@@ -3324,13 +4003,80 @@ static void push_binding(int code) {
 #define WMB_LAUNCH    0x90   /* run the start menu's selection */
 #define WMB_PROFILE   0xA0   /* toggle frame profiling */
 #define WMB_BENCH     0xB0   /* measure frames actually delivered */
+#define WMB_START     0xC0   /* open or close the start menu */
 
 static void start_toggle(void) {
     start_open = !start_open;
-    if (start_open) { start_build(); start_sel = 0; start_top = 0; }
     start_qlen = 0;
     start_q[0] = 0;
+    sm_power_open = 0;
+    if (start_open) {
+        start_build();
+        sm_build_rows();
+        start_sel = sm_first_item();
+        start_top = 0;
+    }
     wp_dirty = 1;
+    dirty = 1;
+}
+
+static void start_close(void) {
+    if (start_open) start_toggle();
+}
+
+// The search changed: a new list, the selection on its first program.
+static void start_requery(void) {
+    sm_build_rows();
+    start_sel = sm_first_item();
+    start_top = 0;
+    menu_dirty = 1;
+    dirty = 1;
+}
+
+// Open a program in a new window, from the menu.
+static void start_run(const char *path, const char *arg) {
+    start_close();
+    new_window_run(path, arg);
+    refresh_leaves();
+    dirty = 1;
+}
+
+// A click inside the open menu, on whatever sm_key_at() named.
+static void start_click(int key) {
+    int kind = (key >> 10) & 0x3F, arg = key & 0x3FF;
+    if (key < 0) { start_close(); return; }
+    switch (kind) {
+    case SMK_ROW:
+        if (arg < sm_nrows && sm_rows[arg].item >= 0)
+            start_run(start_items[sm_rows[arg].item].path, 0);
+        break;
+    case SMK_TILE: {
+        const char *f = sm_tiles[arg].file;
+        if (!f) break;
+        char path[48];
+        str_cpy(path, "/bin/", sizeof path);
+        int n = 5, k = 0;
+        while (f[k] && n < 46) path[n++] = f[k++];
+        path[n] = 0;
+        start_run(path, 0);
+        break;
+    }
+    case SMK_STRIP:
+        if (arg == STRIP_POWER) { sm_power_open = !sm_power_open; menu_dirty = 1; dirty = 1; break; }
+        if (arg == STRIP_DOCS) start_run("/bin/files", "/home");
+        else if (arg == STRIP_PICS) start_run("/bin/files", "/pics");
+        else if (arg == STRIP_SET) start_run("/bin/control", 0);
+        break;
+    case SMK_POWER:
+        if (arg == 0) power_reboot();
+        else power_off();
+        break;
+    default:
+        // Inside the menu, on nothing: the power choice goes away, the
+        // menu stays.
+        if (sm_power_open) { sm_power_open = 0; menu_dirty = 1; dirty = 1; }
+        break;
+    }
 }
 
 // A click on the taskbar: whatever tb_layout() put under the pointer.
@@ -3340,6 +4086,7 @@ static void taskbar_click(int mx, int my) {
     int i = tb_item_at(mx);
     if (i < 0) return;
     const struct tb_item *it = &tb_items[i];
+    if (it->kind != TB_ORB) start_close();   // anything else on the bar closes it
     switch (it->kind) {
     case TB_ORB:
         start_toggle();
@@ -3408,7 +4155,10 @@ static void handle_mouse(const struct mouse_event *me) {
             tb_layout();
             int i = tb_item_at(mx);
             if (i >= 0) key = KEY_TB(i);
-        } else if (!start_open) {
+        } else if (start_open) {
+            key = sm_key_at(mx, my);
+            if (key == KEY_SM(SMK_INSIDE, 0)) key = -1;
+        } else {
             int n = window_at(mx, my);
             if (n >= 0) {
                 int ht = hit_test(n, mx, my);
@@ -3416,13 +4166,27 @@ static void handle_mouse(const struct mouse_event *me) {
                 if (b >= 0) key = KEY_CAP(n, b);
             }
         }
-        if (hover_to(key)) dirty = 1;
+        if (hover_to(key)) { dirty = 1; menu_dirty = 1; }
+    }
+
+    // The wheel scrolls the menu's list, three rows a notch.
+    if (start_open && me->wheel && !on_taskbar) {
+        int lx, ly, lw, lh;
+        sm_list_box(&lx, &ly, &lw, &lh);
+        if (mx >= lx && mx < lx + lw) {
+            start_top += me->wheel > 0 ? -3 : 3;
+            if (start_top > sm_nrows - 4) start_top = sm_nrows - 4;
+            if (start_top < 0) start_top = 0;
+            menu_dirty = 1;
+            dirty = 1;
+        }
+        return;
     }
 
     // Pointer motion and wheel over the focused window's interior belong to
     // the program, not to the WM. Button transitions fall through below --
     // those may start a drag or hit window chrome first.
-    if (drag_mode == DRAG_NONE && !on_taskbar && !me->pressed && !me->released) {
+    if (drag_mode == DRAG_NONE && !on_taskbar && !start_open && !me->pressed && !me->released) {
         int n = window_at(mx, my);
         if (n >= 0 && n == focused && hit_test(n, mx, my) == HIT_CLIENT)
             pane_push_mouse(n, me);
@@ -3491,26 +4255,15 @@ static void handle_mouse(const struct mouse_event *me) {
             return;                          // modal: nothing else sees this
         }
 
-        // The start menu is modal for the pointer: a click inside picks a
-        // program, a click anywhere else dismisses it.
+        // The start menu is modal for the pointer: a press inside arms what
+        // it is on (it fires on release, over the same thing), a press
+        // anywhere else dismisses it.
         if (start_open && !on_taskbar) {
-            int sx, sy, sw, sh;
-            start_geom(&sx, &sy, &sw, &sh);
-            if (mx >= sx && mx < sx + sw && my >= sy && my < sy + sh) {
-                int rh = sm_row_h();
-                int list_y = sy + 12 + (int)GH + 14;
-                int list_h = sh - (list_y - sy) - ((int)GH + 30);
-                if (my >= list_y && my < list_y + list_h) {
-                    int r = (my - list_y) / rh;
-                    if (start_nth(start_top + r) >= 0) {
-                        start_sel = start_top + r;
-                        push_binding(WMB_LAUNCH);
-                    }
-                }
-                return;
-            }
-            start_open = 0;
-            wp_dirty = 1;
+            int key = sm_key_at(mx, my);
+            if (key < 0) { start_close(); return; }
+            press_key = key;
+            press_win = -3;
+            menu_dirty = 1;
             return;
         }
 
@@ -3597,6 +4350,12 @@ static void handle_mouse(const struct mouse_event *me) {
         if (press_hit == HIT_CLIENT && press_win >= 0 && nodes[press_win].used) {
             pane_push_mouse(press_win, me);
             press_win = -1; press_hit = HIT_NONE;
+            return;
+        }
+        if (press_win == -3) {
+            if (start_open && sm_key_at(mx, my) == was_key) start_click(was_key);
+            press_win = -1;
+            menu_dirty = 1;
             return;
         }
         if (press_win == -2) {
@@ -3761,48 +4520,32 @@ void wm_route_input(void) {
         }
 
         // Ctrl+Esc opens the start menu, as it has on every Windows since 3.1.
-        if (ev.code == KEY_ESC && ctrl) {
-            start_open = !start_open;
-            if (start_open) { start_build(); start_sel = 0; start_top = 0; }
-            start_qlen = 0;
-            start_q[0] = 0;
-            wp_dirty = 1;
-            dirty = 1;
-            continue;
-        }
+        // Opening reads /bin from the disk, so it waits for wm_poll.
+        if (ev.code == KEY_ESC && ctrl) { push_binding(WMB_START); continue; }
 
         // While the menu is up it owns the keyboard: no program should
-        // receive the letters someone is typing into a search box.
-        //
-        // Every key that reaches the menu changes what it shows -- a narrower
-        // list, a moved highlight -- and the panel is translucent, painted
-        // over whatever is behind it. Redrawing it without rebuilding the
-        // background first leaves the previous rows showing through the new
-        // ones. That was always true; it used to hide because the desktop
-        // repainted constantly and each pass darkened the leftovers a little
-        // more. Now that a frame only redraws what changed, the leftovers
-        // simply stay, so the menu has to ask for its background back.
+        // receive the letters someone is typing into a search box. Each key
+        // changes only the menu, which redraws over the desktop it saved.
         if (start_open) {
-            wp_dirty = 1;
             if (ev.code == KEY_ESC) {
-                start_open = 0; wp_dirty = 1; dirty = 1;
+                if (sm_power_open) { sm_power_open = 0; menu_dirty = 1; dirty = 1; }
+                else push_binding(WMB_START);
             } else if (ev.code == KEY_ENTER) {
                 push_binding(WMB_LAUNCH);
             } else if (ev.code == KEY_UP) {
-                if (start_sel > 0) start_sel--;
-                dirty = 1;
+                sm_step(-1); sm_scroll_to_sel(); menu_dirty = 1; dirty = 1;
             } else if (ev.code == KEY_DOWN) {
-                start_sel++; dirty = 1;
+                sm_step(1); sm_scroll_to_sel(); menu_dirty = 1; dirty = 1;
             } else if (ev.code == KEY_BKSP) {
                 if (start_qlen) start_q[--start_qlen] = 0;
-                start_sel = 0; start_top = 0; dirty = 1;
+                start_requery();
             } else if (ev.code == KEY_CHAR && (unsigned char)ev.ascii >= 32 &&
                        (unsigned char)ev.ascii < 127) {
                 if (start_qlen < (int)sizeof start_q - 1) {
                     start_q[start_qlen++] = ev.ascii;
                     start_q[start_qlen] = 0;
                 }
-                start_sel = 0; start_top = 0; dirty = 1;
+                start_requery();
             }
             continue;
         }
@@ -3915,16 +4658,14 @@ static void do_binding(int b) {
             theme = (theme + 1) % NTHEMES;
             relayout(); refresh_leaves(); dirty = 1; break;
         case WMB_LAUNCH: {
-            int it = start_nth(start_sel);
-            start_open = 0;
-            start_qlen = 0;
-            start_q[0] = 0;
-            wp_dirty = 1;
-            if (it >= 0) new_window_run(start_items[it].path, 0);
-            refresh_leaves();
-            dirty = 1;
+            if (!start_open) break;
+            int it = (start_sel >= 0 && start_sel < sm_nrows) ? sm_rows[start_sel].item : -1;
+            if (it >= 0) start_run(start_items[it].path, 0);
             break;
         }
+        case WMB_START:
+            start_toggle();
+            break;
         case WMB_PROFILE: {
             static int on;
             on = !on;

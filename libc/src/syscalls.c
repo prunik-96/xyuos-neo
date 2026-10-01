@@ -220,6 +220,9 @@ int  audio_present(void) { return (int)xyuos_syscall3(SYS_AUDIO, AU_INFO, 0, 0);
 int  audio_pending(void) { return (int)xyuos_syscall3(SYS_AUDIO, AU_QUEUED, 0, 0); }
 void audio_flush(void)   { xyuos_syscall3(SYS_AUDIO, AU_STOP, 0, 0); }
 int  audio_volume(int pct) { return (int)xyuos_syscall3(SYS_AUDIO, AU_VOLUME, pct, 0); }
+void audio_title(const char *title) {
+    xyuos_syscall3(SYS_AUDIO, AU_TITLE, (long)title, 0);
+}
 
 int audio_play(const short *frames, int nframes) {
     return (int)xyuos_syscall3(SYS_AUDIO, AU_WRITE, (long)frames, nframes);

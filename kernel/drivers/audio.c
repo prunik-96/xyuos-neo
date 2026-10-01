@@ -377,6 +377,20 @@ void audio_set_volume(int pct) {
     volume = pct < 0 ? 0 : (pct > 100 ? 100 : pct);
 }
 
+static char now_title[AUDIO_TITLE_MAX];
+
+void audio_set_title(const char *t) {
+    int i = 0;
+    while (t && t[i] && i < AUDIO_TITLE_MAX - 1) { now_title[i] = t[i]; i++; }
+    now_title[i] = 0;
+}
+
+// Only while something is actually coming out: a player that was killed
+// never got to say it stopped, but its sound runs dry all the same.
+const char *audio_title(void) {
+    return audio_queued() > 0 ? now_title : "";
+}
+
 int audio_init(void) {
     pci_device_t dev;
     if (!pci_find_class(0x04, 0x03, 0x00, &dev)) {

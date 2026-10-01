@@ -73,6 +73,7 @@ struct winspawn {
 #define AU_QUEUED 2
 #define AU_STOP   3
 #define AU_VOLUME 4
+#define AU_TITLE  5
 
 /* Mirrors struct msgbox_req in the kernel's syscall.h. */
 struct msgbox_req {

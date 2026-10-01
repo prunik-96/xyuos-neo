@@ -262,6 +262,10 @@ static int src_open(const char *p) {
     if (ok) {
         played_frames = 0;
         snprintf(path, sizeof path, "%s", p);
+        /* The desktop's music tile shows the file's name. */
+        const char *base = p;
+        for (const char *q = p; *q; q++) if (*q == '/') base = q + 1;
+        audio_title(base);
     }
     return ok;
 }
@@ -562,6 +566,7 @@ int main(int argc, char **argv) {
     }
 
     audio_flush();
+    audio_title(0);
     src_close();
     gui_close(&g);
     return 0;

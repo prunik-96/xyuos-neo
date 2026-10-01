@@ -36,6 +36,13 @@ void audio_stop(void);
 void audio_set_volume(int pct);
 int  audio_volume(void);
 
+// What is playing, as the player names it, for the desktop to show. Empty
+// when nothing is; a player that dies without clearing it is caught by
+// audio_title() going quiet once the queue has drained.
+#define AUDIO_TITLE_MAX 64
+void audio_set_title(const char *t);
+const char *audio_title(void);
+
 // --- system sounds ---------------------------------------------------------
 // Played for the message-box kinds in wm.h (MB_ERROR / MB_WARN / MB_INFO).
 // Synthesised, not loaded from disk: a sound the system needs in order to

@@ -707,6 +707,22 @@ static uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 if ((int64_t)a2 >= 0) audio_set_volume((int)a2);
                 return (uint64_t)audio_volume();
             }
+            if (a1 == AU_TITLE) {
+                // A string of unknown length in the caller's memory: taken a
+                // byte at a time, each one checked, up to the length kept.
+                char t[AUDIO_TITLE_MAX];
+                int n = 0;
+                if (a2) {
+                    while (n < AUDIO_TITLE_MAX - 1 && vmm_user_range_ok(a2 + (uint64_t)n, 1)) {
+                        char c = ((const char *)(uintptr_t)a2)[n];
+                        if (!c) break;
+                        t[n++] = c;
+                    }
+                }
+                t[n] = 0;
+                audio_set_title(t);
+                return 0;
+            }
             if (a1 == AU_WRITE) {
                 if (!vmm_user_range_ok(a2, a3 * 2 * AUDIO_CH)) return (uint64_t)-1;
                 return (uint64_t)(int64_t)audio_write((const int16_t *)(uintptr_t)a2,

@@ -142,6 +142,7 @@ struct ui_palette {
 #define AU_QUEUED 2       // -> frames still waiting to be played
 #define AU_STOP   3
 #define AU_VOLUME 4       // a2 = 0..100, or -1 to just read it back
+#define AU_TITLE  5       // a2 = what is playing (a string), or 0: nothing
 
 #define PC_KILL   0
 #define PC_STOP   1

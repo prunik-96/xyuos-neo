@@ -136,6 +136,8 @@ int  audio_play(const short *frames, int nframes);
 int  audio_pending(void);
 void audio_flush(void);
 int  audio_volume(int pct);          /* pct < 0 just reads it back */
+/* Say what is playing, for the desktop to show (NULL: nothing). */
+void audio_title(const char *title);
 
 /* Run a program in a NEW desktop window, with an optional single argument.
  * Returns the child's pid, or -1.
