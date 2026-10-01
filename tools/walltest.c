@@ -25,6 +25,7 @@ uint32_t fb_get_height(void) { return 0; }
 void fb_mark_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
     (void)x; (void)y; (void)w; (void)h;
 }
+const uint32_t *icon_get(const char *name, int size) { (void)name; (void)size; return 0; }
 
 #include "../kernel/wm/ui.c"
 #include "../kernel/wm/wall.c"

@@ -2,18 +2,41 @@
 
 #include "ui.h"
 #include "../drivers/framebuffer.h"
+#include "../gfx/icons.h"
 #include "../mm/heap.h"
 
 static int cx0, cy0, cx1, cy1, clip_ok;
 
+// Where drawing goes: the screen's back buffer, or a picture in memory.
+static uint32_t *tg_px;              // 0: the screen
+static int tg_w, tg_h;
+
+static int target_w(void) { return tg_px ? tg_w : (int)fb_get_width(); }
+static int target_h(void) { return tg_px ? tg_h : (int)fb_get_height(); }
+
+void ui_target(uint32_t *px, int w, int h) {
+    tg_px = px; tg_w = w; tg_h = h;
+    ui_noclip();
+}
+
+void ui_target_screen(void) {
+    tg_px = 0;
+    ui_noclip();
+}
+
+// Only what lands on the screen has to be reported to it.
+static inline void mark(int x, int y, int w, int h) {
+    if (!tg_px) fb_mark_rect((uint32_t)x, (uint32_t)y, (uint32_t)w, (uint32_t)h);
+}
+
 void ui_noclip(void) {
     cx0 = 0; cy0 = 0;
-    cx1 = (int)fb_get_width(); cy1 = (int)fb_get_height();
+    cx1 = target_w(); cy1 = target_h();
     clip_ok = 1;
 }
 
 void ui_clip(int x, int y, int w, int h) {
-    int W = (int)fb_get_width(), H = (int)fb_get_height();
+    int W = target_w(), H = target_h();
     cx0 = x < 0 ? 0 : x;
     cy0 = y < 0 ? 0 : y;
     cx1 = x + w > W ? W : x + w;
@@ -47,6 +70,7 @@ static int cut(int *x, int *y, int *w, int *h) {
 }
 
 static inline uint32_t *row_at(int y) {
+    if (tg_px) return tg_px + (uint64_t)y * tg_w;
     return (uint32_t *)(fb_get_base() + (uint64_t)y * fb_get_pitch());
 }
 
@@ -62,7 +86,7 @@ void ui_fill(int x, int y, int w, int h, uint32_t rgb) {
         uint32_t *d = row_at(y + j) + x;
         for (int i = 0; i < w; i++) d[i] = rgb;
     }
-    fb_mark_rect((uint32_t)x, (uint32_t)y, (uint32_t)w, (uint32_t)h);
+    mark(x, y, w, h);
 }
 
 void ui_blend(int x, int y, int w, int h, uint32_t rgb, int alpha) {
@@ -74,7 +98,7 @@ void ui_blend(int x, int y, int w, int h, uint32_t rgb, int alpha) {
         uint32_t *d = row_at(y + j) + x;
         for (int i = 0; i < w; i++) d[i] = ui_mix(d[i], rgb, t);
     }
-    fb_mark_rect((uint32_t)x, (uint32_t)y, (uint32_t)w, (uint32_t)h);
+    mark(x, y, w, h);
 }
 
 // --- corners -----------------------------------------------------------------
@@ -224,7 +248,7 @@ static void rr_fill(int x, int y, int w, int h, int rt, int rb, int corners,
             d[px] = over(d[px], c, (uint32_t)aa);
         }
     }
-    fb_mark_rect((uint32_t)vx, (uint32_t)vy, (uint32_t)vw, (uint32_t)vh);
+    mark(vx, vy, vw, vh);
 }
 
 void ui_rrect(int x, int y, int w, int h, int r, int corners, const ui_mat *m) {
@@ -266,7 +290,7 @@ static void rr_line(int x, int y, int w, int h, int rt, int rb, int corners,
             d[px] = over(d[px], rgb, (uint32_t)(c * alpha / 255));
         }
     }
-    fb_mark_rect((uint32_t)vx, (uint32_t)vy, (uint32_t)vw, (uint32_t)vh);
+    mark(vx, vy, vw, vh);
 }
 
 void ui_rrect_line(int x, int y, int w, int h, int r, int corners,
@@ -365,7 +389,7 @@ void ui_shadow(int x, int y, int w, int h, int r, int size, int alpha, int dy,
             d[px] = ui_mix(d[px], 0, a + (a >> 7));
         }
     }
-    fb_mark_rect((uint32_t)vx, (uint32_t)vy, (uint32_t)vw, (uint32_t)vh);
+    mark(vx, vy, vw, vh);
     ui_clip_set(saved);
 }
 
@@ -373,8 +397,11 @@ void ui_shadow(int x, int y, int w, int h, int r, int size, int alpha, int dy,
 
 static void fb_target(rast_target *t) {
     if (!clip_ok) ui_noclip();
-    rast_target_init(t, (uint32_t *)fb_get_base(), (int)fb_get_width(), (int)fb_get_height(),
-                     (int)(fb_get_pitch() / 4), RAST_XRGB);
+    if (tg_px)
+        rast_target_init(t, tg_px, tg_w, tg_h, tg_w, RAST_XRGB);
+    else
+        rast_target_init(t, (uint32_t *)fb_get_base(), (int)fb_get_width(),
+                         (int)fb_get_height(), (int)(fb_get_pitch() / 4), RAST_XRGB);
     t->cx0 = cx0; t->cy0 = cy0; t->cx1 = cx1; t->cy1 = cy1;
 }
 
@@ -384,7 +411,7 @@ static void mark_path(const rast_path *p, rast_fx grow) {
     int x = (int)((b[0] - grow) >> 16) - 1, y = (int)((b[1] - grow) >> 16) - 1;
     int w = (int)((b[2] + grow) >> 16) + 2 - x, h = (int)((b[3] + grow) >> 16) + 2 - y;
     if (cut(&x, &y, &w, &h))
-        fb_mark_rect((uint32_t)x, (uint32_t)y, (uint32_t)w, (uint32_t)h);
+        mark(x, y, w, h);
 }
 
 void ui_rast_fill(const rast_path *p, const rast_paint *paint) {
@@ -432,7 +459,26 @@ void ui_image(int x, int y, const uint32_t *px, int w, int h, int alpha) {
             d[qx] = (rb & 0xFF00FF) | (g & 0xFF00);
         }
     }
-    fb_mark_rect((uint32_t)vx, (uint32_t)vy, (uint32_t)vw, (uint32_t)vh);
+    mark(vx, vy, vw, vh);
+}
+
+// An icon from the icon set: straight (not premultiplied) alpha. 0 if the
+// set has no such icon at that size, so the caller can draw something else.
+int ui_icon(int x, int y, const char *name, int size) {
+    const uint32_t *src = icon_get(name, size);
+    if (!src) return 0;
+    int vx = x, vy = y, vw = size, vh = size;
+    if (!cut(&vx, &vy, &vw, &vh)) return 1;
+    for (int py = vy; py < vy + vh; py++) {
+        uint32_t *d = row_at(py);
+        const uint32_t *s = src + (py - y) * size;
+        for (int px = vx; px < vx + vw; px++) {
+            uint32_t c = s[px - x], a = c >> 24;
+            if (a) d[px] = over(d[px], c, a);
+        }
+    }
+    mark(vx, vy, vw, vh);
+    return 1;
 }
 
 // --- text ------------------------------------------------------------------------------
@@ -496,7 +542,7 @@ static void put_glyph(int pen, int base, const struct ui_face *F,
             d[px] = over(d[px], rgb, c);
         }
     }
-    fb_mark_rect((uint32_t)vx, (uint32_t)vy, (uint32_t)vw, (uint32_t)vh);
+    mark(vx, vy, vw, vh);
 }
 
 static int text_run(int x, int y, const char *s, int nbytes, int face,
@@ -614,7 +660,7 @@ int ui_text_glow(int x, int y, const char *s, int face, uint32_t rgb,
                 if (a) d[px] = over(d[px], glow, a);
             }
         }
-        fb_mark_rect((uint32_t)vx, (uint32_t)vy, (uint32_t)vw, (uint32_t)vh);
+        mark(vx, vy, vw, vh);
     }
     return ui_text(x, y, s, face, rgb);
 }

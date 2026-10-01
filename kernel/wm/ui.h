@@ -23,6 +23,14 @@ static inline uint32_t ui_mix(uint32_t a, uint32_t b, int t) {
     return rb | g;
 }
 
+/* --- where it goes ------------------------------------------------------------
+ *
+ * Normally the screen's back buffer. ui_target points everything at a
+ * picture in memory instead (w x h, rows packed), until ui_target_screen.
+ * Both reset the clip to the whole of the new target. */
+void ui_target(uint32_t *px, int w, int h);
+void ui_target_screen(void);
+
 /* --- clipping --------------------------------------------------------------- */
 
 void ui_clip(int x, int y, int w, int h);   /* intersect with the screen */
@@ -92,6 +100,10 @@ void ui_set_backdrop(const uint32_t *px, int w, int h);
  *
  * 0xAARRGGBB, premultiplied, w x h, drawn at `alpha` (255: as they are). */
 void ui_image(int x, int y, const uint32_t *px, int w, int h, int alpha);
+
+/* An icon of the icon set (gfx/icons.h) at one of its sizes; 0 if there is
+ * none, for the caller to draw something of its own. */
+int  ui_icon(int x, int y, const char *name, int size);
 
 /* --- text ------------------------------------------------------------------------
  *
