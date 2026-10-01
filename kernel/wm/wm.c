@@ -19,6 +19,7 @@
 #include "../net/net.h"
 #include "ui.h"
 #include "wall.h"
+#include "cursor.h"
 
 static inline uint64_t rdtsc(void) {
     uint32_t lo, hi;
@@ -1692,32 +1693,6 @@ static int sample_stats(void) {
 // when they match; fb_present() then pushes only the scanlines that really
 // changed. An idle desktop therefore costs a few tens of microseconds instead
 // of repainting eight megabytes.
-// The pointer, drawn last so it floats over every window. A classic arrow:
-// each row is a run of solid pixels with a one-pixel outline, scaled up a
-// little so it is visible on a 1080p panel.
-#define CUR_W 12
-#define CUR_H 19
-static const char *cursor_bits[CUR_H] = {
-    "X           ",
-    "XX          ",
-    "X.X         ",
-    "X..X        ",
-    "X...X       ",
-    "X....X      ",
-    "X.....X     ",
-    "X......X    ",
-    "X.......X   ",
-    "X........X  ",
-    "X.........X ",
-    "X......XXXXX",
-    "X...X..X    ",
-    "X..X X..X   ",
-    "X.X  X..X   ",
-    "XX    X..X  ",
-    "X     X..X  ",
-    "       X..X ",
-    "       XXXX ",
-};
 
 // Where a dragged window would land: a tinted pane with an accent outline,
 // the same affordance Windows shows when you shove a window at an edge.
@@ -3214,25 +3189,48 @@ static void draw_alttab(void) {
 // this at the start of the next frame is what keeps a moving pointer from
 // smearing a trail -- and it costs a couple of hundred pixels instead of the
 // full-screen repaint that treating the cursor as "damage" would force.
-static uint32_t cursor_save[CUR_W * CUR_H];
-static int cur_saved_x = -1, cur_saved_y = -1;
+static uint32_t cursor_save[CUR_SZ * CUR_SZ];
+static int cur_saved = 0, cur_saved_x, cur_saved_y;
+
+// A program on its way up: from the moment it is launched until it puts
+// its first picture in its window -- or a few seconds, whichever is first
+// -- the pointer carries a spinning ring, as Windows' "working in the
+// background" pointer does.
+#define BUSY_MS 5000
+static uint64_t busy_until;
+static int busy_pane = -1;
+
+static int busy_active(void) { return busy_until && now_ms() < busy_until; }
+
+static void busy_start(int pane) {
+    busy_pane = pane;
+    busy_until = now_ms() + BUSY_MS;
+}
+
+static void busy_end(int pane) {
+    if (pane == busy_pane || pane < 0) { busy_until = 0; busy_pane = -1; }
+}
+
+static int cursor_pick(int mx, int my);      // which picture, by what is under it
 
 static void cursor_restore(void) {
-    if (cur_saved_x < 0) return;
+    if (!cur_saved) return;
     volatile uint8_t *base = fb_get_base();
-    uint32_t pitch = fb_get_pitch(), fw = fb_get_width(), fh = fb_get_height();
-    for (int r = 0; r < CUR_H; r++) {
-        uint32_t py = (uint32_t)(cur_saved_y + r);
-        if (py >= fh) break;
-        volatile uint32_t *drow = (volatile uint32_t *)(base + (size_t)py * pitch);
-        for (int c = 0; c < CUR_W; c++) {
-            uint32_t px = (uint32_t)(cur_saved_x + c);
-            if (px >= fw) break;
-            drow[px] = cursor_save[r * CUR_W + c];
+    int fw = (int)fb_get_width(), fh = (int)fb_get_height();
+    uint32_t pitch = fb_get_pitch();
+    for (int r = 0; r < CUR_SZ; r++) {
+        int py = cur_saved_y + r;
+        if (py < 0 || py >= fh) continue;
+        uint32_t *drow = (uint32_t *)(base + (size_t)py * pitch);
+        for (int c = 0; c < CUR_SZ; c++) {
+            int px = cur_saved_x + c;
+            if (px < 0 || px >= fw) continue;
+            drow[px] = cursor_save[r * CUR_SZ + c];
         }
     }
-    fb_mark_rect((uint32_t)cur_saved_x, (uint32_t)cur_saved_y, CUR_W, CUR_H);
-    cur_saved_x = -1;
+    int x = cur_saved_x < 0 ? 0 : cur_saved_x, y = cur_saved_y < 0 ? 0 : cur_saved_y;
+    fb_mark_rect((uint32_t)x, (uint32_t)y, CUR_SZ, CUR_SZ);
+    cur_saved = 0;
 }
 
 static void cursor_draw(void) {
@@ -3240,26 +3238,36 @@ static void cursor_draw(void) {
     int32_t mx, my;
     mouse_position(&mx, &my);
 
-    volatile uint8_t *base = fb_get_base();
-    uint32_t pitch = fb_get_pitch(), fw = fb_get_width(), fh = fb_get_height();
+    int hx = 0, hy = 0;
+    const uint32_t *img = cursor_image(cursor_pick(mx, my), (int)(now_ms() / 60), &hx, &hy);
+    if (!img) return;
+    int ox = mx - hx, oy = my - hy;
 
-    for (int r = 0; r < CUR_H; r++) {
-        uint32_t py = (uint32_t)(my + r);
-        if (py >= fh) break;
-        volatile uint32_t *drow = (volatile uint32_t *)(base + (size_t)py * pitch);
-        const char *row = cursor_bits[r];
-        for (int c = 0; c < CUR_W; c++) {
-            uint32_t px = (uint32_t)(mx + c);
-            if (px >= fw) break;
-            cursor_save[r * CUR_W + c] = drow[px];       // remember, then stamp
-            char b = row[c];
-            if (b == 'X')      drow[px] = 0x00000000;    // outline
-            else if (b == '.') drow[px] = 0x00FFFFFF;    // fill
+    volatile uint8_t *base = fb_get_base();
+    int fw = (int)fb_get_width(), fh = (int)fb_get_height();
+    uint32_t pitch = fb_get_pitch();
+    for (int r = 0; r < CUR_SZ; r++) {
+        int py = oy + r;
+        if (py < 0 || py >= fh) continue;
+        uint32_t *drow = (uint32_t *)(base + (size_t)py * pitch);
+        for (int c = 0; c < CUR_SZ; c++) {
+            int px = ox + c;
+            if (px < 0 || px >= fw) continue;
+            uint32_t d = drow[px];
+            cursor_save[r * CUR_SZ + c] = d;             // remember, then stamp
+            uint32_t s = img[r * CUR_SZ + c], a = s >> 24;
+            if (!a) continue;
+            uint32_t ia = 256 - (a + (a >> 7));
+            uint32_t rb = (((d & 0xFF00FF) * ia >> 8) & 0xFF00FF) + (s & 0xFF00FF);
+            uint32_t g  = (((d & 0x00FF00) * ia >> 8) & 0x00FF00) + (s & 0x00FF00);
+            drow[px] = (rb & 0xFF00FF) | (g & 0xFF00);
         }
     }
-    fb_mark_rect((uint32_t)mx, (uint32_t)my, CUR_W, CUR_H);
-    cur_saved_x = mx;
-    cur_saved_y = my;
+    int x = ox < 0 ? 0 : ox, y = oy < 0 ? 0 : oy;
+    fb_mark_rect((uint32_t)x, (uint32_t)y, CUR_SZ, CUR_SZ);
+    cur_saved = 1;
+    cur_saved_x = ox;
+    cur_saved_y = oy;
 }
 
 // --- outline drag ----------------------------------------------------------
@@ -3999,7 +4007,7 @@ static int new_window_run(const char *path, const char *arg) {
     pane_init(&panes[pi], icols(nd->w), irows(nd->h));
     layout_window(n);
     wp_dirty = 1;
-    if (path) { panes[pi].app_pane = 1; spawn_prog_in(pi, path, arg); }
+    if (path) { panes[pi].app_pane = 1; spawn_prog_in(pi, path, arg); busy_start(pi); }
     else      { panes[pi].app_pane = 0; spawn_shell_in(pi); }
     anim_appear(AN_OPEN, n);
     return panes[pi].owner_pid;
@@ -4234,6 +4242,30 @@ static int drag_gx, drag_gy;                 // where the grab started
 static uint32_t drag_ox, drag_oy, drag_ow, drag_oh;   // geometry at grab time
 static int press_hit = HIT_NONE, press_win = -1;      // for click-on-release
 
+// The pointer for a resize handle: which way the edge or corner moves.
+static int edge_cursor(int edge) {
+    int l = edge & HIT_L, r = edge & HIT_R, t = edge & HIT_T, b = edge & HIT_B;
+    if ((l && t) || (r && b)) return CUR_NWSE;
+    if ((r && t) || (l && b)) return CUR_NESW;
+    if (l || r) return CUR_EW;
+    return CUR_NS;
+}
+
+static int cursor_pick(int mx, int my) {
+    if (busy_active()) return CUR_APPSTART;
+    if (drag_mode == DRAG_RESIZE) return edge_cursor(drag_edge);
+    if (drag_mode != DRAG_NONE || start_open || wm_message_pending() || udrag_active ||
+        peek_on)
+        return CUR_ARROW;
+    if (my >= (int)fb_get_height() - TASKBAR_H) return CUR_ARROW;
+    int n = window_at(mx, my);
+    if (n >= 0) {
+        int h = hit_test(n, mx, my);
+        if (h & 0xF0) return edge_cursor(h);
+    }
+    return CUR_ARROW;
+}
+
 // Switch to workspace `n`, giving it a shell on first visit.
 static void switch_ws(int n) {
     if (n < 0 || n >= MAX_WS || n == cur_ws) return;
@@ -4443,6 +4475,7 @@ int wm_pane_blit(struct pane *p, const uint32_t *src, int w, int h) {
     }
     p->gfx_on = 1;
     gfx_gen[p - panes]++;
+    busy_end((int)(p - panes));        // it is up: its first picture is here
     {   // Whoever is painting owns the surface for as long as they live.
         process_t *me = process_current();
         p->gfx_pid = me ? me->pid : 0;
@@ -4490,6 +4523,10 @@ static void spawn_shell_in(int pane_idx) {
 void wm_notify_exit(int pid) {
     // A drag belongs to a program that is now gone; nothing will ever drop it.
     if (udrag_active) wm_drag_cancel();
+
+    // A program that ends before drawing anything is not starting any more.
+    for (int i = 0; i < MAX_PANES; i++)
+        if (panes[i].alive && panes[i].owner_pid == pid) busy_end(i);
 
     // A graphics program does not have to OWN a pane -- one started from the
     // shell is a child, and the pane still belongs to the shell. Its last
@@ -5344,6 +5381,16 @@ void wm_poll(void) {
     // A glow still fading in or out wants its next step drawn.
     if (hover_animating()) dirty = 1;
     if (anim.active) dirty = 1;                 // the next step of a window's way
+    // The spinning pointer turns a step every 60 ms, and turns back into the
+    // arrow when its time is up.
+    {
+        static uint64_t cur_anim_ms;
+        if (busy_until) {
+            uint64_t now = now_ms();
+            if (now >= busy_until) { busy_until = 0; busy_pane = -1; pointer_moved = 1; }
+            else if (now - cur_anim_ms >= 60) { cur_anim_ms = now; pointer_moved = 1; }
+        }
+    }
     // Aero Peek comes on after the pointer has rested on the strip a moment.
     {
         int want = peek_wanted();
@@ -5386,6 +5433,7 @@ void wm_start(void) {
     // The desktop's own face, rasterised while floating point is still ours
     // to use: no program exists yet whose registers it could disturb.
     uifont_init();
+    cursor_init();
     fb_enable_backbuffer();   // flicker-free: draw off-screen, blit per frame
     mouse_init(fb_get_width(), fb_get_height());
     kprintf("wm: double-buffer %s\n", fb_backbuffer_active() ? "ON" : "OFF (direct)");
