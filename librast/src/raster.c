@@ -447,9 +447,21 @@ static int      sortcap;
 static int     *rowstart;
 static int      rowcap;
 
-static int cmp_x(const void *a, const void *b) {
-    int32_t x = ((const rcell *)a)->x, y = ((const rcell *)b)->x;
-    return (x > y) - (x < y);
+/* A row's cells by x. Shell sort rather than qsort: the kernel has no C
+ * library to take qsort from, and a row holds a few hundred cells at most,
+ * already in nearly the right order -- edges are walked left to right as
+ * often as not -- which is the case Shell sort is good at. */
+static void sort_x(rcell *c, int n) {
+    static const int gaps[] = { 701, 301, 132, 57, 23, 10, 4, 1 };
+    for (int g = 0; g < (int)(sizeof gaps / sizeof gaps[0]); g++) {
+        int gap = gaps[g];
+        for (int i = gap; i < n; i++) {
+            rcell v = c[i];
+            int j = i;
+            while (j >= gap && c[j - gap].x > v.x) { c[j] = c[j - gap]; j -= gap; }
+            c[j] = v;
+        }
+    }
 }
 
 static inline int coverage(int32_t v, int rule) {
@@ -511,7 +523,7 @@ static int sweep(const rast_target *t, const painter *P, int rule) {
                 c[j + 1] = v;
             }
         } else {
-            qsort(c + s, (size_t)(e - s), sizeof *c, cmp_x);
+            sort_x(c + s, e - s);
         }
 
         int32_t cover = 0;

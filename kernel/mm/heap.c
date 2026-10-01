@@ -252,3 +252,20 @@ void kfree(void *ptr) {
     coalesce(b);
     spin_unlock_irqrestore(&heap_lock, flags);
 }
+
+// The block already has room more often than not -- an array that grows by
+// a few elements at a time sits in a block rounded up to 16 bytes, and a
+// shrink always fits -- so only a real growth pays for a copy.
+void *krealloc(void *ptr, size_t size) {
+    if (ptr == NULL) return kmalloc(size);
+    if (size == 0) { kfree(ptr); return NULL; }
+    heap_block_t *b = (heap_block_t *)((uint8_t *)ptr - HEADER_SIZE);
+    uint64_t have = b->size;
+    if (have >= size) return ptr;
+    uint8_t *n = (uint8_t *)kmalloc(size);
+    if (n == NULL) return NULL;
+    const uint8_t *o = (const uint8_t *)ptr;
+    for (uint64_t i = 0; i < have; i++) n[i] = o[i];
+    kfree(ptr);
+    return n;
+}

@@ -106,9 +106,20 @@ kernel/gfx/%.o: kernel/gfx/%.c
 %.o: %.S
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(KERNEL): $(OBJ) kernel/arch/x86_64/linker.ld
+# librast once more, for the kernel: the desktop draws its shapes with it.
+# Integer only, so it builds with the kernel's own flags -- it can run inside
+# a system call, where the floating-point registers belong to the program.
+# kernel/include/shim stands in for the C library headers it includes.
+KRAST_OBJS := $(patsubst librast/src/%.c,build/krast/%.o,$(wildcard librast/src/*.c))
+-include $(KRAST_OBJS:.o=.d)
+
+build/krast/%.o: librast/src/%.c
+	mkdir -p build/krast
+	$(CC) $(CFLAGS) -Ikernel/include/shim -Ilibrast/include -Ilibrast/src -c $< -o $@
+
+$(KERNEL): $(OBJ) $(KRAST_OBJS) kernel/arch/x86_64/linker.ld
 	mkdir -p build
-	$(LD) $(LDFLAGS) $(OBJ) -o $@ -lgcc
+	$(LD) $(LDFLAGS) $(OBJ) $(KRAST_OBJS) -o $@ -lgcc
 
 # --- raw-syscall userland programs (test1, ls, cat) ---
 
