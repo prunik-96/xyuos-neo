@@ -738,6 +738,27 @@ static int press_key = -1;                  // what a press armed, until release
 
 static uint64_t now_ms(void) { return pit_get_ticks() * 10; }
 
+// --- a spring ---------------------------------------------------------------------
+//
+// What arrives -- a window opening, a menu coming up, a notice sliding in --
+// moves like a weight on a spring: quickly, a little past where it stops, and
+// back. The curve is a damped spring's (damping 0.65, 22 rad/s), worked out
+// once in 1/256ths at 33 even steps over SPRING_MS; between steps, a line.
+// What leaves does not bounce: it just goes.
+#define SPRING_MS 380
+static const int16_t spring_tab[33] = {
+    0, 8, 28, 55, 86, 118, 148, 176, 201, 222, 238, 251, 261, 267, 271, 273, 273,
+    273, 271, 269, 267, 265, 263, 261, 259, 258, 257, 256, 256, 255, 255, 255, 256,
+};
+
+// Where the spring is `el` ms in: 0 at rest before, 256 at rest after.
+static int spring_at(uint64_t el) {
+    if (el >= SPRING_MS) return 256;
+    int pos = (int)(el * 32 * 256 / SPRING_MS);       // the step, in 1/256ths
+    int i = pos >> 8, f = pos & 255;
+    return spring_tab[i] + (((spring_tab[i + 1] - spring_tab[i]) * f) >> 8);
+}
+
 static int fade_in(uint64_t since) {
     uint64_t t = now_ms() - since;
     return t >= FADE_MS ? 256 : (int)(t * 256 / FADE_MS);
@@ -1803,6 +1824,8 @@ static void draw_gadget(void) {
 
 static int start_open;                 // the launcher (defined further down)
 static int cc_open;                    // the control panel (likewise)
+static uint64_t pop_t0;                // when the open one came up, for its spring
+static int geom_rest;                  // 1: where a popup rests, without the spring
 
 #define ISL_BOTTOM 0
 #define ISL_LEFT   1
@@ -2019,6 +2042,20 @@ static void uk_take(ukeep *k) {
         return;
     }
     for (int i = 0; i < ndmg; i++) uk_copy_in(k, dmg[i][0], dmg[i][1], dmg[i][2], dmg[i][3]);
+}
+
+// Mix what was drawn over the keeper's piece with what it keeps: a = 256 is
+// all the new picture, 0 none of it.
+static void uk_fade(ukeep *k, int a) {
+    if (!k->cap || !k->have || a >= 256) return;
+    volatile uint8_t *base = fb_get_base();
+    uint32_t pitch = fb_get_pitch();
+    for (int y = 0; y < k->h; y++) {
+        uint32_t *d = (uint32_t *)(base + (size_t)(k->y + y) * pitch) + k->x;
+        const uint32_t *s2 = k->px + (size_t)y * k->w;
+        for (int x = 0; x < k->w; x++) d[x] = ui_mix(s2[x], d[x], a);
+    }
+    fb_mark_rect((uint32_t)k->x, (uint32_t)k->y, (uint32_t)k->w, (uint32_t)k->h);
 }
 
 static void uk_restore(ukeep *k) {
@@ -2838,6 +2875,20 @@ static void sm_step(int d) {
 }
 
 // Where the launcher is: by the mark on the island, on its inner side.
+// A popup coming up starts a little short of its place, on the island's side,
+// and springs into it.
+#define POP_TRAVEL 28
+static void pop_shift(int *x, int *y) {
+    if (geom_rest) return;
+    int d = (256 - spring_at(now_ms() - pop_t0)) * POP_TRAVEL / 256;
+    switch (island_edge) {
+    case ISL_LEFT:  *x -= d; break;
+    case ISL_RIGHT: *x += d; break;
+    case ISL_TOP:   *y -= d; break;
+    default:        *y += d; break;
+    }
+}
+
 static void start_geom(int *x, int *y, int *w, int *h) {
     int W = (int)fb_get_width(), H = (int)fb_get_height();
     tb_layout();
@@ -2855,6 +2906,7 @@ static void start_geom(int *x, int *y, int *w, int *h) {
     if (*x + *w > W - 8) *x = W - 8 - *w;
     if (*y < 8) *y = 8;
     if (*y + *h > H - 8) *y = H - 8 - *h;
+    pop_shift(x, y);
 }
 
 // The list's box, in the all-programs and search views.
@@ -3007,10 +3059,14 @@ static ukeep pop_keep;
 static ui_glass pop_glass;
 static int pop_glass_fresh;                 // its memory matches what is under
 
+// What the launcher can reach, wherever the spring has it.
 static void sm_reach(int *rx, int *ry, int *rw, int *rh) {
     int x, y, w, h;
+    geom_rest = 1;
     start_geom(&x, &y, &w, &h);
-    *rx = x - 40; *ry = y - 40; *rw = w + 80; *rh = h + 80;
+    geom_rest = 0;
+    int m = 40 + POP_TRAVEL;
+    *rx = x - m; *ry = y - m; *rw = w + 2 * m; *rh = h + 2 * m;
 }
 
 static void draw_start_menu(void) {
@@ -3213,6 +3269,16 @@ static void cc_geom(int *x, int *y, int *w, int *h) {
     if (*x + *w > W - 8) *x = W - 8 - *w;
     if (*y < 8) *y = 8;
     if (*y + *h > H - 8) *y = H - 8 - *h;
+    pop_shift(x, y);
+}
+
+static void cc_reach(int *rx, int *ry, int *rw, int *rh) {
+    int x, y, w, h;
+    geom_rest = 1;
+    cc_geom(&x, &y, &w, &h);
+    geom_rest = 0;
+    int m = 40 + POP_TRAVEL;
+    *rx = x - m; *ry = y - m; *rw = w + 2 * m; *rh = h + 2 * m;
 }
 
 static void cc_toggle_rect(int i, int *tx, int *ty, int *tw, int *th) {
@@ -3431,10 +3497,12 @@ static int note_alpha(void) {
     return -1;
 }
 
+#define NOTE_SLIDE 48
+
 static int note_animating(void) {
     if (!note_n) return 0;
     uint64_t t = now_ms() - note_t0;
-    return t < NOTE_FADE || t >= NOTE_SHOW;
+    return t < SPRING_MS || t >= NOTE_SHOW;
 }
 
 static void note_next(void) {
@@ -3446,7 +3514,7 @@ static void note_next(void) {
 static void draw_note(void) {
     int x, y, w, h;
     note_geom(&x, &y, &w, &h);
-    int rx = x - 40, ry = y - 30, rw = w + 80, rh = h + 80;
+    int rx = x - 40, ry = y - 30, rw = w + 80 + NOTE_SLIDE, rh = h + 80;
     int a = note_alpha();
     if (a < 0 && note_n) { note_next(); a = note_alpha(); }
     if (a < 0 && !note_drawn) return;
@@ -3458,6 +3526,10 @@ static void draw_note(void) {
     if (a < 0) { note_drawn = 0; dmg_add(rx, ry, rx + rw, ry + rh); return; }
 
     const theme_t *T = TH;
+    {   // Coming in: from a little way out, on the spring.
+        uint64_t nt = now_ms() - note_t0;
+        if (nt < SPRING_MS) x += (256 - spring_at(nt)) * NOTE_SLIDE / 256;
+    }
     ui_shadow(x, y, w, h, 20, 26, 70, 10, 0);
     ui_glass_place(&note_glass, x, y, w, h, 16);
     ui_glass_forget(&note_glass);
@@ -4114,17 +4186,24 @@ static void anim_frame(void) {
     if (!anim.have_b) { grab(anim.b); anim.have_b = 1; }
 
     uint64_t el = now_ms() - anim.t0;
-    int t = el >= ANIM_MS ? 256 : (int)(el * 256 / ANIM_MS);
-    int e = 256 - (((256 - t) * (256 - t)) >> 8);              // ease out
-    int u = (anim.kind == AN_OPEN || anim.kind == AN_RESTORE) ? e : 256 - e;
-    int small = (anim.kind == AN_MIN || anim.kind == AN_RESTORE) ? 70 : 225;
+    int arriving = anim.kind == AN_OPEN || anim.kind == AN_RESTORE;
+    int dur = arriving ? SPRING_MS : ANIM_MS;
+    int t = el >= (uint64_t)dur ? 256 : (int)(el * 256 / (uint64_t)dur);
+    int u, alpha;
+    if (arriving) {
+        u = spring_at(el);                         // a little past full size, and back
+        alpha = el >= 120 ? 256 : (int)(el * 256 / 120);
+    } else {
+        u = 256 - ((t * t) >> 8);                  // away, faster and faster
+        alpha = u;
+    }
+    int small = (anim.kind == AN_MIN || anim.kind == AN_RESTORE) ? 70 : 200;
     int s = small + (256 - small) * u / 256;                   // scale, 256 = 1
     if (s < 8) s = 8;
     int wcx = anim.wx + anim.ww / 2 - anim.x, wcy = anim.wy + anim.wh / 2 - anim.y;
     int cx = anim.tx - anim.x + (wcx - (anim.tx - anim.x)) * u / 256;
     int cy = anim.ty - anim.y + (wcy - (anim.ty - anim.y)) * u / 256;
     int64_t inv = ((int64_t)256 << 16) / s;
-    int alpha = u;
 
     volatile uint8_t *base = fb_get_base();
     uint32_t pitch = fb_get_pitch();
@@ -4165,6 +4244,17 @@ static void anim_frame(void) {
 //
 // The start menu is not on the list: it keeps what it covers (sm_save_under)
 // and redraws over that, so only a change UNDER it costs a full frame.
+// A popup just come up is still fading in over what it covers.
+#define POP_FADE_MS 140
+static void pop_fade(void) {
+    uint64_t el = now_ms() - pop_t0;
+    if (el < POP_FADE_MS) uk_fade(&pop_keep, (int)(el * 256 / POP_FADE_MS));
+}
+
+static int pop_animating(void) {
+    return popup_open() && now_ms() - pop_t0 < SPRING_MS + 20;
+}
+
 static int overlay_needs_repaint(void) {
     return wm_message_pending() || snap_hint != SNAP_NONE || udrag_active ||
            alttab_active;
@@ -4209,6 +4299,7 @@ static void render_all(void) {
             uk_restore(&pop_keep);
             draw_start_menu();
             draw_control();
+            pop_fade();
             dmg_add(pop_keep.x, pop_keep.y, pop_keep.x + pop_keep.w, pop_keep.y + pop_keep.h);
         }
         menu_dirty = 0;
@@ -4236,12 +4327,13 @@ static void render_all(void) {
     if (popup_open()) {
         int rx, ry, rw, rh;
         if (start_open) sm_reach(&rx, &ry, &rw, &rh);
-        else { int x, y, w, h; cc_geom(&x, &y, &w, &h); rx = x - 40; ry = y - 40; rw = w + 80; rh = h + 80; }
+        else cc_reach(&rx, &ry, &rw, &rh);
         uk_place(&pop_keep, rx, ry, rw, rh);
         uk_take(&pop_keep);
         pop_glass_fresh = 0;
         draw_start_menu();
         draw_control();
+        pop_fade();
         dmg_add(rx, ry, rx + rw, ry + rh);
         menu_dirty = 0;
     } else {
@@ -5198,6 +5290,7 @@ static void start_toggle(void) {
     cc_open = 0;
     cc_vol_drag = 0;
     start_open = !start_open;
+    if (start_open) pop_t0 = now_ms();
     start_qlen = 0;
     start_q[0] = 0;
     sm_power_open = 0;
@@ -5309,6 +5402,7 @@ static void taskbar_click(int mx, int my) {
     case TB_STATUS:
         // The clock opens the control panel, and closes it again.
         cc_open = !cc_open;
+        if (cc_open) pop_t0 = now_ms();
         cc_vol_drag = 0;
         pop_glass_fresh = 0;
         wp_dirty = 1;
@@ -6145,6 +6239,11 @@ void wm_poll(void) {
     if (hover_animating()) dirty = 1;
     if (anim.active) dirty = 1;                 // the next step of a window's way
     if (note_animating()) dirty = 1;            // a notice coming or going
+    if (pop_animating()) {                      // a popup springing into place
+        dirty = 1;
+        menu_dirty = 1;
+        pop_glass_fresh = 0;                    // it moved: what is under it is new
+    }
     // The spinning pointer turns a step every 60 ms, and turns back into the
     // arrow when its time is up.
     {
