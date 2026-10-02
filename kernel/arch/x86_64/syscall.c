@@ -12,7 +12,8 @@
 #include "../../drivers/power.h"
 #include "../../drivers/rtc.h"
 #include "smp.h"
-#include "../../fs/fat32.h"
+#include "../../fs/vol.h"
+#include "../../fs/fatfs.h"
 #include "../../wm/wm.h"
 #include "../../net/net.h"
 #include "../../net/nic.h"
@@ -22,18 +23,31 @@
 #include "../../drivers/audio.h"
 #include "../../drivers/mouse.h"
 
-// SYS_USBFS list: copy each FAT32 directory entry into the user's array.
+// SYS_USBFS, the first drive's files as the old interface saw them: paths
+// from that drive's root, names cut to what struct usb_ent holds.
 struct usbfs_fill { struct usb_ent *arr; unsigned int max, n; };
-static void usbfs_list_cb(const struct fat_dirent *e, void *v) {
+static void usbfs_list_cb(const char *name, int is_dir, uint64_t size, int64_t mtime, void *v) {
+    (void)mtime;
     struct usbfs_fill *fc = (struct usbfs_fill *)v;
     if (fc->n >= fc->max) return;
     struct usb_ent *o = &fc->arr[fc->n];
     int i = 0;
-    for (; i < 15 && e->name[i]; i++) o->name[i] = e->name[i];
+    for (; i < 15 && name[i]; i++) o->name[i] = name[i];
     o->name[i] = 0;
-    o->size = e->size;
-    o->is_dir = e->is_dir;
+    o->size = (unsigned int)size;
+    o->is_dir = is_dir;
     fc->n++;
+}
+
+// "/usb" + a path on the first drive.
+static int usbfs_path(const char *p, char *out, int max) {
+    const char *pre = "/usb";
+    int k = 0;
+    while (pre[k]) { out[k] = pre[k]; k++; }
+    if (p[0] != '/') out[k++] = '/';
+    for (int i = 0; p[i]; i++) { if (k >= max - 1) return 0; out[k++] = p[i]; }
+    out[k] = 0;
+    return 1;
 }
 #include <stdint.h>
 
@@ -467,24 +481,33 @@ static uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
             if (!vmm_user_range_ok(a1, sizeof(struct usbfs_req))) return (uint64_t)-1;
             struct usbfs_req *rq = (struct usbfs_req *)(uintptr_t)a1;
             rq->result = -1;
-            if (rq->op == USBFS_MOUNT) { rq->result = fat32_automount(); return 0; }
-            if (!fat32_mounted()) return 0;
+            struct vol *uv = vol_get(0);
+            int usable = uv && (vol_type(0) == VOL_FAT || vol_type(0) == VOL_EXFAT);
+            if (rq->op == USBFS_MOUNT) { rq->result = usable; return 0; }
+            if (!usable) return 0;
             if (!vmm_user_range_ok((uint64_t)(uintptr_t)rq->path, 1)) return (uint64_t)-1;
+            static char up[300];
+            if (!usbfs_path(rq->path, up, sizeof up)) return 0;
             if (rq->op == USBFS_LIST) {
                 if (!vmm_user_range_ok((uint64_t)(uintptr_t)rq->buf,
                                        (uint64_t)rq->len * sizeof(struct usb_ent)))
                     return (uint64_t)-1;
                 struct usbfs_fill fc = { (struct usb_ent *)rq->buf, rq->len, 0 };
-                fat32_list(rq->path, usbfs_list_cb, &fc);
-                rq->result = (int)fc.n;
+                const char *rest;
+                if (vol_of_path(up, &rest) == 0 && fatfs_list(uv, rest, usbfs_list_cb, &fc))
+                    rq->result = (int)fc.n;
             } else if (rq->op == USBFS_READ) {
                 if (!vmm_user_range_ok((uint64_t)(uintptr_t)rq->buf, rq->len))
                     return (uint64_t)-1;
-                rq->result = (int)fat32_read(rq->path, 0, rq->buf, rq->len);
+                int fd = vfs_open(up);
+                if (fd >= 0) { rq->result = vfs_read(fd, rq->buf, rq->len); vfs_close(fd); }
             } else if (rq->op == USBFS_WRITE) {
                 if (!vmm_user_range_ok((uint64_t)(uintptr_t)rq->buf, rq->len))
                     return (uint64_t)-1;
-                rq->result = (int)fat32_write(rq->path, rq->buf, rq->len);
+                if (vfs_create(up) == 0 && vfs_truncate(up, 0) == 0) {
+                    int fd = vfs_open(up);
+                    if (fd >= 0) { rq->result = vfs_write(fd, rq->buf, rq->len); vfs_close(fd); }
+                }
             }
             return 0;
         }

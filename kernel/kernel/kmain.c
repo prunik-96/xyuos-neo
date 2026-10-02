@@ -24,7 +24,6 @@
 #include "../drivers/xhci.h"
 #include "../drivers/virtio_gpu.h"
 #include "../drivers/power.h"
-#include "../fs/fat32.h"
 #include "../wm/wm.h"
 #include "../wm/splash.h"
 #include "../gfx/font.h"

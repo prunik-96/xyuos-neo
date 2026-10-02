@@ -11,7 +11,7 @@
 #include "../mm/pmm.h"
 #include "../arch/x86_64/smp.h"
 #include "../fs/vfs.h"
-#include "../fs/fat32.h"
+#include "../fs/vol.h"
 #include "../kernel/kio.h"
 #include "../drivers/mouse.h"
 #include "../drivers/audio.h"
@@ -1867,7 +1867,7 @@ static void gen_wallpaper(uint32_t w, uint32_t h) {
     // reaching for /usb here would auto-mount it during the very first repaint
     // and put SCSI traffic in every boot, which the lazy mount exists to avoid.
     if (!load_wallpaper_file("/wall.ppm", w, h) &&
-        !(fat32_mounted() && load_wallpaper_file("/usb/wall.ppm", w, h)))
+        !(vol_get(0) && load_wallpaper_file("/usb/wall.ppm", w, h)))
         wall_soft(wallpaper, (int)w, (int)h, wall_style);
     theme_wear(ui_accent_from(wallpaper, (int)w, (int)h));
 
