@@ -843,9 +843,20 @@ static void go_up(void) {
 typedef struct {
     char s[256];
     int cur;           /* byte offset */
-    int all;           /* everything is selected: typing replaces it */
+    int all;           /* the start is selected: typing replaces it ... */
+    int sel_end;       /* ... up to here (0: all of it) -- a name without its extension */
     int active;
 } ed_t;
+
+/* Drop what is selected; the caret where it was. */
+static void ed_cut_sel(ed_t *e) {
+    int n = (int)strlen(e->s);
+    int end = e->sel_end > 0 && e->sel_end < n ? e->sel_end : n;
+    memmove(e->s, e->s + end, (size_t)(n - end + 1));
+    e->cur = 0;
+    e->all = 0;
+    e->sel_end = 0;
+}
 
 static int ed_back(const ed_t *e, int at) {
     if (at <= 0) return 0;
@@ -864,7 +875,16 @@ static void ed_set(ed_t *e, const char *s, int select_all) {
     snprintf(e->s, sizeof e->s, "%s", s);
     e->cur = (int)strlen(e->s);
     e->all = select_all;
+    e->sel_end = 0;
     e->active = 1;
+}
+
+/* A file's name to edit: its name selected, its extension left alone, as
+ * Windows does -- typing a new name keeps ".txt". */
+static void ed_set_name(ed_t *e, const char *s) {
+    ed_set(e, s, 1);
+    const char *d = strrchr(e->s, '.');
+    if (d && d != e->s) e->sel_end = (int)(d - e->s);
 }
 /* A key for the line: 1 if it changed the text. Enter and Escape are the
  * caller's. */
@@ -880,7 +900,7 @@ static int ed_key(ed_t *e, const key_event_t *k) {
                 if (len > (int)sizeof t - 1) len = (int)sizeof t - 1;
                 t[len] = 0;
                 for (char *p = t; *p; p++) if (*p == '\n' || *p == '\r' || *p == '/') *p = ' ';
-                if (e->all) { e->s[0] = 0; e->cur = 0; e->all = 0; n = 0; }
+                if (e->all) { ed_cut_sel(e); n = (int)strlen(e->s); }
                 if (n + len < (int)sizeof e->s - 1) {
                     memmove(e->s + e->cur + len, e->s + e->cur, (size_t)(n - e->cur + 1));
                     memcpy(e->s + e->cur, t, (size_t)len);
@@ -894,14 +914,14 @@ static int ed_key(ed_t *e, const key_event_t *k) {
         return 0;
     }
     if (k->code == XKEY_CHAR && (b >= 32 || b >= 0x80) && b != 127 && !(k->mods & XMOD_ALT)) {
-        if (e->all) { e->s[0] = 0; e->cur = 0; e->all = 0; n = 0; }
+        if (e->all) { ed_cut_sel(e); n = (int)strlen(e->s); }
         if (n + 1 >= (int)sizeof e->s) return 0;
         memmove(e->s + e->cur + 1, e->s + e->cur, (size_t)(n - e->cur + 1));
         e->s[e->cur++] = k->ascii;
         return 1;
     }
     if (k->code == XKEY_BKSP) {
-        if (e->all) { e->s[0] = 0; e->cur = 0; e->all = 0; return 1; }
+        if (e->all) { ed_cut_sel(e); return 1; }
         if (e->cur > 0) {
             int from = ed_back(e, e->cur);
             memmove(e->s + from, e->s + e->cur, (size_t)(n - e->cur + 1));
@@ -911,7 +931,7 @@ static int ed_key(ed_t *e, const key_event_t *k) {
         return 0;
     }
     if (k->code == XKEY_DEL) {
-        if (e->all) { e->s[0] = 0; e->cur = 0; e->all = 0; return 1; }
+        if (e->all) { ed_cut_sel(e); return 1; }
         if (e->cur < n) {
             int to = ed_fwd(e, e->cur);
             memmove(e->s + e->cur, e->s + to, (size_t)(n - to + 1));
@@ -937,7 +957,11 @@ static void ed_draw(const ed_t *e, int x, int y, int w, int h, const txt_style *
     pre[e->cur] = 0;
     int cx = tw(st, pre);
     int shift = cx > w - 30 ? cx - (w - 30) : 0;
-    if (e->all && e->s[0] && focused) rrect(tx - shift - 2, y + 5, tw(st, e->s) + 4, h - 10, 3, GC_SEL, 255);
+    if (e->all && e->s[0] && focused) {
+        char sel[256];
+        snprintf(sel, sizeof sel, "%.*s", e->sel_end > 0 ? e->sel_end : (int)strlen(e->s), e->s);
+        rrect(tx - shift - 2, y + 5, tw(st, sel) + 4, h - 10, 3, GC_SEL, 255);
+    }
     td(st, tx - shift, y, h, e->s, GC_TEXT);
     if (focused && blink && !e->all) rrect(tx - shift + cx, y + 7, 2, h - 14, 1, GC_ACCENT, 255);
     clip_all();
@@ -1237,7 +1261,8 @@ static void begin_rename(int vi) {
     item_t *it = &items[view[vi]];
     if (it->mount || strcmp(cwd, "/") == 0) return;
     ren_item = view[vi];
-    ed_set(&ren, it->name, 1);
+    if (it->dir) ed_set(&ren, it->name, 1);
+    else ed_set_name(&ren, it->name);
     /* the name without its extension is what is selected, as on Windows */
     dirty = 1;
 }
@@ -1347,12 +1372,16 @@ static ed_t pick_name;
 static int running = 1;
 
 static void pick_finish(const char *result) {
-    char out[PATHMAX + 8];
+    /* Written aside and then renamed into place: the program waiting for the
+     * answer never reads half of one. */
+    char out[PATHMAX + 8], tmp[PATHMAX + 8];
     snprintf(out, sizeof out, "%s.out", pick_req);
-    int fd = open(out, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    snprintf(tmp, sizeof tmp, "%s.tmp", pick_req);
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd >= 0) {
         if (result) write(fd, result, strlen(result));
         close(fd);
+        rename(tmp, out);
     }
     running = 0;
 }
@@ -1401,7 +1430,7 @@ static void pick_accept(void) {
 #define SIDE_W   236
 #define TOP_H    58
 #define STATUS_H 30
-#define PICK_H   66
+#define PICK_H   92
 #define HEAD_H   32
 #define ROW_H    34
 #define TILE_W   118
@@ -1873,7 +1902,7 @@ static int pb_hot = -1;
 
 static void pb_rect(int which, int *x, int *y, int *w, int *h) {
     *h = 36; *w = 130;
-    *y = g.h - PICK_H + (PICK_H - 36) / 2;
+    *y = g.h - PICK_H + 40;
     *x = which == PB_OK ? g.w - 16 - 130 : g.w - 16 - 130 - 10 - 130;
 }
 static void pname_rect(int *x, int *y, int *w, int *h) {
@@ -1927,16 +1956,27 @@ static void draw_bottom(int blink) {
     rrect(SIDE_W, py, g.w - SIDE_W, PICK_H, 0, GC_BAR, 255);
     rrect(SIDE_W, py, g.w - SIDE_W, 1, 0, GC_LINE, 255);
     int bx, by, bw, bh;
+    {
+        const char *t = pick_title[0] ? pick_title : pick == PICK_DIR ? T("Выберите папку", "Choose a folder") :
+                        pick == PICK_SAVE ? T("Сохранить", "Save") : T("Выберите файл", "Choose a file");
+        td(&F_BOLD, SIDE_W + 16, py + 8, 26, t, GC_TEXT);
+        if (pick_label[0]) td(&F_SMALL, SIDE_W + 24 + tw(&F_BOLD, t), py + 8, 26, pick_label, GC_DIM);
+    }
     if (pick == PICK_SAVE) {
         int nx, ny, nw, nh;
         pname_rect(&nx, &ny, &nw, &nh);
         td(&F_UI, SIDE_W + 16, ny, nh, T("Имя:", "Name:"), GC_DIM);
         ed_draw(&pick_name, nx, ny, nw, nh, &F_UI, focus_field == 3, blink);
-    } else {
-        const char *t = pick_title[0] ? pick_title : pick == PICK_DIR ? T("Выберите папку", "Choose a folder")
-                                                                      : T("Выберите файл", "Choose a file");
-        td(&F_BOLD, SIDE_W + 16, py + 6, 28, t, GC_TEXT);
-        if (pick_label[0]) td(&F_SMALL, SIDE_W + 16, py + 32, 24, pick_label, GC_DIM);
+    } else if (pick == PICK_OPEN) {
+        /* what will be opened */
+        for (int i = 0; i < nview; i++) {
+            item_t *it = &items[view[i]];
+            if (!it->sel || it->dir) continue;
+            int bx0, by0, bw0, bh0;
+            pb_rect(PB_CANCEL, &bx0, &by0, &bw0, &bh0);
+            td_fit(&F_UI, SIDE_W + 16, by0, bh0, it->disp, bx0 - SIDE_W - 32, GC_TEXT);
+            break;
+        }
     }
     int ok_en = pick == PICK_SAVE ? pick_name.s[0] && strcmp(cwd, "/") != 0 : 1;
     if (pick == PICK_OPEN) {
@@ -2895,14 +2935,10 @@ static void read_request(const char *file) {
     if (line[1]) snprintf(pick_title, sizeof pick_title, "%s", line[1]);
     if (line[2] && line[2][0] && is_dir(line[2])) snprintf(cwd, sizeof cwd, "%s", line[2]);
     else snprintf(cwd, sizeof cwd, "%s", is_dir("/home/Documents") ? "/home/Documents" : "/home");
-    if (line[3]) ed_set(&pick_name, line[3], 0);
+    if (line[3]) ed_set_name(&pick_name, line[3]);
     if (line[4]) snprintf(pick_exts, sizeof pick_exts, "%s", line[4]);
     if (line[5]) snprintf(pick_label, sizeof pick_label, "%s", line[5]);
-    if (pick == PICK_SAVE) {
-        focus_field = 3;
-        /* the name without its extension is what is selected */
-        pick_name.all = 1;
-    }
+    if (pick == PICK_SAVE) focus_field = 3;
 }
 
 int main(int argc, char **argv) {

@@ -22,6 +22,7 @@
 #include <unistd.h>
 #include "xyuos_syscall.h"
 #include "gui.h"
+#include "fdialog.h"
 #include "img.h"
 #include "css.h"
 #include "dom.h"
@@ -4212,7 +4213,7 @@ static int fetch_cached(const char *url, char *buf, int max) {
  * Files land in the OS's own filesystem -- the image this system boots with --
  * and nowhere near the machine's real disk.
  */
-#define DOWNLOAD_DIR "/home/downloads"
+#define DOWNLOAD_DIR "/home/Downloads"
 
 /* A name a filesystem will take, out of whatever the server offered. */
 static void safe_name(const char *in, char *out, int max) {
@@ -4274,12 +4275,18 @@ static void download_name(const char *url, char *out, int max) {
     safe_name(raw, out, max);
 }
 
-/* Write the bytes out, and say where they went. Returns 1 if they got there. */
+/* Write the bytes out, and say where they went. Returns 1 if they got there.
+ * Where is asked, through the file manager's Save window -- Downloads, with
+ * the name the server gave, unless the user says otherwise. */
 static int save_bytes(const char *name, const char *data, int n) {
     xyuos_mkdir(DOWNLOAD_DIR);          /* harmless if it is already there */
 
-    char path[320];
-    snprintf(path, sizeof path, "%s/%s", DOWNLOAD_DIR, name);
+    char path[1024];
+    if (!file_dialog(FD_SAVE, ui_lang() == 1 ? "Save the file" : "Сохранить файл", DOWNLOAD_DIR, name,
+                     "", 0, path, sizeof path)) {
+        snprintf(status, sizeof status, "%s", ui_lang() == 1 ? "download cancelled" : "скачивание отменено");
+        return 0;
+    }
 
     xyuos_unlink(path);                 /* a second copy replaces the first */
     if (xyuos_create(path) != 0) {

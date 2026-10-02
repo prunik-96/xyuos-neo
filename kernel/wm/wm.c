@@ -12,6 +12,7 @@
 #include "../arch/x86_64/smp.h"
 #include "../fs/vfs.h"
 #include "../fs/vol.h"
+#include "../kernel/clip.h"
 #include "../kernel/kio.h"
 #include "../drivers/mouse.h"
 #include "../drivers/audio.h"
@@ -755,6 +756,14 @@ static void draw_content(int n, uint32_t cx, uint32_t cy, uint32_t cw, uint32_t 
     struct pane *p = &panes[nodes[n].pane_idx];
     if (p->gfx_on && p->gfx) { blit_scaled(cx, cy, cw, ch, p->gfx, p->gfx_w, p->gfx_h); return; }
     fb_fill_rect(cx, cy, cw, ch, TH->content_bg);
+    if (p->sel_on) {
+        uint32_t sel = ui_mix(TH->content_bg, TH->accent, 110);
+        for (uint32_t r = p->sel_r0; r <= p->sel_r1 && r < p->rows; r++) {
+            uint32_t c0 = r == p->sel_r0 ? p->sel_c0 : 0;
+            uint32_t c1 = r == p->sel_r1 ? p->sel_c1 : p->cols;
+            if (c1 > c0) fb_fill_rect(cx + c0 * GW, cy + r * GH, (c1 - c0) * GW, GH, sel);
+        }
+    }
     for (uint32_t r = 0; r < p->rows; r++) {
         for (uint32_t c = 0; c < p->cols; c++) {
             int chc; uint8_t a;
@@ -788,6 +797,9 @@ static uint64_t pane_fingerprint(const struct pane *p) {
     }
     hsh = (hsh ^ p->cursor_row) * FNV_P;
     hsh = (hsh ^ p->cursor_col) * FNV_P;
+    if (p->sel_on)
+        hsh = (hsh ^ ((uint64_t)p->sel_r0 << 48 | (uint64_t)p->sel_c0 << 32 |
+                      (uint64_t)p->sel_r1 << 16 | p->sel_c1)) * FNV_P;
     hsh = (hsh ^ p->scroll)     * FNV_P;   // viewport into the scrollback
     hsh = (hsh ^ p->hist_head)  * FNV_P;   // history changed under the viewport
     hsh = (hsh ^ p->hist_count) * FNV_P;
@@ -5633,7 +5645,101 @@ static void pane_push_mouse_ex(int n, const struct mouse_event *me, int phase) {
     if (p->owner_pid > 0) process_wake_key();
 }
 
+// Selecting text in a terminal, with the left button: where the press was,
+// and the cell under the pointer now. Let go, it is on the clipboard.
+static int tsel_node = -1;
+static uint16_t tsel_ar, tsel_ac;
+
+static void term_copy(struct pane *p) {
+    static char buf[PANE_MAX_ROWS * (PANE_MAX_COLS * 3 + 1)];
+    uint32_t n = 0;
+    for (uint32_t r = p->sel_r0; r <= p->sel_r1 && r < p->rows; r++) {
+        uint32_t c0 = r == p->sel_r0 ? p->sel_c0 : 0;
+        uint32_t c1 = r == p->sel_r1 ? p->sel_c1 : p->cols;
+        uint32_t line0 = n, last = n;
+        for (uint32_t c = c0; c < c1 && c < p->cols; c++) {
+            int cp; uint8_t a;
+            pane_cell(p, r, c, &cp, &a);
+            if (cp == 0) cp = ' ';
+            if (cp < 0x80) buf[n++] = (char)cp;
+            else if (cp < 0x800) { buf[n++] = (char)(0xC0 | (cp >> 6)); buf[n++] = (char)(0x80 | (cp & 0x3F)); }
+            else {
+                buf[n++] = (char)(0xE0 | (cp >> 12));
+                buf[n++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+                buf[n++] = (char)(0x80 | (cp & 0x3F));
+            }
+            if (cp != ' ') last = n;
+        }
+        (void)line0;
+        n = last;                                    // a line's trailing blanks are not text
+        if (r != p->sel_r1) buf[n++] = '\n';
+    }
+    if (n) clip_set(CLIP_TEXT, buf, n);
+}
+
+static void term_select(int n, const struct mouse_event *me) {
+    struct pane *p = &panes[nodes[n].pane_idx];
+    uint32_t cx, cy, cw, ch;
+    content_rect(n, &cx, &cy, &cw, &ch);
+    int col = (me->x - (int)cx) / GW, row = (me->y - (int)cy) / GH;
+    if (col < 0) col = 0;
+    if (row < 0) row = 0;
+    if (col > (int)p->cols) col = (int)p->cols;
+    if (row >= (int)p->rows) row = (int)p->rows - 1;
+    if (me->pressed & MOUSE_LEFT) {
+        tsel_node = n;
+        tsel_ar = (uint16_t)row; tsel_ac = (uint16_t)col;
+        p->sel_on = 0;
+        dirty = 1;
+        return;
+    }
+    if (tsel_node != n) return;
+    if (me->buttons & MOUSE_LEFT) {
+        // from the press to here, in reading order
+        int r0 = tsel_ar, c0 = tsel_ac, r1 = row, c1 = col;
+        if (r1 < r0 || (r1 == r0 && c1 < c0)) { int t = r0; r0 = r1; r1 = t; t = c0; c0 = c1; c1 = t; }
+        p->sel_r0 = (uint16_t)r0; p->sel_c0 = (uint16_t)c0;
+        p->sel_r1 = (uint16_t)r1; p->sel_c1 = (uint16_t)c1;
+        p->sel_on = r1 > r0 || c1 > c0;
+        dirty = 1;
+        return;
+    }
+    if (me->released & MOUSE_LEFT) {
+        tsel_node = -1;
+        if (p->sel_on) term_copy(p);
+    }
+}
+
+// The clipboard, typed into a terminal: text as it is, files as their paths.
+static void term_paste(struct pane *p) {
+    static char buf[16384];
+    int type;
+    uint32_t n = clip_get(buf, sizeof buf - 1, &type);
+    if (n > sizeof buf - 1) n = sizeof buf - 1;
+    buf[n] = 0;
+    const char *s = buf;
+    if (type == CLIP_FILES) { const char *nl = buf; while (*nl && *nl != '\n') nl++; s = *nl ? nl + 1 : nl; }
+    struct kbd_event ev;
+    ev.mods = 0;
+    ev.pressed = 1;
+    for (; *s; s++) {
+        if (*s == '\r') continue;
+        if (*s == '\n') {
+            // a list of files goes on one line; text keeps its lines
+            if (type == CLIP_FILES) { if (s[1]) { ev.code = KEY_CHAR; ev.ascii = ' '; pane_push_event(p, &ev); } continue; }
+            ev.code = KEY_ENTER; ev.ascii = '\n';
+        } else { ev.code = KEY_CHAR; ev.ascii = *s; }
+        pane_push_event(p, &ev);
+    }
+    if (p->owner_pid > 0) process_wake_key();
+}
+
 static void pane_push_mouse(int n, const struct mouse_event *me) {
+    struct pane *p = &panes[nodes[n].pane_idx];
+    if (!p->gfx_on) {
+        term_select(n, me);
+        if (me->pressed & MOUSE_MIDDLE) term_paste(p);
+    }
     pane_push_mouse_ex(n, me, 0);
 }
 
@@ -6922,6 +7028,21 @@ void wm_route_input(void) {
                 if (fg != p->owner_pid) { signal_send(fg, SIGINT); continue; }
             }
         }
+
+        // Ctrl+Shift+V in a terminal: the clipboard, typed in.
+        if (!p->gfx_on && ev.code == KEY_CHAR && (ev.mods & KBD_MOD_CTRL) && (ev.mods & KBD_MOD_SHIFT) &&
+            (ev.ascii == 'v' || ev.ascii == 'V')) {
+            term_paste(p);
+            continue;
+        }
+        // Ctrl+Shift+C: the selection, onto it (it is there already after a
+        // drag; this is for the hand that expects it).
+        if (!p->gfx_on && ev.code == KEY_CHAR && (ev.mods & KBD_MOD_CTRL) && (ev.mods & KBD_MOD_SHIFT) &&
+            (ev.ascii == 'c' || ev.ascii == 'C')) {
+            if (p->sel_on) term_copy(p);
+            continue;
+        }
+        if (p->sel_on) { p->sel_on = 0; dirty = 1; }
 
         // Any real input jumps back to the live bottom -- you type, you see the
         // prompt. (Modifier-only auto-repeats carry no code, but those never

@@ -455,27 +455,75 @@ static inline void gui_edit_set(gui_edit_t *e, const char *s) {
     e->cur = n;
 }
 
-/* Feed one key. Returns 1 if the text changed. */
+/* The text is UTF-8: a Russian letter is two bytes and one cell. The caret
+ * and the edges move by characters, never into the middle of one. */
+static inline int gui_edit_back(const gui_edit_t *e, int at) {
+    if (at <= 0) return 0;
+    at--;
+    while (at > 0 && ((unsigned char)e->buf[at] & 0xC0) == 0x80) at--;
+    return at;
+}
+static inline int gui_edit_fwd(const gui_edit_t *e, int at) {
+    if (at >= e->len) return e->len;
+    at++;
+    while (at < e->len && ((unsigned char)e->buf[at] & 0xC0) == 0x80) at++;
+    return at;
+}
+
+/* Feed one key. Returns 1 if the text changed. Ctrl+C copies the line and
+ * Ctrl+V pastes -- through the clipboard every program shares. */
 static inline int gui_edit_key(gui_edit_t *e, const key_event_t *k) {
-    if (k->code == XKEY_LEFT)  { if (e->cur > 0) e->cur--; return 0; }
-    if (k->code == XKEY_RIGHT) { if (e->cur < e->len) e->cur++; return 0; }
+    if (k->code == XKEY_LEFT)  { e->cur = gui_edit_back(e, e->cur); return 0; }
+    if (k->code == XKEY_RIGHT) { e->cur = gui_edit_fwd(e, e->cur); return 0; }
     if (k->code == XKEY_HOME)  { e->cur = 0; return 0; }
     if (k->code == XKEY_END)   { e->cur = e->len; return 0; }
     if (k->code == XKEY_BKSP) {
         if (e->cur == 0) return 0;
-        memmove(e->buf + e->cur - 1, e->buf + e->cur, (size_t)(e->len - e->cur + 1));
-        e->cur--; e->len--;
+        int from = gui_edit_back(e, e->cur);
+        memmove(e->buf + from, e->buf + e->cur, (size_t)(e->len - e->cur + 1));
+        e->len -= e->cur - from;
+        e->cur = from;
         return 1;
     }
     if (k->code == XKEY_DEL) {
         if (e->cur >= e->len) return 0;
-        memmove(e->buf + e->cur, e->buf + e->cur + 1, (size_t)(e->len - e->cur));
-        e->len--;
+        int to = gui_edit_fwd(e, e->cur);
+        memmove(e->buf + e->cur, e->buf + to, (size_t)(e->len - to + 1));
+        e->len -= to - e->cur;
         return 1;
     }
     if (k->code != XKEY_CHAR) return 0;
+    if (k->mods & XMOD_CTRL) {
+        if (k->ascii == 'c' || k->ascii == 'C') { clip_set(CLIP_TEXT, e->buf, (unsigned)e->len); return 0; }
+        if (k->ascii == 'v' || k->ascii == 'V') {
+            char t[512];
+            int type, n = clip_get(t, sizeof t - 1, &type);
+            if (n <= 0) return 0;
+            if (n > (int)sizeof t - 1) n = (int)sizeof t - 1;
+            if (type == CLIP_FILES) {               /* the first path, not the "copy" line */
+                char *nl = memchr(t, '\n', (size_t)n);
+                if (!nl) return 0;
+                int skip = (int)(nl - t) + 1;
+                memmove(t, t + skip, (size_t)(n - skip));
+                n -= skip;
+            }
+            int m = 0;
+            for (int i = 0; i < n; i++) {
+                if (t[i] == '\n' || t[i] == '\r') break;
+                if ((unsigned char)t[i] >= 32) t[m++] = t[i];
+            }
+            if (e->len + m > e->max - 1) m = e->max - 1 - e->len;
+            if (m <= 0) return 0;
+            memmove(e->buf + e->cur + m, e->buf + e->cur, (size_t)(e->len - e->cur + 1));
+            memcpy(e->buf + e->cur, t, (size_t)m);
+            e->cur += m;
+            e->len += m;
+            return 1;
+        }
+        return 0;
+    }
     unsigned char c = (unsigned char)k->ascii;
-    if (c < 32 || c > 126) return 0;
+    if (c < 32 || c == 127) return 0;
     if (e->len >= e->max - 1) return 0;
     memmove(e->buf + e->cur + 1, e->buf + e->cur, (size_t)(e->len - e->cur + 1));
     e->buf[e->cur++] = (char)c;
@@ -491,16 +539,23 @@ static inline void gui_edit_draw(gui_t *g, gui_edit_t *e, int x, int y,
     int ty = y + (h - g->fh) / 2;
     int cells = (w - 10) / g->fw;
     if (cells < 1) return;
-    int from = 0;
-    if (e->cur > cells - 1) from = e->cur - (cells - 1);
     if (e->len == 0 && placeholder && !focus) {
         gui_text(g, x + 6, ty, placeholder, GC_DIM);
         return;
     }
-    for (int i = 0; i < cells && from + i < e->len; i++)
-        gui_glyph(g, x + 6 + i * g->fw, ty, (unsigned char)e->buf[from + i], GC_TEXT, 1);
+    /* the characters before the caret, and where to start so it shows */
+    int before = 0;
+    for (int i = 0; i < e->cur; ) { int cp; i += gui_utf8(e->buf + i, &cp); before++; }
+    int skip = before > cells - 1 ? before - (cells - 1) : 0;
+    int at = 0;
+    for (int k = 0; k < skip && at < e->len; k++) { int cp; at += gui_utf8(e->buf + at, &cp); }
+    for (int i = 0; i < cells && at < e->len; i++) {
+        int cp;
+        at += gui_utf8(e->buf + at, &cp);
+        gui_glyph(g, x + 6 + i * g->fw, ty, cp, GC_TEXT, 1);
+    }
     if (focus && blink) {
-        int cx = x + 6 + (e->cur - from) * g->fw;
+        int cx = x + 6 + (before - skip) * g->fw;
         gui_fill(g, cx, ty, 2, g->fh, GC_ACCENT);
     }
 }

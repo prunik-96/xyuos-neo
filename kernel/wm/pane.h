@@ -79,6 +79,11 @@ struct pane {
     unsigned char u8[4];
     int      u8n;
 
+    // Text selected with the mouse (cells, inclusive start, exclusive end in
+    // reading order). Copied to the clipboard when the button comes up.
+    uint8_t  sel_on;
+    uint16_t sel_r0, sel_c0, sel_r1, sel_c1;
+
     uint8_t  cur_fg;   // colors used by subsequent pane_putc
     uint8_t  cur_bg;
 

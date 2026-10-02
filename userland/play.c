@@ -25,6 +25,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include "gui.h"
+#include "fdialog.h"
 #include "upath.h"
 
 /* The decoders, compiled into this program. Their own code is theirs, so
@@ -346,12 +347,26 @@ static int decode(int want) {
 static int playing, vol = 80;
 static int bars[48];                /* a cheap level meter */
 
-static const char *btn_label[] = { "Play", "Pause", "Stop", "Vol -", "Vol +" };
-#define NBTN ((int)(sizeof btn_label / sizeof btn_label[0]))
+static int en;
+#define T(ru, eng) (en ? (eng) : (ru))
+
+#define NBTN 6
+static const char *btn_label(int i) {
+    switch (i) {
+    case 0: return T("Открыть", "Open");
+    case 1: return T("Играть", "Play");
+    case 2: return T("Пауза", "Pause");
+    case 3: return T("Стоп", "Stop");
+    case 4: return T("Тише", "Vol -");
+    case 5: return T("Громче", "Vol +");
+    }
+    return "";
+}
 
 static void btn_rect(gui_t *g, int i, int *x, int *y, int *w, int *h) {
-    int bw = g->fw * 8, gap = 6;
-    *w = bw; *h = TOOL_H - 12; *x = 10 + i * (bw + gap); *y = 6;
+    int at = 10;
+    for (int k = 0; k < i; k++) at += (gui_len(btn_label(k)) + 2) * g->fw + 6;
+    *w = (gui_len(btn_label(i)) + 2) * g->fw; *h = TOOL_H - 12; *x = at; *y = 6;
 }
 
 static void draw(gui_t *g) {
@@ -363,14 +378,16 @@ static void draw(gui_t *g) {
         int x, y, w, h;
         btn_rect(g, i, &x, &y, &w, &h);
         int st = gui_in(g->mx, g->my, x, y, w, h) ? GB_HOVER : GB_NORMAL;
-        if (i == 0 && playing) st = GB_OFF;
-        if (i == 1 && !playing) st = GB_OFF;
-        gui_button(g, x, y, w, h, btn_label[i], st);
+        if (i == 1 && playing) st = GB_OFF;
+        if (i == 2 && !playing) st = GB_OFF;
+        gui_button(g, x, y, w, h, btn_label(i), st);
     }
     {
-        char t[32];
-        snprintf(t, sizeof t, "volume %d%%", vol);
-        int x = 10 + NBTN * (g->fw * 8 + 6) + 10;
+        char t[48];
+        snprintf(t, sizeof t, T("громкость %d%%", "volume %d%%"), vol);
+        int bx, by, bw, bh;
+        btn_rect(g, NBTN - 1, &bx, &by, &bw, &bh);
+        int x = bx + bw + 14;
         gui_text(g, x, (TOOL_H - g->fh) / 2, t, GC_DIM);
     }
 
@@ -406,9 +423,8 @@ static void draw(gui_t *g) {
         snprintf(t, sizeof t, "%ld:%02ld / %ld:%02ld",
                  secs / 60, secs % 60, tot / 60, tot % 60);
         gui_text(g, 16, py + 24, t, GC_DIM);
-        gui_text(g, g->w - 16 - gui_tw(g, playing ? "playing" : "stopped", 1),
-                 py + 24, playing ? "playing" : "stopped",
-                 playing ? GC_GOOD : GC_DIM);
+        const char *st = playing ? T("играет", "playing") : T("остановлено", "stopped");
+        gui_text(g, g->w - 16 - gui_tw(g, st, 1), py + 24, st, playing ? GC_GOOD : GC_DIM);
     }
 
     gui_vgrad(g, 0, g->h - STAT_H, g->w, STAT_H, GC_BAR, GC_BAR2);
@@ -427,23 +443,40 @@ static void restart(void) {
     played_frames = 0;
 }
 
+/* Something else to play, through the file manager's Open window. */
+static void open_dialog(void) {
+    char dir[UPATH_MAX], out[1024];
+    snprintf(dir, sizeof dir, "%s", path);
+    char *s = strrchr(dir, '/');
+    if (s && s != dir) *s = 0; else dir[0] = 0;
+    if (!file_dialog(FD_OPEN, T("Открыть музыку", "Open music"), dir[0] ? dir : "/home/Music", 0,
+                     "mp3,wav,ogg", T("Звук", "Sound"), out, sizeof out)) return;
+    playing = 0;
+    audio_flush();
+    if (src_open(out)) playing = 1;
+    else message_box(MSG_ERROR, "PLAY-OPEN", T("Этот файл не проигрывается", "Cannot play this file"),
+                     status, out);
+}
+
 static void do_button(int i) {
     switch (i) {
-        case 0:
-            if (src_kind == SRC_NONE) { snprintf(status, sizeof status, "nothing loaded"); break; }
+        case 0: open_dialog(); break;
+        case 1:
+            if (src_kind == SRC_NONE) { snprintf(status, sizeof status, "%s", T("Ничего не открыто", "Nothing loaded")); break; }
             if (played_frames >= total_frames) restart();
             playing = 1;
             break;
-        case 1: playing = 0; audio_flush(); break;
-        case 2: playing = 0; audio_flush(); restart(); break;
-        case 3: vol -= 10; if (vol < 0) vol = 0; audio_volume(vol); break;
-        case 4: vol += 10; if (vol > 100) vol = 100; audio_volume(vol); break;
+        case 2: playing = 0; audio_flush(); break;
+        case 3: playing = 0; audio_flush(); restart(); break;
+        case 4: vol -= 10; if (vol < 0) vol = 0; audio_volume(vol); break;
+        case 5: vol += 10; if (vol > 100) vol = 100; audio_volume(vol); break;
         default: break;
     }
 }
 
 int main(int argc, char **argv) {
     gui_t g;
+    en = ui_lang() == 1;
     if (!gui_open(&g)) return 1;
 
     if (!audio_present()) {
@@ -483,7 +516,7 @@ int main(int argc, char **argv) {
             i = j + 1;
         }
         if (pick[0] && src_open(pick)) playing = 1;
-        else snprintf(status, sizeof status, "usage: play <file.wav|mp3|ogg>");
+        else snprintf(status, sizeof status, "%s", T("Откройте музыку: Ctrl+O", "Open some music: Ctrl+O"));
     }
 
     int running = 1, dirty = 1, hover_btn = -2;
@@ -496,8 +529,10 @@ int main(int argc, char **argv) {
                 key_event_t *k = &e.k;
                 if (k->code == XKEY_RESIZE) { gui_sync(&g); continue; }
                 if (k->code == XKEY_ESC) running = 0;
+                else if (k->code == XKEY_CHAR && (k->mods & XMOD_CTRL) && (k->ascii | 0x20) == 'o')
+                    open_dialog();
                 else if (k->code == XKEY_CHAR && k->ascii == ' ')
-                    do_button(playing ? 1 : 0);
+                    do_button(playing ? 2 : 1);
                 else if (k->code == XKEY_CHAR && k->ascii == 'q') running = 0;
                 else if (k->code == XKEY_UP)   do_button(4);
                 else if (k->code == XKEY_DOWN) do_button(3);
