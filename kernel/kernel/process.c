@@ -661,6 +661,17 @@ uint64_t sched_on_tick(uint64_t cur_rsp, uint64_t cs) {
     current->saved_rsp = cur_rsp;       // so the exit path sees something sane
     signal_check();
 
+    // The desktop is in the middle of moving something. On its core it is
+    // owed a frame every tick, whoever is running: put this process down,
+    // let the loop draw, and it is picked up again straight after -- here or
+    // on another core.
+    if (this_cpu()->cpu_index == 0 && wm_wants_frame()) {
+        current->resume_kernel = 0;
+        current->state = PROC_READY;
+        __asm__ volatile ("fxsave (%0)" : : "r"(current->fxstate) : "memory");
+        kctx_restore(this_cpu()->idle_ctx, 1);      // never returns
+    }
+
     process_t *next = pick_next(current);
 
     // Suspended -- by SIGSTOP or the task manager. With something else to
@@ -1055,6 +1066,11 @@ static void cpu_loop(void) {
         // No process on this core from here until one is picked.
         current = NULL;
         this_cpu()->kstack_top = 0;
+
+        // Something on the desktop is moving: its frame first, then whatever
+        // is runnable (wm_wants_frame lets this happen once per frame, not on
+        // every pass).
+        if (bsp && wm_wants_frame()) wm_poll();
 
         process_t *next = pick_next(NULL);
 

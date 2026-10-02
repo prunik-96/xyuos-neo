@@ -26,6 +26,10 @@ int wm_running(void);
 // kernel puts on the screen itself, such as a program's crash.
 int wm_lang(void);
 
+// 1 while something on the desktop is moving and its next frame is due:
+// the scheduler then lets the desktop draw before anything else on its core.
+int wm_wants_frame(void);
+
 // A notice in the corner of the screen, for a few seconds: a title and a
 // line of text, with one of the glyphs of glyphs.h on a square of `col`.
 // Not shown while "do not disturb" is on.

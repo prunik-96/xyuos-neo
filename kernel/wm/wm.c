@@ -741,7 +741,26 @@ static int hov_key = -1, hov_old = -1;
 static uint64_t hov_ms, hov_old_ms;
 static int press_key = -1;                  // what a press armed, until release
 
-static uint64_t now_ms(void) { return pit_get_ticks() * 10; }
+// Milliseconds, as finely as the processor's own counter allows. The timer
+// ticks every 10 ms, and an animation stepped by it moves in visible jumps;
+// the time-stamp counter is learned against the timer over the first half
+// second, and from then on fills in the time between ticks. It is kept within
+// a tick of the timer, so the two can never drift apart.
+static uint64_t clk_tick0, clk_tsc0, clk_per_ms;
+static uint64_t now_ms(void) {
+    uint64_t t = pit_get_ticks(), c = rdtsc();
+    if (!clk_tsc0) { clk_tick0 = t; clk_tsc0 = c; return t * 10; }
+    if (!clk_per_ms) {
+        if (t - clk_tick0 < 50) return t * 10;
+        clk_per_ms = (c - clk_tsc0) / ((t - clk_tick0) * 10);
+        if (!clk_per_ms) clk_per_ms = 1;
+    }
+    uint64_t f = clk_tick0 * 10 + (c - clk_tsc0) / clk_per_ms;
+    if (f < t * 10) f = t * 10;
+    if (f > t * 10 + 10) f = t * 10 + 10;
+    return f;
+}
+static uint64_t last_frame_ms;         // when render_all last ran
 
 // --- a spring ---------------------------------------------------------------------
 //
@@ -1829,6 +1848,7 @@ static void draw_gadget(void) {
 
 static int start_open;                 // the launcher (defined further down)
 static int cc_open;                    // the control panel (likewise)
+static int am_open;                    // a program's windows, from the island
 static uint64_t pop_t0;                // when the open one came up, for its spring
 static int geom_rest;                  // 1: where a popup rests, without the spring
 
@@ -2231,8 +2251,9 @@ static void draw_island_now(void) {
         }
     }
 
-    // The name of the program under the pointer, beside the island.
-    if (hot >= 0 && tb_items[hot].kind == TB_APP) {
+    // The name of the program under the pointer, beside the island -- not
+    // while a popup stands there, where it would peek out from under it.
+    if (hot >= 0 && tb_items[hot].kind == TB_APP && !start_open && !cc_open && !am_open) {
         const struct tb_item *it = &tb_items[hot];
         const char *label = program_label(it->name);
         int tw = ui_text_w(label, UI_F13) + 24, th = 30;
@@ -3213,7 +3234,7 @@ static void island_set_edge(int e);
 static int dnd;                     // "do not disturb": notices are not shown
 static int cc_vol_drag;             // the volume knob is held
 
-static int popup_open(void) { return start_open || cc_open; }
+static int popup_open(void) { return start_open || cc_open || am_open; }
 
 static void cc_geom(int *x, int *y, int *w, int *h) {
     int W = (int)fb_get_width(), H = (int)fb_get_height();
@@ -3427,6 +3448,303 @@ static void draw_control(void) {
 // A card of glass in the corner -- what is playing now, a layout kept, a
 // program's word -- that comes in, stays a few seconds and goes. One at a
 // time; a newer one waits its turn.
+
+// --- a program's windows, from the island ------------------------------------------
+//
+// A right click on a program on the island lays its windows out as small
+// pictures of themselves: pick one to bring it forward, close one by its
+// cross, close them all -- or open another window of the program instead of
+// going back to the one already running.
+#define AM_CARD_W  220
+#define AM_CARD_H  164
+#define AM_THUMB_H 112
+#define AM_COLS    4
+#define AM_GAP     12
+#define AM_MAXW    16
+#define AM_TOP     64                  // the header: the program's icon and name
+#define AM_FOOT    60                  // the buttons along the bottom
+static char am_name[24];               // the program, by its file in /bin
+static int  am_win[AM_MAXW], am_n;     // its windows on this desktop
+
+#define AMK_CARD   1
+#define AMK_CLOSE  2
+#define AMK_NEW    3
+#define AMK_ALL    4
+#define AMK_INSIDE 5
+#define KEY_AM(k, a) (0x60000 | ((k) << 8) | (a))
+
+static void am_collect(void) {
+    am_n = 0;
+    for (int i = 0; i < MAX_NODES && am_n < AM_MAXW; i++)
+        if (nodes[i].used && nodes[i].ws == cur_ws &&
+            str_same(pane_title(&panes[nodes[i].pane_idx]), am_name)) am_win[am_n++] = i;
+}
+
+static void am_geom(int *x, int *y, int *w, int *h) {
+    int W = (int)fb_get_width(), H = (int)fb_get_height();
+    am_collect();
+    int cols = am_n < AM_COLS ? am_n : AM_COLS;
+    int rows = (am_n + AM_COLS - 1) / AM_COLS;
+    *w = cols ? cols * (AM_CARD_W + AM_GAP) - AM_GAP + 40 : 0;
+    if (*w < 340) *w = 340;
+    *h = AM_TOP + (rows ? rows * (AM_CARD_H + AM_GAP) : 8) + AM_FOOT;
+    // By the program's place on the island.
+    tb_layout();
+    int ax = isl_x + isl_w / 2, ay = isl_y + isl_h / 2;
+    for (int i = 0; i < tb_n; i++)
+        if (tb_items[i].kind == TB_APP && str_same(tb_items[i].name, am_name)) {
+            ax = tb_items[i].x + tb_items[i].w / 2;
+            ay = tb_items[i].y + tb_items[i].h / 2;
+        }
+    switch (island_edge) {
+    case ISL_LEFT:  *x = isl_x + isl_w + 14; *y = ay - *h / 2; break;
+    case ISL_RIGHT: *x = isl_x - 14 - *w;    *y = ay - *h / 2; break;
+    case ISL_TOP:   *x = ax - *w / 2;        *y = isl_y + isl_h + 14; break;
+    default:        *x = ax - *w / 2;        *y = isl_y - 14 - *h; break;
+    }
+    if (*x < 8) *x = 8;
+    if (*x + *w > W - 8) *x = W - 8 - *w;
+    if (*y < 8) *y = 8;
+    if (*y + *h > H - 8) *y = H - 8 - *h;
+    pop_shift(x, y);
+}
+
+static void am_reach(int *rx, int *ry, int *rw, int *rh) {
+    int x, y, w, h;
+    geom_rest = 1;
+    am_geom(&x, &y, &w, &h);
+    geom_rest = 0;
+    int m = 40 + POP_TRAVEL;
+    *rx = x - m; *ry = y - m; *rw = w + 2 * m; *rh = h + 2 * m;
+}
+
+static void am_card_rect(int i, int x, int y, int *cx, int *cy) {
+    *cx = x + 20 + (i % AM_COLS) * (AM_CARD_W + AM_GAP);
+    *cy = y + AM_TOP + (i / AM_COLS) * (AM_CARD_H + AM_GAP);
+}
+
+static void am_close_rect(int cx, int cy, int *bx, int *by) {
+    *bx = cx + AM_CARD_W - 36;
+    *by = cy + AM_THUMB_H + 18;
+}
+
+// The buttons along the bottom: "new window" on the left, "close all" on
+// the right (only for more than one).
+static void am_btn_rect(int which, int x, int y, int w, int h, int *bx, int *by, int *bw, int *bh) {
+    const char *t = which ? L("Закрыть все", "Close all") : L("Новое окно", "New window");
+    *bw = ui_text_w(t, UI_F13B) + (which ? 36 : 58);
+    *bh = 38;
+    *by = y + h - AM_FOOT + 6;
+    *bx = which ? x + w - 20 - *bw : x + 20;
+}
+
+static int am_key_at(int mx, int my) {
+    int x, y, w, h;
+    am_geom(&x, &y, &w, &h);
+    if (mx < x || my < y || mx >= x + w || my >= y + h) return -1;
+    for (int i = 0; i < am_n; i++) {
+        int cx, cy, bx, by;
+        am_card_rect(i, x, y, &cx, &cy);
+        am_close_rect(cx, cy, &bx, &by);
+        if (mx >= bx && mx < bx + 26 && my >= by && my < by + 26) return KEY_AM(AMK_CLOSE, i);
+        if (mx >= cx && mx < cx + AM_CARD_W && my >= cy && my < cy + AM_CARD_H) return KEY_AM(AMK_CARD, i);
+    }
+    for (int b = 0; b < (am_n > 1 ? 2 : 1); b++) {
+        int bx, by, bw, bh;
+        am_btn_rect(b, x, y, w, h, &bx, &by, &bw, &bh);
+        if (mx >= bx && mx < bx + bw && my >= by && my < by + bh) return KEY_AM(b ? AMK_ALL : AMK_NEW, 0);
+    }
+    return KEY_AM(AMK_INSIDE, 0);
+}
+
+// A window, small: the program's own picture scaled down, or a terminal's
+// text drawn as strokes of its colours -- enough to tell one from another.
+static void am_thumb(int n, int x, int y, int w, int h) {
+    const struct wm_node *nd = &nodes[n];
+    struct pane *p = &panes[nd->pane_idx];
+    int ww = (int)nd->w > 0 ? (int)nd->w : 1, wh = (int)nd->h > 0 ? (int)nd->h : 1;
+    int tw = w, th = wh * w / ww;
+    if (th > h) { th = h; tw = ww * h / wh; }
+    if (tw < 8 || th < 8) return;
+    int tx = x + (w - tw) / 2, ty = y + (h - th) / 2;
+    ui_round_fill(tx, ty, tw, th, 8, body_colour(n), 255);
+    if (p->gfx_on && p->gfx && p->gfx_w && p->gfx_h) {
+        int W = (int)fb_get_width(), H = (int)fb_get_height();
+        volatile uint8_t *base = fb_get_base();
+        uint32_t pitch = fb_get_pitch();
+        const int r = 8;
+        for (int j = 0; j < th; j++) {
+            int py = ty + j;
+            if (py < 0 || py >= H) continue;
+            uint32_t *d = (uint32_t *)(base + (size_t)py * pitch);
+            const uint32_t *srow = p->gfx + (size_t)(j * p->gfx_h / th) * p->gfx_w;
+            for (int i = 0; i < tw; i++) {
+                int px = tx + i;
+                if (px < 0 || px >= W) continue;
+                // Keep the rounded corners round.
+                int cx = i < r ? r - i : i >= tw - r ? i - (tw - r - 1) : 0;
+                int cy = j < r ? r - j : j >= th - r ? j - (th - r - 1) : 0;
+                if (cx && cy && cx * cx + cy * cy > r * r) continue;
+                d[px] = srow[i * p->gfx_w / tw];
+            }
+        }
+        fb_mark_rect((uint32_t)(tx < 0 ? 0 : tx), (uint32_t)(ty < 0 ? 0 : ty), (uint32_t)tw, (uint32_t)th);
+        return;
+    }
+    if (!p->cols || !p->rows) return;
+    int pad = 4;
+    int iw = tw - 2 * pad, ih = th - 2 * pad;
+    int cw = iw * 256 / (int)p->cols, ch = ih * 256 / (int)p->rows;
+    int sh = ch * 45 / 100 >> 8;
+    if (sh < 1) sh = 1;
+    for (uint32_t r = 0; r < p->rows; r++) {
+        int ry = ty + pad + (int)((r * ch) >> 8) + (ch >> 10);
+        uint32_t c = 0;
+        while (c < p->cols) {
+            int cp;
+            uint8_t at;
+            pane_cell(p, r, c, &cp, &at);
+            if (cp <= ' ') { c++; continue; }
+            // A run of characters in one colour is one stroke.
+            uint32_t c0 = c;
+            uint8_t fg = (uint8_t)(at >> 4);
+            for (;;) {
+                c++;
+                if (c >= p->cols) break;
+                int cp2;
+                uint8_t at2;
+                pane_cell(p, r, c, &cp2, &at2);
+                if (cp2 <= ' ' || (uint8_t)(at2 >> 4) != fg) break;
+            }
+            int sx = tx + pad + (int)((c0 * cw) >> 8);
+            int ex = tx + pad + (int)((c * cw) >> 8);
+            ui_fill(sx, ry, ex - sx > 1 ? ex - sx - 1 : 1, sh, pane_palette[fg & 7]);
+        }
+    }
+}
+
+static const char *ru_windows(int n) {
+    int a = n % 100, b = n % 10;
+    if (a >= 11 && a <= 14) return "окон";
+    if (b == 1) return "окно";
+    if (b >= 2 && b <= 4) return "окна";
+    return "окон";
+}
+
+static void draw_appmenu(void) {
+    if (!am_open) return;
+    const theme_t *T = TH;
+    int x, y, w, h;
+    am_geom(&x, &y, &w, &h);
+    uint32_t ink = T->title_text, dim = T->title_text_dim;
+
+    ui_shadow(x, y, w, h, 24, 34, 80, 14, 0);
+    ui_shadow(x, y, w, h, 24, 4, 34, 1, 0);
+    ui_glass_place(&pop_glass, x, y, w, h, 16);
+    if (!pop_glass_fresh) {
+        ui_glass_forget(&pop_glass);
+        ui_glass_take(&pop_glass, 0, 0);
+        pop_glass_fresh = 1;
+    }
+    ui_glass_draw(&pop_glass, x, y, w, h, 24, 0, 0, 0, 0, 0, 0, ui_mix(T->frost, T->accent, 40), 165 + T->frost_a);
+    ui_glass_rim(x, y, w, h, 24);
+
+    // Whose windows, and how many.
+    prog_icon(am_name, x + 20, y + 16, 34);
+    ui_text_fit(x + 66, y + 14, w - 90, program_label(am_name), UI_F15B, ink);
+    {
+        char t[40];
+        int q = 0;
+        if (!am_n) {
+            const char *z = L("Не запущена", "Not running");
+            while (*z) t[q++] = *z++;
+        } else {
+            q += u2s(t, (unsigned)am_n);
+            t[q++] = ' ';
+            const char *z = lang ? (am_n == 1 ? "window" : "windows") : ru_windows(am_n);
+            while (*z) t[q++] = *z++;
+        }
+        t[q] = 0;
+        ui_text(x + 66, y + 36, t, UI_F12, dim);
+    }
+
+    for (int i = 0; i < am_n; i++) {
+        int n = am_win[i];
+        const struct wm_node *nd = &nodes[n];
+        int cx, cy;
+        am_card_rect(i, x, y, &cx, &cy);
+        int glow = glow_of(KEY_AM(AMK_CARD, i));
+        int front = n == focused && nd->state != WIN_MIN && !nd->tab_hidden;
+        ui_round_fill(cx, cy, AM_CARD_W, AM_CARD_H, 18, T->plate, 120 + glow * 100 / 256);
+        if (front) ui_rrect_line(cx, cy, AM_CARD_W, AM_CARD_H, 18, UI_ALL, T->accent, 255);
+        am_thumb(n, cx + 10, cy + 10, AM_CARD_W - 20, AM_THUMB_H);
+
+        // What it is: the file it has open, or which of them it is; and if
+        // it is not on the screen, why not.
+        char t[64];
+        int q = 0;
+        if (nd->arg[0]) {
+            const char *b = base_name(nd->arg);
+            while (*b && q < 40) t[q++] = *b++;
+        } else {
+            const char *b = L("Окно ", "Window ");
+            while (*b) t[q++] = *b++;
+            q += u2s(t + q, (unsigned)(i + 1));
+        }
+        t[q] = 0;
+        const char *st = nd->tab_hidden ? L("вкладка", "a tab") :
+                         nd->state == WIN_MIN ? L("свёрнуто", "minimised") :
+                         front ? L("сейчас открыто", "in front") : L("на столе", "on the desktop");
+        ui_text_fit(cx + 14, cy + AM_THUMB_H + 16, AM_CARD_W - 60, t, UI_F13B, ink);
+        ui_text_fit(cx + 14, cy + AM_THUMB_H + 34, AM_CARD_W - 60, st, UI_F11, dim);
+
+        int bx, by;
+        am_close_rect(cx, cy, &bx, &by);
+        int cg = glow_of(KEY_AM(AMK_CLOSE, i));
+        int pressed = press_key == KEY_AM(AMK_CLOSE, i) && cg;
+        ui_round_fill(bx, by, 26, 26, 13, ui_mix(T->plate, 0x00E5484D, cg), 150 + cg * 105 / 256);
+        wglyph(GL_CLOSE, bx + 7, by + 7 + (pressed ? 1 : 0), 12,
+               0xFF000000 | ui_mix(T->title_text, 0x00FFFFFF, cg));
+    }
+    if (!am_n)
+        ui_text(x + 20, y + AM_TOP, L("Окон этой программы сейчас нет.", "This program has no windows now."),
+                UI_F13, dim);
+
+    for (int b = 0; b < (am_n > 1 ? 2 : 1); b++) {
+        int bx, by, bw, bh;
+        am_btn_rect(b, x, y, w, h, &bx, &by, &bw, &bh);
+        int glow = glow_of(KEY_AM(b ? AMK_ALL : AMK_NEW, 0));
+        if (b == 0) {
+            ui_round_fill(bx, by, bw, bh, bh / 2, ui_mix(T->accent, 0x00FFFFFF, glow * 40 / 256), 255);
+            wglyph(GL_PLUS, bx + 16, by + 13, 12, 0xFFFFFFFF);
+            ui_text(bx + 36, by + (bh - ui_line_h(UI_F13B)) / 2, L("Новое окно", "New window"), UI_F13B, 0x00FFFFFF);
+        } else {
+            ui_round_fill(bx, by, bw, bh, bh / 2, ui_mix(T->plate, 0x00E5484D, glow * 200 / 256),
+                          170 + glow * 85 / 256);
+            ui_text(bx + 18, by + (bh - ui_line_h(UI_F13B)) / 2, L("Закрыть все", "Close all"), UI_F13B,
+                    glow > 128 ? 0x00FFFFFF : ink);
+        }
+    }
+}
+
+static void start_toggle(void);
+
+static void am_show(const char *name) {
+    if (am_open && str_same(am_name, name)) {      // again on the same: put it away
+        am_open = 0;
+        wp_dirty = 1;
+        dirty = 1;
+        return;
+    }
+    if (start_open) start_toggle();
+    cc_open = 0;
+    am_open = 1;
+    str_put(am_name, name, sizeof am_name);
+    pop_t0 = now_ms();
+    pop_glass_fresh = 0;
+    wp_dirty = 1;
+    dirty = 1;
+}
 
 #define NOTE_MAX  4
 #define NOTE_SHOW 5000
@@ -4112,6 +4430,7 @@ static struct {
     int have_a, have_b;
     int cap;
     uint64_t t0;
+    int frames;                   // drawn so far; the clock starts at the first
 } anim;
 
 static void render_all(void);
@@ -4181,6 +4500,7 @@ static int anim_setup(int kind, int n) {
     if (anim.w <= 0 || anim.h <= 0 || !anim_buffers(anim.w, anim.h)) return 0;
     anim.kind = kind;
     anim.have_a = anim.have_b = 0;
+    anim.frames = 0;
     return 1;
 }
 
@@ -4217,6 +4537,10 @@ static void anim_vanish(int kind, int n) {
 // One frame of it, over what render_all() has just drawn.
 static void anim_frame(void) {
     if (!anim.active) return;
+    // The clock starts with the first frame actually drawn: whatever kept the
+    // desktop from drawing until now must not eat the start of the motion.
+    if (!anim.frames) anim.t0 = now_ms();
+    anim.frames++;
     if (!anim.have_a) { grab(anim.a); anim.have_a = 1; }
     if (!anim.have_b) { grab(anim.b); anim.have_b = 1; }
 
@@ -4239,6 +4563,8 @@ static void anim_frame(void) {
     int cx = anim.tx - anim.x + (wcx - (anim.tx - anim.x)) * u / 256;
     int cy = anim.ty - anim.y + (wcy - (anim.ty - anim.y)) * u / 256;
     int64_t inv = ((int64_t)256 << 16) / s;
+    // The source column for the first one, in 16.16; each next is `inv` on.
+    int64_t fx0 = ((int64_t)wcx << 16) - (int64_t)cx * inv;
 
     volatile uint8_t *base = fb_get_base();
     uint32_t pitch = fb_get_pitch();
@@ -4246,16 +4572,19 @@ static void anim_frame(void) {
         uint32_t *d = (uint32_t *)(base + (size_t)(anim.y + j) * pitch) + anim.x;
         const uint32_t *ra = anim.a + j * anim.w;
         int sy = wcy + (int)(((int64_t)(j - cy) * inv) >> 16);
-        int rowok = sy >= 0 && sy < anim.h;
-        const uint32_t *sa = anim.a + (rowok ? sy : 0) * anim.w;
-        const uint32_t *sb = anim.b + (rowok ? sy : 0) * anim.w;
-        for (int i = 0; i < anim.w; i++) {
+        if (alpha <= 0 || sy < 0 || sy >= anim.h) {
+            // A row the window does not reach: the picture without it.
+            for (int i = 0; i < anim.w; i++) d[i] = ra[i];
+            continue;
+        }
+        const uint32_t *sa = anim.a + sy * anim.w;
+        const uint32_t *sb = anim.b + sy * anim.w;
+        int64_t fx = fx0;
+        for (int i = 0; i < anim.w; i++, fx += inv) {
+            int sx = (int)(fx >> 16);
             uint32_t out = ra[i];
-            if (rowok && alpha > 0) {
-                int sx = wcx + (int)(((int64_t)(i - cx) * inv) >> 16);
-                if (sx >= 0 && sx < anim.w && sb[sx] != sa[sx])
-                    out = ui_mix(out, sb[sx], alpha);
-            }
+            if ((unsigned)sx < (unsigned)anim.w && sb[sx] != sa[sx])
+                out = alpha >= 256 ? sb[sx] : ui_mix(out, sb[sx], alpha);
             d[i] = out;
         }
     }
@@ -4306,6 +4635,7 @@ static int windows_changed(void) {
 
 static void render_all(void) {
     uint64_t t0 = pf_on ? rdtsc() : 0, t1, t2, t3, t4;
+    last_frame_ms = now_ms();
     if (sample_stats() && popup_open()) menu_dirty = 1;   // the clock moved on
     cursor_restore();   // put back what the arrow covered last frame, first
     outline_hide();     // and the drag outline, which sits under the arrow
@@ -4334,6 +4664,7 @@ static void render_all(void) {
             uk_restore(&pop_keep);
             draw_start_menu();
             draw_control();
+            draw_appmenu();
             pop_fade();
             dmg_add(pop_keep.x, pop_keep.y, pop_keep.x + pop_keep.w, pop_keep.y + pop_keep.h);
         }
@@ -4362,12 +4693,14 @@ static void render_all(void) {
     if (popup_open()) {
         int rx, ry, rw, rh;
         if (start_open) sm_reach(&rx, &ry, &rw, &rh);
-        else cc_reach(&rx, &ry, &rw, &rh);
+        else if (cc_open) cc_reach(&rx, &ry, &rw, &rh);
+        else am_reach(&rx, &ry, &rw, &rh);
         uk_place(&pop_keep, rx, ry, rw, rh);
         uk_take(&pop_keep);
         pop_glass_fresh = 0;
         draw_start_menu();
         draw_control();
+        draw_appmenu();
         pop_fade();
         dmg_add(rx, ry, rx + rw, ry + rh);
         menu_dirty = 0;
@@ -5323,6 +5656,7 @@ static void push_binding(int code) {
 
 static void start_toggle(void) {
     cc_open = 0;
+    am_open = 0;
     cc_vol_drag = 0;
     start_open = !start_open;
     if (start_open) pop_t0 = now_ms();
@@ -5430,6 +5764,7 @@ static void taskbar_click(int mx, int my) {
     const struct tb_item *it = &tb_items[i];
     if (it->kind != TB_ORB) start_close();   // anything else on the island closes it
     if (it->kind != TB_STATUS && cc_open) { cc_open = 0; wp_dirty = 1; }
+    if (am_open) { am_open = 0; wp_dirty = 1; }
     switch (it->kind) {
     case TB_ORB:
         start_toggle();
@@ -5463,6 +5798,55 @@ static void taskbar_click(int mx, int my) {
     default:
         break;
     }
+}
+
+// A click in a program's list of windows.
+static void am_click(int key) {
+    int kind = (key >> 8) & 0xFF, arg = key & 0xFF;
+    am_collect();
+    switch (kind) {
+    case AMK_CARD:
+        if (arg < am_n) {
+            am_open = 0;
+            restore_window(am_win[arg]);
+            refresh_leaves();
+        }
+        break;
+    case AMK_CLOSE:
+        // The list stays up, one window shorter.
+        if (arg < am_n) close_window(am_win[arg]);
+        break;
+    case AMK_ALL: {
+        int w[AM_MAXW], k = am_n;
+        for (int i = 0; i < k; i++) w[i] = am_win[i];
+        for (int i = 0; i < k; i++) if (nodes[w[i]].used) close_window(w[i]);
+        am_open = 0;
+        break;
+    }
+    case AMK_NEW:
+        am_open = 0;
+        if (str_same(am_name, "sh")) {
+            new_window();
+        } else {
+            char path[48];
+            bin_path(path, sizeof path, am_name);
+            new_window_run(path, 0);
+        }
+        refresh_leaves();
+        break;
+    default:
+        break;
+    }
+    // The list may have moved under the pointer: light what is there now.
+    {
+        int32_t px, py;
+        mouse_position(&px, &py);
+        int k = am_open ? am_key_at(px, py) : -1;
+        hover_to(k == KEY_AM(AMK_INSIDE, 0) ? -1 : k);
+    }
+    wp_dirty = 1;
+    dirty = 1;
+    tb_valid = 0;
 }
 
 // Dragging the island by its glass: let go near an edge and it moves there.
@@ -5542,6 +5926,9 @@ static void handle_mouse(const struct mouse_event *me) {
         } else if (cc_open) {
             key = cc_key_at(mx, my);
             if (key == KEY_CC(CCK_INSIDE, 0)) key = -1;
+        } else if (am_open) {
+            key = am_key_at(mx, my);
+            if (key == KEY_AM(AMK_INSIDE, 0)) key = -1;
         } else {
             int n = window_at(mx, my);
             if (n >= 0) key = chrome_key(n, mx, my);
@@ -5648,7 +6035,26 @@ static void handle_mouse(const struct mouse_event *me) {
     // the way clicking a background window before its context menu appears
     // does everywhere else.
     if ((me->pressed | me->released) & MOUSE_RIGHT) {
-        if (on_taskbar) return;
+        if (on_taskbar) {
+            // On a program: its windows, to pick from, close, or add to.
+            if (me->pressed & MOUSE_RIGHT) {
+                int i = tb_item_at(mx, my);
+                if (i >= 0 && tb_items[i].kind == TB_APP) am_show(tb_items[i].name);
+                else if (am_open) { am_open = 0; wp_dirty = 1; dirty = 1; }
+            }
+            return;
+        }
+        if (am_open) {
+            if (me->pressed & MOUSE_RIGHT) {
+                int in = am_key_at(mx, my) >= 0;
+                am_open = 0;
+                wp_dirty = 1;
+                dirty = 1;
+                if (in) return;
+            } else if (am_key_at(mx, my) >= 0) {
+                return;
+            }
+        }
         int n = window_at(mx, my);
         if (n < 0) return;
         if (hit_test(n, mx, my) != HIT_CLIENT) return;
@@ -5692,6 +6098,15 @@ static void handle_mouse(const struct mouse_event *me) {
             if (key == KEY_CC(CCK_VOL, 0)) { cc_vol_drag = 1; cc_set_volume_at(mx); return; }
             press_key = key;
             press_win = -4;
+            menu_dirty = 1;
+            return;
+        }
+        // A program's windows: anything in it fires on release; outside, it goes.
+        if (am_open && !on_taskbar) {
+            int key = am_key_at(mx, my);
+            if (key < 0) { am_open = 0; wp_dirty = 1; dirty = 1; return; }
+            press_key = key;
+            press_win = -5;
             menu_dirty = 1;
             return;
         }
@@ -5854,6 +6269,12 @@ static void handle_mouse(const struct mouse_event *me) {
         }
         if (press_win == -4) {
             if (cc_open && cc_key_at(mx, my) == was_key) cc_click(was_key);
+            press_win = -1;
+            menu_dirty = 1;
+            return;
+        }
+        if (press_win == -5) {
+            if (am_open && am_key_at(mx, my) == was_key) am_click(was_key);
             press_win = -1;
             menu_dirty = 1;
             return;
@@ -6043,6 +6464,7 @@ void wm_route_input(void) {
 
         // The control panel takes Escape to close and nothing else.
         if (cc_open && ev.code == KEY_ESC) { cc_open = 0; wp_dirty = 1; dirty = 1; continue; }
+        if (am_open && ev.code == KEY_ESC) { am_open = 0; wp_dirty = 1; dirty = 1; continue; }
 
         // While the menu is up it owns the keyboard: no program should
         // receive the letters someone is typing into a search box. Each key
@@ -6211,6 +6633,17 @@ void wm_set_asleep(int on) { screen_asleep = on; }
 
 int wm_running(void) { return started; }
 int wm_lang(void) { return lang; }
+
+// Something is moving -- a window opening or closing, a popup coming up, a
+// notice sliding in -- and its next frame is due. The scheduler asks, and on
+// the desktop's core puts a running program down for a moment to draw it:
+// otherwise one busy program, alone on that core, starves the motion into a
+// slide show.
+int wm_wants_frame(void) {
+    if (!started || screen_asleep) return 0;
+    if (!anim.active && !pop_animating() && !note_animating()) return 0;
+    return now_ms() - last_frame_ms >= 8;
+}
 
 void wm_poll(void) {
     if (screen_asleep) return;
