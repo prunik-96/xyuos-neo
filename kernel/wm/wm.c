@@ -13,6 +13,7 @@
 #include "../fs/vfs.h"
 #include "../fs/vol.h"
 #include "../kernel/clip.h"
+#include "../kernel/clock.h"
 #include "../kernel/kio.h"
 #include "../drivers/mouse.h"
 #include "../drivers/audio.h"
@@ -2600,7 +2601,7 @@ static int sample_stats(void) {
     last_ticks = now; last_idle = idl;
     s_last = now;
 
-    rtc_read(&wm_clock);
+    clock_local_tm(&wm_clock);
 
     // Something new started playing: say what.
     {
@@ -7357,7 +7358,7 @@ void wm_start(void) {
     fb_enable_backbuffer();   // flicker-free: draw off-screen, blit per frame
     mouse_init(fb_get_width(), fb_get_height());
     kprintf("wm: double-buffer %s\n", fb_backbuffer_active() ? "ON" : "OFF (direct)");
-    rtc_read(&wm_clock);      // seed the clock so it shows the right time at once
+    clock_local_tm(&wm_clock);   // seed the clock so it shows the right time at once
 
     for (int i = 0; i < MAX_PANES; i++) panes[i].alive = 0;
     for (int i = 0; i < MAX_NODES; i++) nodes[i].used = 0;
@@ -7367,6 +7368,8 @@ void wm_start(void) {
     focused = -1;
 
     desk_load();              // language, theme, the island's edge
+    clock_load();             // the time zone, and what the board's clock holds
+    clock_local_tm(&wm_clock);
     started = 1;
     dirty = 1;
     // The windows kept with "keep this layout", or else a first shell.

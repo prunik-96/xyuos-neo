@@ -22,6 +22,7 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <tty.h>
+#include <time.h>
 #include "xyuos_syscall.h"
 
 #define LINE_MAX 1024
@@ -769,6 +770,101 @@ static int mkdir_p(const char *p) {
 static int loop_ctl;                /* 1 break, 2 continue */
 static int want_exit, exit_code;
 
+/* date: the time, and the clock's settings.
+ *   date               local time, with the zone
+ *   date -u            UTC
+ *   date sync [SERVER] set the clock from the network now
+ *   date zone [NAME]   the zone, or change it
+ *   date zones         the zones there are */
+static void fmt_offset(char *out, int n, int off) {
+    int a = off < 0 ? -off : off;
+    if (a % 3600) snprintf(out, n, "UTC%c%d:%02d", off < 0 ? '-' : '+', a / 3600, a / 60 % 60);
+    else snprintf(out, n, a ? "UTC%c%d" : "UTC", off < 0 ? '-' : '+', a / 3600);
+}
+
+static int cmd_date(int argc, char **argv) {
+    static const char *wd_ru[7] = { "вс", "пн", "вт", "ср", "чт", "пт", "сб" };
+    static const char *wd_en[7] = { "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
+    struct clock_info ci;
+    sysclock_info(&ci);
+    char off[24];
+
+    if (argc >= 2 && !strcmp(argv[1], "sync")) {
+        printf(T("спрашиваю время у %s...\n", "asking %s for the time...\n"),
+               argc >= 3 ? argv[2] : "pool.ntp.org");
+        if (!net_up()) { printf(T("date: нет сети\n", "date: no network\n")); return 1; }
+        int r = sysclock_sync(argc >= 3 ? argv[2] : 0);
+        if (r < 0) { printf(T("date: нет сети\n", "date: no network\n")); return 1; }
+        if (r == 0) { printf(T("date: сервер времени не ответил\n", "date: no time server answered\n")); return 1; }
+        sysclock_info(&ci);
+        int d = ci.delta_ms, ad = d < 0 ? -d : d;
+        printf(T("часы установлены по %s: поправка %c%d.%03d с, ответ за %d мс\n",
+                 "clock set from %s: off by %c%d.%03d s, answer in %d ms\n"),
+               ci.server, d < 0 ? '-' : '+', ad / 1000, ad % 1000, ci.rtt_ms);
+        argc = 1;              /* and show it */
+    }
+    if (argc >= 2 && !strcmp(argv[1], "zones")) {
+        struct clock_zone z;
+        for (int i = 0; sysclock_zone(i, &z) == 0; i++) {
+            fmt_offset(off, sizeof off, z.offset_now);
+            printf("%s%-20s %-9s %s\n", strcmp(z.name, ci.zone) ? "  " : "* ",
+                   z.name, off, en ? z.en : z.ru);
+        }
+        return 0;
+    }
+    if (argc >= 2 && !strcmp(argv[1], "zone")) {
+        if (argc >= 3) {
+            /* A city's own name finds its zone too: "date zone Moscow". */
+            const char *want = argv[2];
+            struct clock_zone z;
+            const char *hit = 0;
+            static char found[40];
+            for (int i = 0; sysclock_zone(i, &z) == 0 && !hit; i++) {
+                const char *slash = strchr(z.name, '/');
+                /* ...and so does a Russian one, any of the cities it lists. */
+                int ru_hit = 0;
+                size_t wl = strlen(want);
+                for (const char *c = z.ru; *c && !ru_hit; ) {
+                    if (!strncmp(c, want, wl) && (c[wl] == ',' || c[wl] == 0)) ru_hit = 1;
+                    while (*c && *c != ',') c++;
+                    while (*c == ',' || *c == ' ') c++;
+                }
+                if (ru_hit || !strcasecmp(z.name, want) || (slash && !strcasecmp(slash + 1, want))) {
+                    snprintf(found, sizeof found, "%s", z.name);
+                    hit = found;
+                }
+            }
+            if (!hit || sysclock_set_zone(hit) != 0) {
+                printf(T("date: нет такого пояса: %s (список: date zones)\n",
+                         "date: no such zone: %s (see: date zones)\n"), want);
+                return 1;
+            }
+            sysclock_info(&ci);
+        }
+        fmt_offset(off, sizeof off, ci.offset);
+        printf("%s (%s%s)\n", ci.zone, off, ci.dst ? T(", летнее время", ", summer time") : "");
+        return 0;
+    }
+
+    int utc = argc >= 2 && !strcmp(argv[1], "-u");
+    if (argc >= 2 && !utc) {
+        printf(T("использование: date [-u] | date sync [сервер] | date zone [пояс] | date zones\n",
+                 "usage: date [-u] | date sync [server] | date zone [name] | date zones\n"));
+        return 2;
+    }
+    time_t now = (time_t)(ci.utc_ms / 1000);
+    struct tm *tm = utc ? gmtime(&now) : localtime(&now);
+    fmt_offset(off, sizeof off, utc ? 0 : ci.offset);
+    printf("%s %02d.%02d.%04d %02d:%02d:%02d %s",
+           en ? wd_en[tm->tm_wday] : wd_ru[tm->tm_wday], tm->tm_mday, tm->tm_mon + 1,
+           tm->tm_year + 1900, tm->tm_hour, tm->tm_min, tm->tm_sec, off);
+    if (!utc) printf("  %s", ci.zone);
+    printf("\n");
+    if (!ci.synced)
+        printf(T("(часы ещё не сверены с сетью: date sync)\n", "(not yet set from the network: date sync)\n"));
+    return 0;
+}
+
 static int builtin(int argc, char **argv) {
     const char *cmd = argv[0];
     const char *a1 = argc > 1 ? argv[1] : "";
@@ -891,12 +987,7 @@ static int builtin(int argc, char **argv) {
         return 1;
     }
     if (!strcmp(cmd, "suspend")) { xyuos_power(XYUOS_SLEEP); return 0; }
-    if (!strcmp(cmd, "date")) {
-        struct xyuos_tm t;
-        xyuos_time(&t);
-        printf("%02d.%02d.%04d %02d:%02d:%02d\n", t.day, t.mon, t.year, t.hour, t.min, t.sec);
-        return 0;
-    }
+    if (!strcmp(cmd, "date")) return cmd_date(argc, argv);
     if (!strcmp(cmd, "ifconfig") || !strcmp(cmd, "ip")) {
         if (!net_up()) { printf(T("сеть: нет связи (есть ли сетевая карта или телефон-модем?)\n",
                                   "net: no link (is there a NIC or a tethered phone?)\n")); return 1; }
@@ -1334,6 +1425,8 @@ static void help(const char *topic) {
     printf(T("текст      grep wc head tail sort uniq tee echo edit\n", "text       grep wc head tail sort uniq tee echo edit\n"));
     printf(T("система    ps kill free uname date sleep smp clear cd pwd env export\n",
              "system     ps kill free uname date sleep smp clear cd pwd env export\n"));
+    printf(T("время      date [-u], date sync (сверить по сети), date zone Москва, date zones\n",
+             "time       date [-u], date sync (set from network), date zone Moscow, date zones\n"));
     printf(T("питание    reboot poweroff suspend\n", "power      reboot poweroff suspend\n"));
     printf(T("сеть       ifconfig ping wget curl\n", "net        ifconfig ping wget curl\n"));
     printf(T("флешки     /usb, /usb2, ... (FAT, exFAT; можно вынимать на ходу)\n",

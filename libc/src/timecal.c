@@ -20,6 +20,7 @@
  * form a repeating pattern with no special cases.
  */
 
+#include "xyuos_syscall.h"
 #include <time.h>
 #include <stdio.h>
 
@@ -83,12 +84,24 @@ struct tm *gmtime(const time_t *t) {
     return &tm;
 }
 
-/* This system has no timezone database and no way to learn one, so local
- * time is UTC. Saying so here is better than an offset invented from
- * nothing. */
-struct tm *localtime(const time_t *t) { return gmtime(t); }
+/* Local time is the zone the system is set to (SYS_CLOCK knows its rules,
+ * summer time included). */
+static long zone_offset(long utc) {
+    return (long)xyuos_syscall3(SYS_CLOCK, CLOCKOP_OFFSET, utc, 0);
+}
 
-time_t mktime(struct tm *tm) {
+struct tm *localtime(const time_t *t) {
+    if (t == NULL) return NULL;
+    long off = zone_offset((long)*t);
+    time_t lt = *t + off;
+    struct tm *r = gmtime(&lt);
+    /* Summer time is the larger of the offsets half a year apart. */
+    if (r) r->tm_isdst = off > zone_offset((long)*t - 183L * 86400) ? 1 : 0;
+    return r;
+}
+
+/* The inverse of gmtime: the fields as UTC. */
+static time_t utc_fields(struct tm *tm) {
     if (tm == NULL) return (time_t)-1;
 
     /* Fields out of range are normalised, as the standard requires: callers
@@ -112,6 +125,22 @@ time_t mktime(struct tm *tm) {
     return t;
 }
 
+time_t timegm(struct tm *tm) { return utc_fields(tm); }
+
+/* The fields are local time: as UTC they are `offset` too late. The offset
+ * is the one in force at that moment, asked of the zone a second time in
+ * case the first guess fell across a summer-time change. */
+time_t mktime(struct tm *tm) {
+    if (tm == NULL) return (time_t)-1;
+    time_t as_utc = utc_fields(tm);
+    long off = zone_offset((long)as_utc);
+    off = zone_offset((long)as_utc - off);
+    time_t t = as_utc - off;
+    struct tm *n = localtime(&t);
+    if (n != NULL) *tm = *n;
+    return t;
+}
+
 static const char wdays[7][4] = { "Sun", "Mon", "Tue", "Wed", "Thu",
                                   "Fri", "Sat" };
 static const char months[12][4] = { "Jan", "Feb", "Mar", "Apr", "May", "Jun",
@@ -130,7 +159,7 @@ char *asctime(const struct tm *tm) {
     return buf;
 }
 
-char *ctime(const time_t *t) { return asctime(gmtime(t)); }
+char *ctime(const time_t *t) { return asctime(localtime(t)); }
 
 /* A small subset: the conversions a log line or an HTTP date needs. An
  * unknown one is copied through with its percent, so a caller sees what it

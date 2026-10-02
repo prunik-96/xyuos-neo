@@ -16,6 +16,7 @@
 #include <ctype.h>
 #include <stdio.h>
 #include <sys/mman.h>
+#include "xyuos_syscall.h"
 
 #define FD_OFFSET 3
 
@@ -108,15 +109,13 @@ void __assert_fail(const char *expr, const char *file, int line) {
 }
 
 /* --- time ---------------------------------------------------------------
- * There is no RTC driver yet, so the clock is fixed. tcc only needs this for
- * the __DATE__/__TIME__ macros and for -bench timings, both of which are
- * cosmetic; a fixed date is honest and predictable rather than pretending.
- */
-#define FIXED_EPOCH 1752969600L   /* 2025-07-20 00:00:00 UTC */
+ * The kernel's clock: UTC, set from the network when there is one. */
 
 time_t time(time_t *t) {
-    if (t) *t = FIXED_EPOCH;
-    return FIXED_EPOCH;
+    long long ms = xyuos_syscall3(SYS_CLOCK, CLOCKOP_NOW_MS, 0, 0);
+    time_t s = (time_t)(ms / 1000);
+    if (t) *t = s;
+    return s;
 }
 
 /* localtime, gmtime, mktime and the rest of the calendar are in timecal.c.
@@ -126,7 +125,8 @@ time_t time(time_t *t) {
 
 int gettimeofday(struct timeval *tv, void *tz) {
     (void)tz;
-    if (tv) { tv->tv_sec = FIXED_EPOCH; tv->tv_usec = 0; }
+    long long ms = xyuos_syscall3(SYS_CLOCK, CLOCKOP_NOW_MS, 0, 0);
+    if (tv) { tv->tv_sec = (time_t)(ms / 1000); tv->tv_usec = (long)(ms % 1000) * 1000; }
     return 0;
 }
 

@@ -15,6 +15,7 @@
 #include "../../fs/vol.h"
 #include "../../fs/ext2.h"
 #include "../../kernel/clip.h"
+#include "../../kernel/clock.h"
 #include "../../drivers/sensors.h"
 #include "../../fs/fatfs.h"
 #include "../../wm/wm.h"
@@ -595,10 +596,69 @@ static uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
             }
             return 0;
         }
+        case SYS_CLOCK: {
+            if (a1 == CLOCKOP_NOW_MS) return (uint64_t)clock_utc_ms();
+            if (a1 == CLOCKOP_OFFSET) return (uint64_t)(int64_t)clock_offset((int64_t)a2);
+            if (a1 == CLOCKOP_INFO) {
+                if (!vmm_user_range_ok(a2, sizeof(struct clock_info))) return (uint64_t)-1;
+                struct clock_info *ci = (struct clock_info *)(uintptr_t)a2;
+                struct clock_state cs;
+                clock_state(&cs);
+                ci->utc_ms = clock_utc_ms();
+                int64_t now = ci->utc_ms / 1000;
+                ci->offset = clock_offset(now);
+                ci->dst = clock_is_dst(now);
+                ci->synced = cs.synced;
+                ci->rtc_known = cs.rtc_known;
+                ci->rtc_skew = cs.rtc_skew;
+                ci->delta_ms = cs.delta_ms;
+                ci->rtt_ms = cs.rtt_ms;
+                ci->sync_utc = cs.sync_utc;
+                const char *zn = clock_zone_name();
+                int i = 0;
+                for (; zn[i] && i < 39; i++) ci->zone[i] = zn[i];
+                ci->zone[i] = 0;
+                for (i = 0; cs.server[i] && i < 63; i++) ci->server[i] = cs.server[i];
+                ci->server[i] = 0;
+                return 0;
+            }
+            if (a1 == CLOCKOP_SYNC || a1 == CLOCKOP_SETZONE) {
+                char name[64];
+                name[0] = 0;
+                if (a2) {
+                    if (!vmm_user_range_ok(a2, 1)) return (uint64_t)-1;
+                    const char *s = (const char *)(uintptr_t)a2;
+                    int i = 0;
+                    for (; i < 63 && vmm_user_range_ok(a2 + (uint64_t)i, 1) && s[i]; i++) name[i] = s[i];
+                    name[i] = 0;
+                }
+                if (a1 == CLOCKOP_SETZONE) return (uint64_t)(int64_t)clock_set_zone(name);
+                return (uint64_t)(int64_t)clock_sync(name[0] ? name : 0, 0);
+            }
+            if (a1 == CLOCKOP_ZONE) {
+                if (!vmm_user_range_ok(a3, sizeof(struct clock_zone))) return (uint64_t)-1;
+                const char *n, *ru, *en;
+                int sm, rule;
+                if (clock_zone_get((int)a2, &n, &ru, &en, &sm, &rule) != 0) return (uint64_t)-1;
+                struct clock_zone *cz = (struct clock_zone *)(uintptr_t)a3;
+                int i;
+                for (i = 0; n[i] && i < 39; i++) cz->name[i] = n[i];
+                cz->name[i] = 0;
+                for (i = 0; ru[i] && i < 63; i++) cz->ru[i] = ru[i];
+                cz->ru[i] = 0;
+                for (i = 0; en[i] && i < 63; i++) cz->en[i] = en[i];
+                cz->en[i] = 0;
+                cz->std_min = sm;
+                cz->rule = rule;
+                cz->offset_now = clock_zone_offset_now((int)a2);   // its own rule, applied to now
+                return 0;
+            }
+            return (uint64_t)-1;
+        }
         case SYS_TIME: {
             if (!vmm_user_range_ok(a1, sizeof(struct sys_tm))) return (uint64_t)-1;
             struct rtc_time t;
-            rtc_read(&t);
+            clock_local_tm(&t);
             struct sys_tm *out = (struct sys_tm *)(uintptr_t)a1;
             out->sec = t.sec; out->min = t.min; out->hour = t.hour;
             out->day = t.day; out->mon = t.mon; out->year = t.year;

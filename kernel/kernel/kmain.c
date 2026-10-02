@@ -24,6 +24,7 @@
 #include "../drivers/xhci.h"
 #include "../drivers/virtio_gpu.h"
 #include "../drivers/sensors.h"
+#include "clock.h"
 #include "../drivers/power.h"
 #include "../wm/wm.h"
 #include "../wm/splash.h"
@@ -338,6 +339,7 @@ void kernel_main(uint32_t multiboot_addr) {
     // PS/2 driver keeps working alongside it. xhci_poll() is driven by the
     // timer tick (see pit.c).
     sensors_init();               // the CPU's thermometer and clock counters
+    clock_init();                 // the wall clock: the board's clock, read once
     power_init(multiboot_addr);   // ACPI: learn how to power off / reset
 
     // Before the filesystem: the root filesystem may be on the USB stick the

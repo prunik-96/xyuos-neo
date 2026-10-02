@@ -16,16 +16,16 @@ struct tm {
     int tm_wday, tm_yday, tm_isdst;
 };
 
-// There is no RTC driver: the clock is fixed. Callers get a stable, plainly
-// wrong date rather than a pretend-accurate one.
+// UTC seconds since 1970, from the kernel's clock (set over NTP).
 time_t     time(time_t *t);
 
-/* Real conversions, in both directions: mktime(gmtime(t)) gives back t. The
- * clock this system starts from is wrong; arithmetic on it is not. There is
- * no timezone database here and no way to learn one, so local time is UTC. */
+/* Real conversions, in both directions: mktime(localtime(t)) and
+ * timegm(gmtime(t)) give back t. Local time is the zone set in the control
+ * panel (or `date zone`), summer time included. */
 struct tm *localtime(const time_t *t);
 struct tm *gmtime(const time_t *t);
 time_t     mktime(struct tm *tm);
+time_t     timegm(struct tm *tm);
 /* difftime returns a double, so it is defined in math.c -- the one file in
  * this libc compiled with floating-point registers. Declared here because
  * this is where callers look for it. */

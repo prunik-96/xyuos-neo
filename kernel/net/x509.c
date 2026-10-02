@@ -1,6 +1,7 @@
 #include "x509.h"
 #include "../crypto/crypto.h"
 #include "../drivers/rtc.h"
+#include "../kernel/clock.h"
 #include "roots.h"
 
 /* X.509, cut down to the question that matters.
@@ -460,7 +461,7 @@ int x509_verify_chain(const uint8_t *const *certs, const int *lens, int n,
         }
     }
 
-    int64_t now = rtc_now_unix();
+    int64_t now = clock_utc();
     /* A clock that is obviously wrong would reject the whole web, so say so
      * rather than blaming the certificate. */
     if (now < 1600000000LL) { *why = "the system clock is not set"; return 0; }

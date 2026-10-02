@@ -191,9 +191,18 @@ void xyuos_power(int op);
 #define XYUOS_OFF    1
 #define XYUOS_SLEEP  2
 
-/* Wall-clock time from the CMOS RTC (UTC on most machines). */
+/* The local time, broken down (time() is UTC). */
 struct xyuos_tm { int sec, min, hour, day, mon, year; };
 void xyuos_time(struct xyuos_tm *out);
+
+/* The system clock (SYS_CLOCK): what it knows of itself, setting it from the
+ * network now, and the time zone. */
+struct clock_info;
+struct clock_zone;
+int sysclock_info(struct clock_info *out);
+int sysclock_sync(const char *server);           /* 1 set, 0 no answer, -1 no network */
+int sysclock_set_zone(const char *name);         /* 0, or -1 for an unknown zone */
+int sysclock_zone(int i, struct clock_zone *out);/* 0, or -1 past the last */
 
 /* USB FAT32 data stick. usb_mount() auto-mounts the first FAT32 stick (returns
  * 1 if found). usb_list() fills up to `max` entries of a directory, returns the

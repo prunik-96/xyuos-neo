@@ -16,6 +16,7 @@
  * size. Bold is the same glyph drawn twice, a pixel apart.
  */
 
+#include <time.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -3856,20 +3857,9 @@ static long long ll_of(const char *v) {
     return neg ? -n : n;
 }
 
-/* Seconds since 1970, out of the clock on the board. Days-from-civil, which
- * is the usual way of doing it without a table of month lengths. */
+/* Seconds since 1970, UTC: what cookie lifetimes are counted in. */
 static long long now_epoch(void) {
-    struct xyuos_tm t;
-    xyuos_time(&t);
-    int y = t.year, m = t.mon, d = t.day;
-    if (y < 1970) return 0;
-    y -= m <= 2;
-    long long era = (y >= 0 ? y : y - 399) / 400;
-    unsigned yoe = (unsigned)(y - era * 400);
-    unsigned doy = (unsigned)((153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1);
-    unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    long long days = era * 146097 + (long long)doe - 719468;
-    return days * 86400 + t.hour * 3600 + t.min * 60 + t.sec;
+    return (long long)time(NULL);
 }
 
 /* Does a cookie for `chost` reach `host`? Either it is that host, or the

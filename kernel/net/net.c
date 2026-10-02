@@ -1,4 +1,5 @@
 #include "net.h"
+#include "../kernel/clock.h"
 #include "http.h"
 #include "nic.h"
 #include "tls.h"
@@ -956,6 +957,75 @@ static int dns_query(const char *name, uint32_t *ip) {
 }
 
 // ==========================================================================
+//  NTP
+// ==========================================================================
+//
+// 48 bytes out, 48 back. The server copies our transmit stamp into its
+// "origin" field, which is how an answer is told from a stale or forged one;
+// what we send there need not be a time at all, only something unguessable
+// enough, so it is the counter. The answer carries when the server got the
+// request (T2) and when it sent the reply (T3); the time it spent in between
+// is not network, so the one-way trip is (round trip - (T3 - T2)) / 2, and
+// the time at arrival T3 plus that.
+
+static void put_be32(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16); p[2] = (uint8_t)(v >> 8); p[3] = (uint8_t)v;
+}
+static uint32_t get_be32(const uint8_t *p) {
+    return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3];
+}
+// An NTP stamp (seconds since 1900, 32.32) in milliseconds since 1970.
+static int64_t ntp_ms(const uint8_t *p) {
+    int64_t s = (int64_t)get_be32(p) - 2208988800LL;
+    return s * 1000 + (int64_t)(((uint64_t)get_be32(p + 4) * 1000) >> 32);
+}
+
+int net_ntp(uint32_t ip, int tries, int64_t *utc_ms, uint64_t *at_us, uint32_t *rtt_ms) {
+    if (!up) return 0;
+    static uint16_t seq;
+    uint16_t sport = (uint16_t)(40000 + (++seq % 4000));
+    udp_box_t *box = udp_box_open(sport);
+    if (!box) return 0;
+
+    int ok = 0;
+    for (int t = 0; t < tries && !ok; t++) {
+        uint8_t q[48];
+        nmemset(q, 0, sizeof q);
+        q[0] = 0x23;                              // no leap warning, version 4, client
+        uint64_t t1 = now_us();
+        uint32_t tag_hi = (uint32_t)(t1 >> 32) ^ 0x6E54C0DEu, tag_lo = (uint32_t)t1 ^ (uint32_t)seq;
+        put_be32(q + 40, tag_hi);
+        put_be32(q + 44, tag_lo);
+        box->have = 0;
+        if (udp_send(ip, sport, 123, q, sizeof q) != 0) break;
+        uint64_t deadline = now_ms() + 1000;
+        while (!ok && now_ms() < deadline) {
+            net_poll();
+            if (!box->have) continue;
+            uint64_t t4 = now_us();
+            const uint8_t *r = box->data;
+            int good = box->sip == ip && box->len >= 48
+                       && (r[0] & 7) == 4                 // a server's answer
+                       && (r[0] >> 6) != 3                // its clock is set
+                       && r[1] >= 1 && r[1] <= 15         // stratum: not a "kiss of death"
+                       && get_be32(r + 24) == tag_hi && get_be32(r + 28) == tag_lo;
+            if (good) {
+                int64_t t2 = ntp_ms(r + 32), t3 = ntp_ms(r + 40);
+                int64_t rtt = (int64_t)(t4 - t1) / 1000 - (t3 - t2);
+                if (rtt < 0) rtt = 0;
+                *utc_ms = t3 + rtt / 2;
+                *at_us = t4;
+                *rtt_ms = (uint32_t)rtt;
+                ok = 1;
+            }
+            box->have = 0;
+        }
+    }
+    udp_box_close(box);
+    return ok;
+}
+
+// ==========================================================================
 //  fetching on its own stack
 // ==========================================================================
 //
@@ -1646,6 +1716,8 @@ int net_up(void) {
 
     if (dhcp_run()) {
         up = 1;
+        // The network is the one thing that knows what time it is.
+        clock_sync(0, 1);
         kprintf("net: %d.%d.%d.%d/%d gw %d.%d.%d.%d dns %d.%d.%d.%d\n",
                 (our_ip>>24)&0xFF,(our_ip>>16)&0xFF,(our_ip>>8)&0xFF,our_ip&0xFF,
                 __builtin_popcount(net_mask),

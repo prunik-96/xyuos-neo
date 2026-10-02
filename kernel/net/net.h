@@ -79,6 +79,12 @@ void net_tcp_release(int h);
 // How many of the eight are currently held. For the status line and tests.
 int  net_tcp_open_count(void);
 
+// One NTP exchange with `ip` (the simple client of RFC 4330), up to `tries`
+// requests a second apart. On an answer: *utc_ms is UTC at the moment it
+// arrived, *at_us that moment by pit_now_us(), *rtt_ms the round trip less the
+// server's own time. Returns 1 then, else 0.
+int net_ntp(uint32_t ip, int tries, int64_t *utc_ms, uint64_t *at_us, uint32_t *rtt_ms);
+
 // Parse "a.b.c.d" into a host-order address. Returns 1 on success.
 int net_parse_ip(const char *s, uint32_t *out);
 

@@ -49,7 +49,7 @@
 #define SYS_PIPE      28  // create a pipe -> its index, or -1
 #define SYS_PIPECLOSE 29  // pipe_close(idx=a1); clean up a half-wired pipeline
 #define SYS_POWER     30  // op=a1: 0 reboot, 1 power off, 2 sleep (halt until key)
-#define SYS_TIME      31  // fill struct sys_tm *out (a1) with the RTC wall clock
+#define SYS_TIME      31  // fill struct sys_tm *out (a1) with the local time
 #define SYS_USBFS     32  // FAT32 on the USB data stick; a1 = struct usbfs_req *
 #define SYS_NET       33  // IPv4 stack; a1 = struct net_req *
 #define SYS_GFX       34  // raw pixel surface for the caller's pane; a1 = op
@@ -134,6 +134,35 @@ struct uvol {
 #define SYS_ENV       54
 #define ENVOP_GET 0
 #define ENVOP_SET 1
+
+// The wall clock and the time zone. a1 = CLOCKOP_*.
+#define SYS_CLOCK     55
+#define CLOCKOP_NOW_MS  0        // -> UTC, milliseconds since 1970
+#define CLOCKOP_INFO    1        // a2 = struct clock_info *
+#define CLOCKOP_SYNC    2        // a2 = server name or 0 -> 1 set, 0 no answer, -1 no network
+#define CLOCKOP_SETZONE 3        // a2 = zone name ("Europe/Moscow") -> 0, or -1
+#define CLOCKOP_ZONE    4        // a2 = index, a3 = struct clock_zone * -> 0, or -1 past the end
+#define CLOCKOP_OFFSET  5        // a2 = UTC seconds -> seconds east of UTC then
+struct clock_info {
+    long long utc_ms;            // now
+    int  offset;                 // seconds east of UTC now, summer time included
+    int  dst;                    // 1 while summer time is on
+    int  synced;                 // set from NTP since boot
+    int  rtc_known;              // what the board's clock holds is known
+    int  rtc_skew;               // the board's clock minus UTC, seconds
+    int  delta_ms;               // how far off the last sync found the clock
+    int  rtt_ms;
+    long long sync_utc;          // when it was last set from NTP (seconds), 0 never
+    char zone[40];
+    char server[64];
+};
+struct clock_zone {
+    char name[40];               // "Europe/Moscow"
+    char ru[64], en[64];         // "Москва, Санкт-Петербург"
+    int  std_min;                // standard offset, minutes
+    int  rule;                   // summer time: 0 none, 1 European, 2 North American
+    int  offset_now;             // seconds, now
+};
 
 // The clipboard, shared by every program. a1 = struct clip_req *.
 #define SYS_CLIP      53
@@ -232,7 +261,7 @@ struct winspawn {
     const char *arg;
 };
 
-// SYS_TIME output: broken-down UTC time from the CMOS RTC.
+// SYS_TIME output: the local time, broken down (see SYS_CLOCK for UTC).
 struct sys_tm { int sec, min, hour, day, mon, year; };
 
 // SYS_USBFS: one directory entry returned to userland.

@@ -8,6 +8,7 @@
 #include "fatfs.h"
 #include "vol.h"
 #include "../drivers/rtc.h"
+#include "../kernel/clock.h"
 #include "../mm/heap.h"
 #include "../kernel/kio.h"
 #include <stddef.h>
@@ -227,10 +228,11 @@ static uint32_t clus_at(struct vol *v, uint32_t first, int contig, uint32_t k, s
 
 // --- time ----------------------------------------------------------------------
 
-// Now, as FAT and exFAT pack it: date << 16 | time, two-second steps.
+// Now, as FAT and exFAT pack it: date << 16 | time, two-second steps. Local
+// time, as every other system that writes FAT does.
 static uint32_t dos_now(void) {
     struct rtc_time t;
-    rtc_read(&t);
+    clock_local_tm(&t);
     if (t.year < 1980) t.year = 1980;
     uint32_t date = ((uint32_t)(t.year - 1980) << 9) | ((uint32_t)t.mon << 5) | (uint32_t)t.day;
     uint32_t time = ((uint32_t)t.hour << 11) | ((uint32_t)t.min << 5) | (uint32_t)(t.sec / 2);
@@ -247,7 +249,8 @@ static int64_t dos_unix(uint32_t d) {
     t.min = (int)((d >> 5) & 0x3F);
     t.sec = (int)(d & 0x1F) * 2;
     if (t.mon < 1 || t.mon > 12 || t.day < 1) return 0;
-    return rtc_to_unix(&t);
+    int64_t local = rtc_to_unix(&t);
+    return local - clock_offset(local);
 }
 
 // --- names ---------------------------------------------------------------------

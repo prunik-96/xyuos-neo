@@ -117,6 +117,19 @@ void xyuos_time(struct xyuos_tm *out) {
     xyuos_syscall3(SYS_TIME, (long)out, 0, 0);
 }
 
+int sysclock_info(struct clock_info *out) {
+    return (int)xyuos_syscall3(SYS_CLOCK, CLOCKOP_INFO, (long)out, 0);
+}
+int sysclock_sync(const char *server) {
+    return (int)xyuos_syscall3(SYS_CLOCK, CLOCKOP_SYNC, (long)server, 0);
+}
+int sysclock_set_zone(const char *name) {
+    return (int)xyuos_syscall3(SYS_CLOCK, CLOCKOP_SETZONE, (long)name, 0);
+}
+int sysclock_zone(int i, struct clock_zone *out) {
+    return (int)xyuos_syscall3(SYS_CLOCK, CLOCKOP_ZONE, i, (long)out);
+}
+
 /* Must match struct usbfs_req in the kernel's syscall.h. */
 struct usbfs_req { int op; const char *path; void *buf; unsigned int len; int result; };
 

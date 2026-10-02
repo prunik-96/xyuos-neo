@@ -1,6 +1,7 @@
 #include "ext2.h"
 #include "../drivers/blkdev.h"
 #include "../drivers/rtc.h"
+#include "../kernel/clock.h"
 #include "../kernel/kio.h"
 #include <stddef.h>
 #include "../mm/heap.h"
@@ -762,7 +763,7 @@ static int write_impl(uint32_t inode_num, uint32_t offset, const void *buf, uint
         dirty = 1;
     }
     if (total > 0) {                        // record the modification time
-        inode.i_mtime = inode.i_ctime = (uint32_t)rtc_now_unix();
+        inode.i_mtime = inode.i_ctime = (uint32_t)clock_utc();
         dirty = 1;
     }
     if (dirty) put_inode(inode_num, &inode);
@@ -1066,7 +1067,7 @@ static int ext2_create_impl(uint32_t parent_inode_num, const char *name, int is_
     ni.i_links_count = is_dir ? 2 : 1;
     ni.i_size = 0;
     ni.i_blocks = 0;
-    ni.i_atime = ni.i_ctime = ni.i_mtime = (uint32_t)rtc_now_unix();
+    ni.i_atime = ni.i_ctime = ni.i_mtime = (uint32_t)clock_utc();
 
     if (is_dir) {
         int dirty = 0;
