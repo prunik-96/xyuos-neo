@@ -223,6 +223,11 @@ static int split_request = 0;  // set by the shell's `hyper` command
 static int started = 0;    // wm_start() has run; wm_poll() is meaningful
 static int dirty = 0;      // something changed; repaint on the next poll
 static int theme = 0;      // index into THEMES[] (0 = light glass)
+// The language the desktop speaks: 0 Russian, 1 English. Every word it
+// shows is written both ways where it is used, L("слово", "word"), so the
+// two can never drift apart into a table nobody reads.
+static int lang = 0;
+#define L(ru, en) (lang ? (en) : (ru))
 static int dblclick_ms = 400;   // how close two clicks must be to be a double
 #define TH (&THEMES[theme])
 
@@ -1276,7 +1281,7 @@ static void paint_chrome(int n, int focus) {
     if (nd->pinned && cap_glow(n, WB_PIN)) {
         char t[48];
         int q = 0;
-        const char *a = "Колесо мыши — прозрачность · ";
+        const char *a = L("Колесо мыши — прозрачность · ", "Mouse wheel — opacity · ");
         while (*a) t[q++] = *a++;
         q += u2s(t + q, (unsigned)(nd->alpha * 100 + 127) / 255);
         t[q++] = '%';
@@ -2096,9 +2101,12 @@ static void island_reach(int *x, int *y, int *w, int *h) {
 
 static void two_digits(char *b, int v) { b[0] = (char)('0' + (v / 10) % 10); b[1] = (char)('0' + v % 10); }
 
-static const char *const wdays_ru[7] = { "Вс", "Пн", "Вт", "Ср", "Чт", "Пт", "Сб" };
-static const char *const months_ru[12] = { "янв", "фев", "мар", "апр", "мая", "июн",
-                                           "июл", "авг", "сен", "окт", "ноя", "дек" };
+static const char *const wdays_s[2][7] = {
+    { "Вс", "Пн", "Вт", "Ср", "Чт", "Пт", "Сб" },
+    { "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" } };
+static const char *const months_s[2][12] = {
+    { "янв", "фев", "мар", "апр", "мая", "июн", "июл", "авг", "сен", "окт", "ноя", "дек" },
+    { "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" } };
 
 static int dow(int y, int m, int d) {          // 0 = Sunday
     static const int t[] = { 0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4 };
@@ -2114,15 +2122,18 @@ static uint32_t accent_ink(const theme_t *T, int k) {
 
 // A program's name as a person reads it, for the name over its icon.
 static const char *program_label(const char *file) {
-    static const struct { const char *f, *n; } names[] = {
-        { "files", "Файлы" }, { "web", "Браузер" }, { "sh", "Терминал" },
-        { "note", "Блокнот" }, { "play", "Музыка" }, { "taskmgr", "Диспетчер задач" },
-        { "control", "Настройки" }, { "devmgr", "Устройства" }, { "view", "Просмотр" },
-        { "netsurf", "NetSurf" }, { "doom", "DOOM" }, { "python", "Python" },
-        { "cc", "Компилятор C" }, { "edit", "Редактор" }, { "fm", "Файлы (текст)" },
+    static const struct { const char *f, *n, *en; } names[] = {
+        { "files", "Файлы", "Files" }, { "web", "Браузер", "Browser" },
+        { "sh", "Терминал", "Terminal" }, { "note", "Блокнот", "Notepad" },
+        { "play", "Музыка", "Music" }, { "taskmgr", "Диспетчер задач", "Task manager" },
+        { "control", "Настройки", "Settings" }, { "devmgr", "Устройства", "Devices" },
+        { "view", "Просмотр", "Viewer" }, { "netsurf", "NetSurf", "NetSurf" },
+        { "doom", "DOOM", "DOOM" }, { "python", "Python", "Python" },
+        { "cc", "Компилятор C", "C compiler" }, { "edit", "Редактор", "Editor" },
+        { "fm", "Файлы (текст)", "Files (text)" },
     };
     for (unsigned i = 0; i < sizeof names / sizeof names[0]; i++)
-        if (str_same(names[i].f, file)) return names[i].n;
+        if (str_same(names[i].f, file)) return L(names[i].n, names[i].en);
     return file;
 }
 
@@ -2196,13 +2207,13 @@ static void draw_island_now(void) {
                 glyph_draw(G_VOL, it->x + 42, it->y + 13, 18, 0xFF000000 | (snd ? ink : dim), 0);
                 char dt[24];
                 int q = 0;
-                const char *wd = wdays_ru[dow(wm_clock.year, wm_clock.mon, wm_clock.day)];
+                const char *wd = wdays_s[lang][dow(wm_clock.year, wm_clock.mon, wm_clock.day)];
                 while (*wd) dt[q++] = *wd++;
                 dt[q++] = ','; dt[q++] = ' ';
                 if (wm_clock.day >= 10) dt[q++] = (char)('0' + wm_clock.day / 10);
                 dt[q++] = (char)('0' + wm_clock.day % 10);
                 dt[q++] = ' ';
-                const char *mo = months_ru[(wm_clock.mon + 11) % 12];
+                const char *mo = months_s[lang][(wm_clock.mon + 11) % 12];
                 while (*mo) dt[q++] = *mo++;
                 dt[q] = 0;
                 ui_text(it->x + 76, it->y + 3, tm, UI_F15B, ink);
@@ -2293,7 +2304,7 @@ static int sample_stats(void) {
         const char *t = audio_title();
         if (t[0] && !str_same(t, last_title)) {
             str_put(last_title, t, sizeof last_title);
-            wm_notify_glyph("Сейчас играет", t, G_MUSIC, 0x00E06A4C);
+            wm_notify_glyph(L("Сейчас играет", "Now playing"), t, G_MUSIC, 0x00E06A4C);
         } else if (!t[0]) {
             last_title[0] = 0;
         }
@@ -2709,8 +2720,8 @@ static void start_build(void) {
     for (int i = 0; i < N_KNOWN; i++) {
         struct start_item *it = &start_items[start_count++];
         it->featured = 1;
-        str_cpy(it->name, start_known[i].name, START_NAME);
-        str_cpy(it->alt, start_known[i].en, START_NAME);
+        str_cpy(it->name, L(start_known[i].name, start_known[i].en), START_NAME);
+        str_cpy(it->alt, L(start_known[i].en, start_known[i].name), START_NAME);
         str_cpy(it->name_file, start_known[i].file, START_NAME);
         str_cpy(it->desc, start_known[i].desc, START_DESC);
         str_cpy(it->path, "/bin/", 48);
@@ -3097,14 +3108,14 @@ static void draw_start_menu(void) {
             int tw = ui_text(x + 70, ty, start_q, UI_F15, ink);
             ui_fill(x + 71 + tw, y + 34, 2, 24, T->accent);         // the caret
         } else {
-            ui_text(x + 70, ty, "Программы и настройки…", UI_F15, dim);
+            ui_text(x + 70, ty, L("Программы и настройки…", "Programs and settings…"), UI_F15, dim);
         }
     }
 
     int saved[4];
     if (start_qlen || sm_all) {
         // A list: everything, by letter, or what the search found.
-        if (!start_qlen) ui_text(x + 28, y + 88, "Все программы", UI_F13B, ink);
+        if (!start_qlen) ui_text(x + 28, y + 88, L("Все программы", "All programs"), UI_F13B, ink);
         int lx, ly, lw, lh;
         sm_list_box(&lx, &ly, &lw, &lh);
         ui_clip_get(saved);
@@ -3138,11 +3149,11 @@ static void draw_start_menu(void) {
             }
             yy += rh;
         }
-        if (!sm_nrows) ui_text(lx + 14, ly + 10, "Ничего не найдено", UI_F13, dim);
+        if (!sm_nrows) ui_text(lx + 14, ly + 10, L("Ничего не найдено", "Nothing found"), UI_F13, dim);
         ui_clip_set(saved);
     } else {
         // Home: the kept programs, then what was opened lately.
-        ui_text(x + 28, y + 88, "Закреплённые", UI_F13B, ink);
+        ui_text(x + 28, y + 88, L("Закреплённые", "Pinned"), UI_F13B, ink);
         for (int i = 0; i < 12; i++) {
             int cx, cy;
             ln_cell(i, &cx, &cy);
@@ -3161,9 +3172,10 @@ static void draw_start_menu(void) {
                 ui_text(cx + 40 - tw / 2, cy + 56, lbl, UI_F12, ink);
             }
         }
-        ui_text(x + 28, y + 330, "Недавнее", UI_F13B, ink);
+        ui_text(x + 28, y + 330, L("Недавнее", "Recent"), UI_F13B, ink);
         if (!recent_n)
-            ui_text(x + 28, y + 364, "Здесь появится то, что вы открывали.", UI_F13, dim);
+            ui_text(x + 28, y + 364, L("Здесь появится то, что вы открывали.",
+                                        "What you open will show up here."), UI_F13, dim);
         for (int i = 0; i < recent_n && i < 3; i++) {
             int rx, ry, rw, rh;
             ln_recent_row(i, &rx, &ry, &rw, &rh);
@@ -3188,7 +3200,7 @@ static void draw_start_menu(void) {
     if (!start_qlen) {
         int ax, ay, aw, ah;
         ln_all_link(&ax, &ay, &aw, &ah);
-        const char *lbl = sm_all ? "Назад" : "Все программы";
+        const char *lbl = sm_all ? L("Назад", "Back") : L("Все программы", "All programs");
         int glow = glow_of(KEY_SM(SMK_ALL, 0));
         if (glow) ui_round_fill(ax, ay, aw, ah, 13, T->plate, glow * 160 / 256);
         int tw = ui_text_w(lbl, UI_F12);
@@ -3204,10 +3216,10 @@ static void draw_start_menu(void) {
         rast_ellipse(&p, RAST_INT(x + 44), RAST_INT(y + h - 34), RAST_INT(16), RAST_INT(16));
         g_fill(&p, 0xFF000000 | T->accent);
         rast_path_free(&p);
-        const char *ini = "П";
+        const char *ini = L("П", "U");
         ui_text(x + 44 - ui_text_w(ini, UI_F13B) / 2, y + h - 34 - ui_line_h(UI_F13B) / 2, ini,
                 UI_F13B, 0x00FFFFFF);
-        ui_text(x + 70, y + h - 34 - ui_line_h(UI_F13) / 2, "Пользователь", UI_F13, ink);
+        ui_text(x + 70, y + h - 34 - ui_line_h(UI_F13) / 2, L("Пользователь", "User"), UI_F13, ink);
     }
     for (int i = 0; i < 2; i++) {
         int bx, by;
@@ -3226,7 +3238,7 @@ static void draw_start_menu(void) {
         int bh = POWER_ROWS * ph + 12, by0 = py - 6;
         ui_shadow(px, by0, pw, bh, 16, 16, 70, 5, 0);
         ui_round_fill(px, by0, pw, bh, 16, T->plate, 245);
-        static const char *const pw_names[POWER_ROWS] = { "Перезагрузить", "Выключить" };
+        const char *const pw_names[POWER_ROWS] = { L("Перезагрузить", "Restart"), L("Выключить", "Shut down") };
         for (int i = 0; i < POWER_ROWS; i++) {
             int rx, ry, rw, rh;
             sm_power_rect(i, &rx, &ry, &rw, &rh);
@@ -3245,8 +3257,12 @@ static void draw_start_menu(void) {
 // playing; this month. Glass, like the launcher, and the two never show at
 // once -- they share the keeping of what is under them.
 
+static void desk_save(void);
+static void island_set_edge(int e);
+
 #define CC_W 380
-#define CC_H 568
+#define CC_H 640
+#define CC_TOGGLES 6        // three rows of two
 static int dnd;                     // "do not disturb": notices are not shown
 static int cc_vol_drag;             // the volume knob is held
 
@@ -3293,13 +3309,13 @@ static void cc_toggle_rect(int i, int *tx, int *ty, int *tw, int *th) {
 static void cc_vol_track(int *vx, int *vy, int *vw) {
     int x, y, w, h;
     cc_geom(&x, &y, &w, &h);
-    *vx = x + 60; *vy = y + 182 + 10; *vw = w - 84;
+    *vx = x + 60; *vy = y + 254 + 10; *vw = w - 84;
 }
 
 static void cc_player_rect(int *px, int *py, int *pw, int *ph) {
     int x, y, w, h;
     cc_geom(&x, &y, &w, &h);
-    *px = x + 20; *py = y + 230; *pw = w - 40; *ph = 86;
+    *px = x + 20; *py = y + 302; *pw = w - 40; *ph = 86;
 }
 
 #define KEY_CC(k, a) (0x40000 | ((k) << 8) | (a))
@@ -3312,7 +3328,7 @@ static int cc_key_at(int mx, int my) {
     int x, y, w, h;
     cc_geom(&x, &y, &w, &h);
     if (mx < x || my < y || mx >= x + w || my >= y + h) return -1;
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < CC_TOGGLES; i++) {
         int tx, ty, tw, th;
         cc_toggle_rect(i, &tx, &ty, &tw, &th);
         if (mx >= tx && mx < tx + tw && my >= ty && my < ty + th) return KEY_CC(CCK_TOGGLE, i);
@@ -3338,9 +3354,11 @@ static void cc_set_volume_at(int mx) {
     tb_valid = 0;                    // the island's speaker shows it too
 }
 
-static const char *const month_names_ru[12] = {
-    "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
-    "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь" };
+static const char *const month_names[2][12] = {
+    { "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
+      "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь" },
+    { "January", "February", "March", "April", "May", "June",
+      "July", "August", "September", "October", "November", "December" } };
 
 static int days_in(int y, int m) {
     static const int d[12] = { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
@@ -3367,12 +3385,18 @@ static void draw_control(void) {
     ui_glass_rim(x, y, w, h, 24);
 
     // The switches.
-    static const char *const names[4] = { "Сеть", "Не беспокоить", "Тёмная тема", "Раскладка" };
-    static const int glyphs[4] = { G_WIFI, G_BELL, G_MOON, G_SAVE };
-    int on[4] = { net_is_up(), dnd, TH->dark, 0 };
-    const char *sub[4] = { on[0] ? "Подключено" : "Нет сети", dnd ? "Вкл." : "Выкл.",
-                           TH->dark ? "Вкл." : "Выкл.", "Сохранить стол" };
-    for (int i = 0; i < 4; i++) {
+    const char *names[CC_TOGGLES] = { L("Сеть", "Network"), L("Не беспокоить", "Do not disturb"),
+                                      L("Тёмная тема", "Dark theme"), L("Язык", "Language"),
+                                      L("Остров", "Island"), L("Раскладка", "Layout") };
+    static const int glyphs[CC_TOGGLES] = { G_WIFI, G_BELL, G_MOON, G_GLOBE, G_MAX, G_SAVE };
+    int on[CC_TOGGLES] = { net_is_up(), dnd, TH->dark, 0, 0, 0 };
+    const char *edges[4] = { L("Снизу", "Bottom"), L("Слева", "Left"), L("Справа", "Right"), L("Сверху", "Top") };
+    const char *sub[CC_TOGGLES] = { on[0] ? L("Подключено", "Connected") : L("Нет сети", "Offline"),
+                                    dnd ? L("Вкл.", "On") : L("Выкл.", "Off"),
+                                    TH->dark ? L("Вкл.", "On") : L("Выкл.", "Off"),
+                                    L("Русский", "English"), edges[island_edge & 3],
+                                    L("Сохранить стол", "Save desktop") };
+    for (int i = 0; i < CC_TOGGLES; i++) {
         int tx, ty, tw, th;
         cc_toggle_rect(i, &tx, &ty, &tw, &th);
         int glow = glow_of(KEY_CC(CCK_TOGGLE, i));
@@ -3411,23 +3435,26 @@ static void draw_control(void) {
         ui_round_grad(px + 12, py + 12, 62, 62, 14, UI_ALL, 0x00F4A38C, 255, 0x00C0508F, 255);
         glyph_draw(G_MUSIC, px + 29, py + 29, 28, 0xE0FFFFFF, 0);
         const char *t = audio_title();
-        ui_text_fit(px + 88, py + 18, pw - 100, t[0] ? t : "Ничего не играет", UI_F15B, ink);
-        ui_text(px + 88, py + 42, t[0] ? "Музыка · играет" : "Музыка", UI_F12, dim);
+        ui_text_fit(px + 88, py + 18, pw - 100, t[0] ? t : L("Ничего не играет", "Nothing playing"), UI_F15B, ink);
+        ui_text(px + 88, py + 42, t[0] ? L("Музыка · играет", "Music · playing") : L("Музыка", "Music"),
+                UI_F12, dim);
     }
 
     // The month.
     {
-        int cy = y + 332, ch = h - 352;
+        int cy = y + 404, ch = h - 424;
         ui_round_fill(x + 20, cy, w - 40, ch, 18, T->plate, 170);
         char title[32];
         int q = 0;
-        const char *mn = month_names_ru[(wm_clock.mon + 11) % 12];
+        const char *mn = month_names[lang][(wm_clock.mon + 11) % 12];
         while (*mn) title[q++] = *mn++;
         title[q++] = ' ';
         q += u2s(title + q, (unsigned)wm_clock.year);
         title[q] = 0;
         ui_text(x + 36, cy + 14, title, UI_F15B, ink);
-        static const char *const wd[7] = { "Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс" };
+        static const char *const wds[2][7] = { { "Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс" },
+                                               { "Mo", "Tu", "We", "Th", "Fr", "Sa", "Su" } };
+        const char *const *wd = wds[lang];
         for (int i = 0; i < 7; i++) {
             int tw = ui_text_w(wd[i], UI_F11);
             ui_text(x + 36 + i * 44 + 14 - tw / 2, cy + 46, wd[i], UI_F11, dim);
@@ -3668,6 +3695,56 @@ static int layout_restore(void) {
     return opened;
 }
 
+// --- the desktop's settings ----------------------------------------------------
+//
+// The language, the theme, the island's edge and "do not disturb", kept in
+// /home/.desk as name=value lines and read back when the desktop starts.
+#define DESK_FILE "/home/.desk"
+
+static void desk_save(void) {
+    char buf[96];
+    int n = 0;
+    const char *k[4] = { "lang=", "theme=", "island=", "dnd=" };
+    int v[4] = { lang, theme, island_edge, dnd };
+    for (int i = 0; i < 4; i++) {
+        for (const char *c = k[i]; *c; c++) buf[n++] = *c;
+        n += u2s(buf + n, (unsigned)v[i]);
+        buf[n++] = '\n';
+    }
+    vfs_unlink(DESK_FILE);
+    if (vfs_create(DESK_FILE) != 0) return;
+    int fd = vfs_open(DESK_FILE);
+    if (fd < 0) return;
+    vfs_write(fd, buf, (uint32_t)n);
+    vfs_close(fd);
+}
+
+static void desk_load(void) {
+    char buf[128];
+    int fd = vfs_open(DESK_FILE);
+    if (fd < 0) return;
+    int n = vfs_read(fd, buf, sizeof buf - 1);
+    vfs_close(fd);
+    if (n <= 0) return;
+    buf[n] = 0;
+    for (char *line = buf; *line; ) {
+        char *eq = line;
+        while (*eq && *eq != '=' && *eq != '\n') eq++;
+        int v = 0;
+        char *c = *eq == '=' ? eq + 1 : eq;
+        while (*c >= '0' && *c <= '9') v = v * 10 + (*c++ - '0');
+        if (*eq == '=') {
+            *eq = 0;
+            if (str_same(line, "lang")) lang = v ? 1 : 0;
+            else if (str_same(line, "theme")) wm_theme_set(v);
+            else if (str_same(line, "island")) island_edge = v & 3;
+            else if (str_same(line, "dnd")) dnd = v ? 1 : 0;
+        }
+        while (*c && *c != '\n') c++;
+        line = *c ? c + 1 : c;
+    }
+}
+
 // A click inside the open control panel.
 static void cc_click(int key) {
     int kind = (key >> 8) & 0xFF, arg = key & 0xFF;
@@ -3679,14 +3756,28 @@ static void cc_click(int key) {
             new_window_run("/bin/netlog", 0);
         } else if (arg == 1) {
             dnd = !dnd;
+            desk_save();
         } else if (arg == 2) {
             wm_theme_set(theme == 0 ? 1 : 0);
+        } else if (arg == 3) {
+            lang = !lang;
+            start_build();                 // the programs by their names in it
+            desk_save();
+            wp_dirty = 1;
+        } else if (arg == 4) {
+            // The island goes round the edges: bottom, left, right, top.
+            island_set_edge((island_edge + 1) & 3);
+            pop_t0 = now_ms();             // the panel comes up again by it
         } else {
             if (layout_save())
-                wm_notify_glyph("Раскладка сохранена", "Окна откроются так же при следующем запуске.",
+                wm_notify_glyph(L("Раскладка сохранена", "Layout saved"),
+                                L("Окна откроются так же при следующем запуске.",
+                                  "Windows will open the same way next time."),
                                 G_SAVE, TH->accent);
             else
-                wm_notify_glyph("Не удалось сохранить", "Нет места в /home или диск только для чтения.",
+                wm_notify_glyph(L("Не удалось сохранить", "Could not save"),
+                                L("Нет места в /home или диск только для чтения.",
+                                  "No room in /home, or the disk is read-only."),
                                 G_SAVE, 0x00C24A2F);
         }
         menu_dirty = 1;
@@ -3975,6 +4066,7 @@ void wm_theme_set(int i) {
     refresh_leaves();
     wp_dirty = 1;
     dirty = 1;
+    if (started) desk_save();
 }
 
 int  wm_dblclick_ms(void) { return dblclick_ms; }
@@ -5433,6 +5525,17 @@ static void taskbar_click(int mx, int my) {
 // Dragging the island by its glass: let go near an edge and it moves there.
 static int isl_drag = 0, isl_drag_x, isl_drag_y;
 
+static void island_set_edge(int e) {
+    if (e == island_edge) return;
+    island_edge = e;
+    isl_keep.have = 0;
+    relayout();
+    refresh_leaves();
+    wp_dirty = 1;
+    dirty = 1;
+    desk_save();
+}
+
 static void island_drop(int mx, int my) {
     int W = (int)fb_get_width(), H = (int)fb_get_height();
     int edge = island_edge;
@@ -5443,14 +5546,7 @@ static void island_drop(int mx, int my) {
     if (dl * H < best * W) { best = dl * H / W; e = ISL_LEFT; }
     if (dr * H < best * W) { best = dr * H / W; e = ISL_RIGHT; }
     if (dt < best) { e = ISL_TOP; }
-    if (e != edge) {
-        island_edge = e;
-        isl_keep.have = 0;
-        relayout();
-        refresh_leaves();
-        wp_dirty = 1;
-        dirty = 1;
-    }
+    if (e != edge) island_set_edge(e);
 }
 
 // Act on one pointer event: press starts a drag or arms a button, motion
@@ -6304,6 +6400,7 @@ void wm_start(void) {
     z_top   = 0;
     focused = -1;
 
+    desk_load();              // language, theme, the island's edge
     started = 1;
     dirty = 1;
     // The windows kept with "keep this layout", or else a first shell.
