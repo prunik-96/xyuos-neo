@@ -1,3 +1,4 @@
+#include "../arch/x86_64/smp.h"
 #include "framebuffer.h"
 #include "font8x8_basic.h"
 #include "../mm/heap.h"
@@ -231,6 +232,51 @@ void fb_present_discard(void) {
     dmg_n = 0;
 }
 
+// One row of a changed rectangle to the screen: narrowed against the shadow
+// to the part that really differs, then copied. Returns the bytes it moved.
+static uint32_t present_row(uint32_t y, uint32_t x0, uint32_t x1) {
+    size_t off = (size_t)y * fb_pitch + (size_t)x0 * 4;
+    const uint32_t *b = (const uint32_t *)(fb_back + off);
+    volatile uint32_t *d = (volatile uint32_t *)(fb_mem + off);
+    uint32_t lo = 0, hi = x1 - x0;
+    if (fb_shadow) {
+        uint32_t *sh = (uint32_t *)(fb_shadow + off);
+        while (lo < hi && b[lo] == sh[lo]) lo++;
+        while (hi > lo && b[hi - 1] == sh[hi - 1]) hi--;
+        if (lo == hi) return 0;                 // row already on screen
+        for (uint32_t k = lo; k < hi; k++) sh[k] = b[k];
+    }
+    uint32_t k = lo;
+    if ((k & 1) && k < hi) { d[k] = b[k]; k++; }
+    uint32_t pairs = (hi - k) / 2;
+    const uint64_t *s8 = (const uint64_t *)(b + k);
+    volatile uint64_t *d8 = (volatile uint64_t *)(d + k);
+    for (uint32_t j = 0; j < pairs; j++) d8[j] = s8[j];
+    for (uint32_t t = k + pairs * 2; t < hi; t++) d[t] = b[t];
+    return (hi - lo) * 4;
+}
+
+// A big frame goes out on every free core: each takes its share of the rows
+// of every changed rectangle (they never overlap, so neither do the shares).
+struct present_job { struct fb_dmg r[FB_DMG_MAX]; int n; uint32_t bytes[MAX_CPUS], rows[MAX_CPUS]; };
+static struct present_job pjob;
+
+static void present_share(int share, int nsh, void *arg) {
+    struct present_job *j = (struct present_job *)arg;
+    uint32_t bytes = 0, rows = 0;
+    for (int i = 0; i < j->n; i++) {
+        uint32_t h = j->r[i].y1 - j->r[i].y0;
+        uint32_t a = j->r[i].y0 + (uint32_t)((uint64_t)h * share / nsh);
+        uint32_t b = j->r[i].y0 + (uint32_t)((uint64_t)h * (share + 1) / nsh);
+        for (uint32_t y = a; y < b; y++) {
+            uint32_t m = present_row(y, j->r[i].x0, j->r[i].x1);
+            if (m) { bytes += m; rows++; }
+        }
+    }
+    j->bytes[share] = bytes;
+    j->rows[share] = rows;
+}
+
 void fb_present(void) {
     if (!fb_back || draw_target != fb_back) return;
 
@@ -240,6 +286,22 @@ void fb_present(void) {
     present_rows = 0;
     present_rects = (uint32_t)n;
     if (!n) return;                          // nothing was drawn this frame
+
+    uint64_t area = 0;
+    for (int i = 0; i < n; i++)
+        area += (uint64_t)(dmg[i].x1 - dmg[i].x0) * (dmg[i].y1 - dmg[i].y0);
+    if (smp_cpu_count() > 1 && area >= 60000) {
+        pjob.n = n;
+        for (int i = 0; i < n; i++) pjob.r[i] = dmg[i];
+        for (int i = 0; i < MAX_CPUS; i++) pjob.bytes[i] = pjob.rows[i] = 0;
+        smp_run(present_share, &pjob);
+        for (int i = 0; i < MAX_CPUS; i++) {
+            present_bytes += pjob.bytes[i];
+            present_rows += pjob.rows[i];
+        }
+        if (present_bytes) present_frames++;
+        return;
+    }
 
     // Copy the changed rectangles, and nothing else.
     //

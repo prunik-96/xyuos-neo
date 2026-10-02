@@ -1749,19 +1749,7 @@ static void draw_wallpaper(void) {
     wp_dirty = 0;
     fb_mark_rows(0, h);
 
-    const uint32_t *src = wallpaper;
-    volatile uint8_t *base = fb_get_base();
-    uint32_t pitch = fb_get_pitch();
-    uint32_t pairs = w / 2;                 // copy two pixels at a time
-    for (uint32_t y = 0; y < h; y++) {
-        volatile uint64_t *drow = (volatile uint64_t *)(base + (size_t)y * pitch);
-        const uint64_t *srow = (const uint64_t *)(src + (size_t)y * w);
-        for (uint32_t i = 0; i < pairs; i++) drow[i] = srow[i];
-        if (w & 1) {                        // odd width: the last pixel
-            volatile uint32_t *d32 = (volatile uint32_t *)(base + (size_t)y * pitch);
-            d32[w - 1] = src[(size_t)y * w + w - 1];
-        }
-    }
+    px_copy(bb_at(0, 0), bb_stride(), wallpaper, (int)w, (int)w, (int)h);
 }
 
 // --- small text/number helpers --------------------------------------------
