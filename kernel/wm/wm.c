@@ -1533,6 +1533,8 @@ static int change_kind(int n) {
 static void busy_end(int pane);
 
 static void note_push(const char *title, const char *body, int glyph, uint32_t color);
+static void note_open_last(const char *path);
+static void str_put(char *dst, const char *src, int cap);
 
 // What a USB device that came or went is, in a word, and the line under it.
 static void usb_note(const struct usb_news *n) {
@@ -1587,8 +1589,27 @@ static void usb_note(const struct usb_news *n) {
         for (int i = 0; t[i] && k < 94; i++) body[k++] = t[i];
     }
     body[k] = 0;
+    // A drive: what its volume is called, and a click to open it.
+    char open[16] = "";
+    if (in && n->kind == USB_KIND_DISK && n->disk >= 0) {
+        static struct vol_info vi[VOL_MAX];
+        int nv = vol_list(vi, VOL_MAX);
+        for (int i = 0; i < nv; i++) {
+            if (vi[i].disk != n->disk) continue;
+            open[0] = '/';
+            str_put(open + 1, vi[i].mount, sizeof open - 1);
+            k = 0;
+            const char *lab = vi[i].label[0] ? vi[i].label : name;
+            for (int j = 0; lab[j] && k < 40; j++) body[k++] = lab[j];
+            const char *t = L(" — нажмите, чтобы открыть", " -- click to open");
+            for (int j = 0; t[j] && k < 94; j++) body[k++] = t[j];
+            body[k] = 0;
+            break;
+        }
+    }
     sound_play(in ? SND_USB_IN : SND_USB_OUT);
     note_push(title, body, G_CHIP, in ? TH->accent : 0x006B7480);
+    if (open[0]) note_open_last(open);
 }
 
 static void pane_painted(int n) {
@@ -3997,7 +4018,7 @@ static void am_show(const char *name) {
 #define NOTE_MAX  4
 #define NOTE_SHOW 5000
 #define NOTE_FADE 260
-static struct { char title[48]; char text[96]; int g; uint32_t col; } notes[NOTE_MAX];
+static struct { char title[48]; char text[96]; int g; uint32_t col; char open[16]; } notes[NOTE_MAX];
 static int note_n;
 static uint64_t note_t0;            // when the first one in the queue came up
 static int note_drawn;              // a notice was on the screen last frame
@@ -4020,9 +4041,15 @@ static void note_push(const char *title, const char *text, int g, uint32_t col) 
     str_put(notes[note_n].text, text ? text : "", sizeof notes[0].text);
     notes[note_n].g = g;
     notes[note_n].col = col;
+    notes[note_n].open[0] = 0;
     if (note_n == 0) note_t0 = now_ms();
     note_n++;
     dirty = 1;
+}
+
+// The notice just pushed opens this folder when it is clicked.
+static void note_open_last(const char *path) {
+    if (note_n) str_put(notes[note_n - 1].open, path, sizeof notes[0].open);
 }
 
 void wm_notify(const char *title, const char *text) {
@@ -6450,7 +6477,13 @@ static void handle_mouse(const struct mouse_event *me) {
         // it is on (it fires on release, over the same thing), a press
         // anywhere else dismisses it.
         // A notice: a click puts it away.
-        if (note_hit(mx, my)) { note_t0 = now_ms() - NOTE_SHOW; dirty = 1; return; }
+        if (note_hit(mx, my)) {
+            // A notice about a drive opens it.
+            if (note_n && notes[0].open[0]) new_window_run("/bin/files", notes[0].open);
+            note_t0 = now_ms() - NOTE_SHOW;
+            dirty = 1;
+            return;
+        }
 
         if (start_open && !on_taskbar) {
             int key = sm_key_at(mx, my);

@@ -299,6 +299,7 @@ int vol_list(struct vol_info *out, int max) {
         sset(o->fs, v->fsname, sizeof o->fs);
         o->total = v->total;
         o->free = v->free_known ? v->free_bytes : 0;
+        o->disk = v->disk;
     }
     return n;
 }

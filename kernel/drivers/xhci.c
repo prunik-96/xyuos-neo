@@ -281,13 +281,14 @@ static void scopy(char *d, const char *s, int max) {
     d[i] = 0;
 }
 
-static void news_push(int attached, int kind, const char *name, uint32_t mib) {
+static void news_push(int attached, int kind, const char *name, uint32_t mib, int disk) {
     if (booting) return;
     if (news_n == NEWS_MAX) { news_head = (news_head + 1) % NEWS_MAX; news_n--; }
     struct usb_news *n = &news[(news_head + news_n) % NEWS_MAX];
     n->attached = attached;
     n->kind = kind;
     n->mib = mib;
+    n->disk = disk;
     scopy(n->name, name, sizeof n->name);
     news_n++;
 }
@@ -1392,15 +1393,17 @@ static int attach(struct hc *h, int parent, int port, int strict) {
     if (pd) pd->stage = stage;
     {
         uint32_t mib = 0;
+        int dk = -1;
         if (u->kind == USB_KIND_DISK && !booting) {
             for (int k = 0; k < MAX_MSC; k++) {
                 if (!mscs[k].used || mscs[k].dev != d) continue;
                 uint32_t blocks, bsize;
+                dk = k;
                 if (usb_disk_capacity(k, &blocks, &bsize))
                     mib = (uint32_t)((uint64_t)blocks * bsize >> 20);
             }
         }
-        news_push(1, u->kind, u->name, mib);
+        news_push(1, u->kind, u->name, mib, dk);
     }
     return d;
 
@@ -1467,7 +1470,7 @@ static void detach(int d, int quiet) {
     unpage(u->ctx);
     unpage(u->ep0_trb);
     DBG("xhci: let go of device %d (%s)\n", d, u->name);
-    if (!quiet) news_push(0, u->kind, u->name, 0);
+    if (!quiet) news_push(0, u->kind, u->name, 0, -1);
     u->used = 0;
 }
 

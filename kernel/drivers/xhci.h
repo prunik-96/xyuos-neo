@@ -40,6 +40,7 @@ struct usb_news {
     int attached;               // 1 plugged in, 0 pulled out
     int kind;
     uint32_t mib;               // a disk's size, 0 if not known
+    int disk;                   // the USB disk's index (usb_disk_*), -1 if not a disk
     char name[48];              // what the device calls itself, may be empty
 };
 // 1 and the oldest news in *n, or 0 if there is none.

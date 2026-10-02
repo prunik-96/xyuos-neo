@@ -31,6 +31,7 @@ struct vol_info {
     char drive[48];              // what the drive calls itself
     char fs[8];                  // "FAT32", "exFAT", "NTFS", ...
     uint64_t total, free;        // bytes; free is 0 until asked for (vol_space)
+    int disk;                    // the USB disk it is on
 };
 
 // Look at the drives again: forget volumes on drives that went, find the
