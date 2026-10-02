@@ -898,6 +898,15 @@ static int add_mouse(int d, int iface, int ep_addr, int mps, int rlen) {
     return 1;
 }
 
+// Whether an HID interface's report descriptor describes a pointer.
+static int is_pointer(int d, int iface, int rlen) {
+    static hid_mouse_fmt f;
+    if (rlen <= 0) return 0;
+    if (rlen > (int)sizeof xfer_buf) rlen = (int)sizeof xfer_buf;
+    if (ctrl(d, 0x81, 6, 0x2200, (uint16_t)iface, (uint16_t)rlen, NULL) != CC_SUCCESS) return 0;
+    return hid_parse_mouse(xfer_buf, rlen, &f);
+}
+
 static int bulk_mps(int speed) { return speed >= 4 ? 1024 : (speed == 3 ? 512 : 64); }
 
 static int add_disk(int d, int in_addr, int out_addr) {
@@ -1357,6 +1366,14 @@ static int attach(struct hc *h, int parent, int port, int strict) {
                 driven = 1;
             }
         }
+    } else if (alt_if >= 0 && ok(ctrl(d, 0x00, 9, (uint16_t)cfg_val, 0, 0, NULL)) &&
+               is_pointer(d, alt_if, hid_rlen[alt_if & 7]) &&
+               add_mouse(d, alt_if, alt_ep, alt_mps, hid_rlen[alt_if & 7])) {
+        // An HID that is no boot device but whose own description has X and
+        // Y: a tablet, a touch screen, QEMU's usb-tablet.
+        u->kind = USB_KIND_MOUSE;
+        stage = "pointer";
+        driven = 1;
     } else if (alt_if >= 0) {
         stage = "not a keyboard (proto!=1)";
         u->generic_hid = 1;
@@ -1764,7 +1781,8 @@ static void process_mouse_report(struct mousedev *ms, const uint8_t *r, int len)
     if (b & 1) buttons |= MOUSE_LEFT;
     if (b & 2) buttons |= MOUSE_RIGHT;
     if (b & 4) buttons |= MOUSE_MIDDLE;
-    mouse_inject(buttons, dx, dy, wheel);
+    if (ms->fmt.abs) mouse_inject_abs(buttons, dx, ms->fmt.xmax, dy, ms->fmt.ymax, wheel);
+    else mouse_inject(buttons, dx, dy, wheel);
 }
 
 int xhci_present(void) { return nkbds > 0 || nmice > 0; }

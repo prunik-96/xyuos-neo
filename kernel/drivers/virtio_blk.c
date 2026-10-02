@@ -186,3 +186,9 @@ int virtio_blk_read_sectors(uint64_t lba, uint32_t count, void *buf) {
 int virtio_blk_write_sector(uint64_t lba, const void *buf512) {
     return submit_request(lba, (void *)(uintptr_t)buf512, 512, 1);
 }
+
+// Several sectors in one request: a run of a file's blocks is one command,
+// not one per sector. `buf` is kernel memory, contiguous as the device needs.
+int virtio_blk_write_sectors(uint64_t lba, uint32_t count, const void *buf) {
+    return submit_request(lba, (void *)(uintptr_t)buf, count * 512, 1);
+}

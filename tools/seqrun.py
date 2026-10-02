@@ -36,6 +36,10 @@ file -- what the system actually sent to the speakers, to be checked.
 SEQRUN_PUT="host:guest,host2:guest2" copies files onto the run's copy of the
 disk first (never onto disk.img itself): test material that should not ship.
 
+SEQRUN_TABLET=1 gives the machine QEMU's usb-tablet instead of the mouse:
+an absolute pointer, so "!mouse_move X Y" puts it at screen pixel X, Y and a
+click lands where it is aimed ("!mouse_button 1;mouse_button 0").
+
 SEQRUN_NOHID=1 leaves out the keyboard and mouse on the controller's own
 ports, and SEQRUN_USBX adds QEMU arguments (split at spaces) -- together they
 put the keyboard behind a hub: SEQRUN_USBX="-device usb-hub,bus=xhci.0,port=1
@@ -53,6 +57,8 @@ RAMDISK = os.environ.get("SEQRUN_RAMDISK") == "1"
 STICK = os.environ.get("SEQRUN_STICK") == "1"
 KEEP = os.environ.get("SEQRUN_KEEP") == "1"
 UEFI = os.environ.get("SEQRUN_UEFI") == "1"
+TABLET = os.environ.get("SEQRUN_TABLET") == "1"
+SCREEN = tuple(int(v) for v in os.environ.get("SEQRUN_SCREEN", "1920x1080").split("x"))
 RAM = sys.argv[1] if len(sys.argv) > 1 else "2G"
 STEPS = sys.argv[2:] or ["sigtest:25"]
 
@@ -60,7 +66,7 @@ os.makedirs(OUT, exist_ok=True)
 for f in list(os.listdir(OUT)):
     if not (KEEP and f == "stick.img"):
         os.unlink(OUT + "/" + f)
-SER, MON = OUT + "/serial.log", OUT + "/mon.sock"
+SER, MON, QMP = OUT + "/serial.log", OUT + "/mon.sock", OUT + "/qmp.sock"
 DISK = []
 if STICK:
     if not (KEEP and os.path.exists(OUT + "/stick.img")):
@@ -97,9 +103,11 @@ proc = subprocess.Popen(
     ["-device", "qemu-xhci,id=xhci"] +
     (["-device", "usb-storage,bus=xhci.0,drive=stick,bootindex=0"] if STICK else []) +
     ([] if os.environ.get("SEQRUN_NOHID") == "1" else
-     ["-device", "usb-kbd,bus=xhci.0", "-device", "usb-mouse,bus=xhci.0"]) +
+     ["-device", "usb-kbd,bus=xhci.0",
+      "-device", ("usb-tablet" if os.environ.get("SEQRUN_TABLET") == "1" else "usb-mouse") + ",bus=xhci.0"]) +
     os.environ.get("SEQRUN_USBX", "").split() +
-    ["-monitor", "unix:%s,server,nowait" % MON] + NET + AUDIO + VGA,
+    ["-monitor", "unix:%s,server,nowait" % MON, "-qmp", "unix:%s,server,nowait" % QMP] +
+    NET + AUDIO + VGA,
     stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
 
 
@@ -127,6 +135,47 @@ for _ in range(60):
     except OSError:
         time.sleep(0.25)
 s.settimeout(0.3)
+
+# QMP as well: the only way to put an absolute pointer at a place (HMP's
+# mouse_move only ever moves, and a tablet ignores moves).
+import json
+q = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+for _ in range(60):
+    try:
+        q.connect(QMP); break
+    except OSError:
+        time.sleep(0.25)
+q.settimeout(0.02)       # answers come at once; waiting longer spoils double-clicks
+
+
+def qmp(obj, settle=0.02):
+    q.sendall((json.dumps(obj) + "\n").encode())
+    time.sleep(settle)
+    try:
+        while True:
+            r = q.recv(65536)
+            if not r:
+                break
+            if b"error" in r and os.environ.get("SEQRUN_QMPDEBUG"):
+                sys.stderr.write("qmp: " + r.decode("utf-8", "replace") + "\n")
+    except socket.timeout:
+        pass
+
+
+qmp({"execute": "qmp_capabilities"})
+
+
+def pointer_to(x, y):
+    ax = int(x * 32767 / (SCREEN[0] - 1))
+    ay = int(y * 32767 / (SCREEN[1] - 1))
+    qmp({"execute": "input-send-event", "arguments": {"events": [
+        {"type": "abs", "data": {"axis": "x", "value": ax}},
+        {"type": "abs", "data": {"axis": "y", "value": ay}}]}})
+
+
+def button(name, down):
+    qmp({"execute": "input-send-event", "arguments": {"events": [
+        {"type": "btn", "data": {"down": down, "button": name}}]}})
 
 
 def cmd(c, settle=0.08):
@@ -165,8 +214,29 @@ for i, step in enumerate(STEPS):
     elif line.startswith("!"):
         # QEMU monitor commands, separated by ';': "!mouse_move 200 100;
         # mouse_button 1; mouse_button 0:1" moves the pointer and clicks.
+        # With the tablet, "click X Y", "rclick X Y" and "dclick X Y" click
+        # at screen pixel X, Y (QEMU wants the tablet's 0..32767 scale).
         for c in line[1:].split(";"):
-            cmd(c.strip(), 0.15)
+            c = c.strip()
+            w = c.split()
+            if TABLET and w and w[0] in ("mouse_move", "click", "rclick", "dclick", "move",
+                                          "press", "release") and len(w) >= 3:
+                pointer_to(int(w[1]), int(w[2]))
+                time.sleep(0.1)
+                if w[0] in ("click", "dclick"):
+                    for _ in range(2 if w[0] == "dclick" else 1):
+                        button("left", True)
+                        button("left", False)
+                elif w[0] == "rclick":
+                    button("right", True)
+                    button("right", False)
+                elif w[0] == "press":
+                    button("left", True)
+                elif w[0] == "release":
+                    button("left", False)
+                time.sleep(0.1)
+                continue
+            cmd(c, 0.15)
     else:
         typ(line + "\n")
     time.sleep(float(wait))

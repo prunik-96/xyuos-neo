@@ -89,6 +89,21 @@ void mouse_inject(uint8_t buttons, int dx, int dy, int wheel) {
     if (q_head == q_tail) q_tail = (q_tail + 1) % MOUSE_QUEUE;   // drop oldest
 }
 
+void mouse_inject_abs(uint8_t buttons, int x, int xmax, int y, int ymax, int wheel) {
+    if (xmax <= 0 || ymax <= 0) return;
+    if (x < 0) x = 0;
+    if (y < 0) y = 0;
+    if (x > xmax) x = xmax;
+    if (y > ymax) y = ymax;
+    int32_t nx = (int32_t)((int64_t)x * ((int32_t)bound_w - 1) / xmax);
+    int32_t ny = (int32_t)((int64_t)y * ((int32_t)bound_h - 1) / ymax);
+    // As motion from where it was: everything after this is the same.
+    int sp = speed_pct;
+    speed_pct = 100;
+    mouse_inject(buttons, nx - cur_x, ny - cur_y, wheel);
+    speed_pct = sp;
+}
+
 int mouse_poll_event(struct mouse_event *out) {
     if (q_tail == q_head) return 0;
     if (out) *out = queue[q_tail];

@@ -3,6 +3,7 @@
 #include "../drivers/rtc.h"
 #include "../kernel/kio.h"
 #include <stddef.h>
+#include "../mm/heap.h"
 
 typedef struct __attribute__((packed)) {
     uint32_t s_inodes_count;
@@ -64,9 +65,32 @@ static uint8_t block_buf[MAX_BLOCK_SIZE];
 static uint8_t indirect_buf[MAX_BLOCK_SIZE];  // a single-indirect / level-2 table
 static uint8_t dind_buf[MAX_BLOCK_SIZE];      // a double-indirect / level-1 table
 static uint8_t wb_buf[MAX_BLOCK_SIZE];   // inode-table / zeroing read-modify-write
-static uint8_t bmp_buf[MAX_BLOCK_SIZE];  // block/inode bitmaps
 static uint8_t gd_buf[MAX_BLOCK_SIZE];   // group descriptor blocks
 static int mounted = 0;
+
+// --- the metadata, kept in memory and written once a call ----------------------
+//
+// Writing a file used to cost, for every kilobyte: the group descriptor read
+// and written, the block bitmap read and written, the superblock read and
+// written twice over, the new block zeroed, the indirect table read and
+// written, and the block itself read before being written -- a dozen device
+// commands per kilobyte, 340 KB/s on a fast disk and far worse on a USB stick.
+// Now the descriptors live in memory, a bitmap and the indirect tables are
+// kept while they are being changed, and all of it is written once, when the
+// call that changed it ends (ext2_flush). The superblock's free counts too.
+static ext2_bgd_t *gdt;                  // every group's descriptor
+static uint32_t gdt_groups;
+static uint8_t gdt_dirty[64];            // which descriptor blocks changed, a bit each
+static int sb_dirty;
+static uint8_t bmb_buf[MAX_BLOCK_SIZE];  // a block bitmap ...
+static uint32_t bmb_blk;                 // ... which one (0: none) ...
+static int bmb_dirty;                    // ... and whether it changed
+static uint8_t imb_buf[MAX_BLOCK_SIZE];  // an inode bitmap, the same way
+static uint32_t imb_blk;
+static int imb_dirty;
+static uint32_t ib_blk, db_blk;          // which tables indirect_buf / dind_buf hold (0: none)
+static int ib_dirty, db_dirty;
+static uint32_t alloc_hint_g;            // the group that last had a free block
 
 // The read path's own copies of the last indirect tables it looked at, and
 // which blocks they are (0: none). Reading a file front to back asks for the
@@ -117,6 +141,18 @@ int ext2_mount(void) {
     }
     inode_size = (sb.s_rev_level >= 1 && sb.s_inode_size != 0) ? sb.s_inode_size : 128;
     bgd_block = sb.s_first_data_block + 1;
+
+    gdt_groups = (sb.s_blocks_count - sb.s_first_data_block + sb.s_blocks_per_group - 1)
+                 / sb.s_blocks_per_group;
+    uint32_t per = block_size / sizeof(ext2_bgd_t);
+    uint32_t nblk = (gdt_groups + per - 1) / per;
+    if (nblk > 64 * 8) { kprintf("ext2: too many groups (%u)\n", gdt_groups); return 0; }
+    gdt = (ext2_bgd_t *)kmalloc((size_t)nblk * block_size);
+    if (!gdt) { kprintf("ext2: no memory for the group descriptors\n"); return 0; }
+    for (uint32_t i = 0; i < nblk; i++) read_block(bgd_block + i, (uint8_t *)gdt + (size_t)i * block_size);
+    for (int i = 0; i < 64; i++) gdt_dirty[i] = 0;
+    sb_dirty = bmb_dirty = imb_dirty = ib_dirty = db_dirty = 0;
+    bmb_blk = imb_blk = ib_blk = db_blk = 0;
 
     kprintf("ext2: mounted, block_size=%u inodes=%u\n", block_size, sb.s_inodes_count);
     rc_ind_blk = rc_dind_blk = 0;
@@ -357,9 +393,12 @@ static uint32_t num_groups(void) {
            / sb.s_blocks_per_group;
 }
 
+// The superblock's free counts changed: written by ext2_flush.
+static void sb_writeback(void) { sb_dirty = 1; }
+
 // The primary superblock always lives at byte offset 1024 (LBA 2-3). We only
 // ever change the free counts, so read-modify-write those two fields in place.
-static void sb_writeback(void) {
+static void sb_write_now(void) {
     uint8_t buf[1024];
     blkdev_read_sector(2, buf);
     blkdev_read_sector(3, buf + 512);
@@ -370,18 +409,60 @@ static void sb_writeback(void) {
 }
 
 static void bgd_get(uint32_t group, ext2_bgd_t *out) {
-    uint32_t per = block_size / sizeof(ext2_bgd_t);
-    uint32_t blk = bgd_block + group / per;
-    read_block(blk, gd_buf);
-    *out = *((ext2_bgd_t *)gd_buf + (group % per));
+    *out = gdt[group];
 }
 
 static void bgd_writeback(uint32_t group, const ext2_bgd_t *in) {
+    gdt[group] = *in;
+    uint32_t b = group / (block_size / sizeof(ext2_bgd_t));
+    gdt_dirty[b / 8] |= (uint8_t)(1u << (b % 8));
+}
+
+static void bmb_flush(void) {
+    if (bmb_dirty && bmb_blk) write_block(bmb_blk, bmb_buf);
+    bmb_dirty = 0;
+}
+static uint8_t *bmb_get(uint32_t blk) {
+    if (bmb_blk != blk) { bmb_flush(); read_block(blk, bmb_buf); bmb_blk = blk; }
+    return bmb_buf;
+}
+static void imb_flush(void) {
+    if (imb_dirty && imb_blk) write_block(imb_blk, imb_buf);
+    imb_dirty = 0;
+}
+static uint8_t *imb_get(uint32_t blk) {
+    if (imb_blk != blk) { imb_flush(); read_block(blk, imb_buf); imb_blk = blk; }
+    return imb_buf;
+}
+static void ib_flush(void) {
+    if (ib_dirty && ib_blk) write_block(ib_blk, indirect_buf);
+    ib_dirty = 0;
+}
+static void db_flush(void) {
+    if (db_dirty && db_blk) write_block(db_blk, dind_buf);
+    db_dirty = 0;
+}
+
+// Everything changed in memory, to the disk: the bitmaps, the tables, the
+// descriptors, the superblock. The end of every call that changes anything.
+static void ext2_flush(void) {
+    bmb_flush();
+    imb_flush();
+    ib_flush();
+    db_flush();
+    ib_blk = db_blk = 0;           // the truncate path reads these buffers its own way
     uint32_t per = block_size / sizeof(ext2_bgd_t);
-    uint32_t blk = bgd_block + group / per;
-    read_block(blk, gd_buf);
-    *((ext2_bgd_t *)gd_buf + (group % per)) = *in;
-    write_block(blk, gd_buf);
+    uint32_t nblk = (gdt_groups + per - 1) / per;
+    for (uint32_t b = 0; b < nblk; b++) {
+        if (!(gdt_dirty[b / 8] & (1u << (b % 8)))) continue;
+        read_block(bgd_block + b, gd_buf);          // the tail past the last group stays
+        uint32_t first = b * per, n = gdt_groups - first < per ? gdt_groups - first : per;
+        for (uint32_t k = 0; k < n * sizeof(ext2_bgd_t); k++)
+            gd_buf[k] = ((const uint8_t *)(gdt + first))[k];
+        write_block(bgd_block + b, gd_buf);
+        gdt_dirty[b / 8] &= (uint8_t)~(1u << (b % 8));
+    }
+    if (sb_dirty) { sb_write_now(); sb_dirty = 0; }
 }
 
 static void put_inode(uint32_t inode_num, const ext2_inode_t *in) {
@@ -411,19 +492,27 @@ static void zero_block(uint32_t blk) {
 
 static uint32_t alloc_block(void) {
     uint32_t groups = num_groups();
-    for (uint32_t g = 0; g < groups; g++) {
-        ext2_bgd_t bgd;
-        bgd_get(g, &bgd);
-        if (bgd.bg_free_blocks_count == 0) continue;
-        read_block(bgd.bg_block_bitmap, bmp_buf);
-        for (uint32_t i = 0; i < sb.s_blocks_per_group; i++) {
-            if (!(bmp_buf[i / 8] & (1 << (i % 8)))) {
-                bmp_buf[i / 8] |= (1 << (i % 8));
-                write_block(bgd.bg_block_bitmap, bmp_buf);
-                bgd.bg_free_blocks_count--;
-                bgd_writeback(g, &bgd);
+    // From the group that last had room: a file's blocks come out in a row,
+    // and they can be written in one go.
+    for (uint32_t n = 0; n < groups; n++) {
+        uint32_t g = (alloc_hint_g + n) % groups;
+        if (gdt[g].bg_free_blocks_count == 0) continue;
+        uint8_t *bm = bmb_get(gdt[g].bg_block_bitmap);
+        uint32_t in_group = sb.s_blocks_per_group;
+        if (g == groups - 1) {
+            uint32_t rest = sb.s_blocks_count - sb.s_first_data_block - g * sb.s_blocks_per_group;
+            if (rest < in_group) in_group = rest;
+        }
+        for (uint32_t i = 0; i < in_group; i++) {
+            if (bm[i / 8] == 0xFF) { i |= 7; continue; }
+            if (!(bm[i / 8] & (1 << (i % 8)))) {
+                bm[i / 8] |= (uint8_t)(1 << (i % 8));
+                bmb_dirty = 1;
+                gdt[g].bg_free_blocks_count--;
+                bgd_writeback(g, &gdt[g]);
                 sb.s_free_blocks_count--;
                 sb_writeback();
+                alloc_hint_g = g;
                 return sb.s_first_data_block + g * sb.s_blocks_per_group + i;
             }
         }
@@ -435,13 +524,11 @@ static void free_block(uint32_t blk) {
     uint32_t rel = blk - sb.s_first_data_block;
     uint32_t g = rel / sb.s_blocks_per_group;
     uint32_t i = rel % sb.s_blocks_per_group;
-    ext2_bgd_t bgd;
-    bgd_get(g, &bgd);
-    read_block(bgd.bg_block_bitmap, bmp_buf);
-    bmp_buf[i / 8] &= ~(1 << (i % 8));
-    write_block(bgd.bg_block_bitmap, bmp_buf);
-    bgd.bg_free_blocks_count++;
-    bgd_writeback(g, &bgd);
+    uint8_t *bm = bmb_get(gdt[g].bg_block_bitmap);
+    bm[i / 8] &= (uint8_t)~(1 << (i % 8));
+    bmb_dirty = 1;
+    gdt[g].bg_free_blocks_count++;
+    bgd_writeback(g, &gdt[g]);
     sb.s_free_blocks_count++;
     sb_writeback();
 }
@@ -449,18 +536,16 @@ static void free_block(uint32_t blk) {
 static uint32_t alloc_inode(void) {
     uint32_t groups = num_groups();
     for (uint32_t g = 0; g < groups; g++) {
-        ext2_bgd_t bgd;
-        bgd_get(g, &bgd);
-        if (bgd.bg_free_inodes_count == 0) continue;
-        read_block(bgd.bg_inode_bitmap, bmp_buf);
+        if (gdt[g].bg_free_inodes_count == 0) continue;
+        uint8_t *bm = imb_get(gdt[g].bg_inode_bitmap);
         for (uint32_t i = 0; i < sb.s_inodes_per_group; i++) {
             // reserved inodes are already marked used in the bitmap by mke2fs,
             // so a plain first-free scan naturally skips them.
-            if (!(bmp_buf[i / 8] & (1 << (i % 8)))) {
-                bmp_buf[i / 8] |= (1 << (i % 8));
-                write_block(bgd.bg_inode_bitmap, bmp_buf);
-                bgd.bg_free_inodes_count--;
-                bgd_writeback(g, &bgd);
+            if (!(bm[i / 8] & (1 << (i % 8)))) {
+                bm[i / 8] |= (uint8_t)(1 << (i % 8));
+                imb_dirty = 1;
+                gdt[g].bg_free_inodes_count--;
+                bgd_writeback(g, &gdt[g]);
                 sb.s_free_inodes_count--;
                 sb_writeback();
                 return g * sb.s_inodes_per_group + i + 1;
@@ -473,13 +558,11 @@ static uint32_t alloc_inode(void) {
 static void free_inode(uint32_t ino) {
     uint32_t g = (ino - 1) / sb.s_inodes_per_group;
     uint32_t i = (ino - 1) % sb.s_inodes_per_group;
-    ext2_bgd_t bgd;
-    bgd_get(g, &bgd);
-    read_block(bgd.bg_inode_bitmap, bmp_buf);
-    bmp_buf[i / 8] &= ~(1 << (i % 8));
-    write_block(bgd.bg_inode_bitmap, bmp_buf);
-    bgd.bg_free_inodes_count++;
-    bgd_writeback(g, &bgd);
+    uint8_t *bm = imb_get(gdt[g].bg_inode_bitmap);
+    bm[i / 8] &= (uint8_t)~(1 << (i % 8));
+    imb_dirty = 1;
+    gdt[g].bg_free_inodes_count++;
+    bgd_writeback(g, &gdt[g]);
     sb.s_free_inodes_count++;
     sb_writeback();
 }
@@ -508,13 +591,36 @@ static void clear_inode_entry(uint32_t inode_num) {
 // Returns the physical block backing block_index of `inode`, allocating it (and
 // the single-indirect block if needed) on demand. Sets *dirty when the inode's
 // i_block/i_blocks changed and must be written back by the caller.
-static uint32_t get_or_alloc_block(ext2_inode_t *inode, uint32_t block_index, int *dirty) {
+// A table for the write path, in indirect_buf (`dind` 0) or dind_buf (1):
+// read once, changed in memory, written when another is wanted or the call
+// ends. A table just allocated is zeros, with nothing to read.
+static uint32_t *wtable(int dind, uint32_t blk, int fresh) {
+    uint8_t *buf = dind ? dind_buf : indirect_buf;
+    uint32_t *cur = dind ? &db_blk : &ib_blk;
+    if (*cur != blk) {
+        if (dind) db_flush(); else ib_flush();
+        if (fresh) { for (uint32_t i = 0; i < block_size; i++) buf[i] = 0; }
+        else read_block(blk, buf);
+        *cur = blk;
+        if (fresh) { if (dind) db_dirty = 1; else ib_dirty = 1; }
+    }
+    return (uint32_t *)buf;
+}
+
+// Returns the physical block backing block_index of `inode`, allocating it (and
+// the tables above it) on demand. Sets *dirty when the inode's i_block/i_blocks
+// changed and must be written back by the caller. A data block allocated here
+// is zeroed only with `zero`; without, *fresh says it was just allocated and
+// holds whatever it held -- the caller is about to write it.
+static uint32_t get_or_alloc_block(ext2_inode_t *inode, uint32_t block_index, int *dirty,
+                                   int zero, int *fresh) {
     uint32_t spb = block_size / 512;
+    if (fresh) *fresh = 0;
     if (block_index < 12) {
         if (inode->i_block[block_index] == 0) {
             uint32_t blk = alloc_block();
             if (blk == 0) return 0;
-            zero_block(blk);
+            if (zero) zero_block(blk); else if (fresh) *fresh = 1;
             inode->i_block[block_index] = blk;
             inode->i_blocks += spb;
             *dirty = 1;
@@ -527,22 +633,23 @@ static uint32_t get_or_alloc_block(ext2_inode_t *inode, uint32_t block_index, in
 
     // single indirect
     if (idx < per) {
+        int new_t = 0;
         if (inode->i_block[12] == 0) {
             uint32_t ind = alloc_block();
             if (ind == 0) return 0;
-            zero_block(ind);
             inode->i_block[12] = ind;
             inode->i_blocks += spb;
             *dirty = 1;
+            new_t = 1;
         }
-        read_block(inode->i_block[12], indirect_buf);
-        uint32_t *ptrs = (uint32_t *)indirect_buf;
+        uint32_t *ptrs = wtable(0, inode->i_block[12], new_t);
         if (ptrs[idx] == 0) {
             uint32_t blk = alloc_block();
             if (blk == 0) return 0;
-            zero_block(blk);
+            if (zero) zero_block(blk); else if (fresh) *fresh = 1;
             ptrs[idx] = blk;
-            write_block(inode->i_block[12], indirect_buf);
+            ib_dirty = 1;
+            inode->i_block[12] = inode->i_block[12];
             inode->i_blocks += spb;
             *dirty = 1;
         }
@@ -550,40 +657,39 @@ static uint32_t get_or_alloc_block(ext2_inode_t *inode, uint32_t block_index, in
     }
     idx -= per;
 
-    // double indirect. alloc_block/zero_block use bmp_buf/gd_buf/wb_buf, never
-    // dind_buf or indirect_buf, so the two table images stay valid across the
-    // allocations below.
+    // double indirect: the level-1 table in dind_buf, a level-2 one in
+    // indirect_buf.
     if (idx < per * per) {
+        int new_t = 0;
         if (inode->i_block[13] == 0) {
             uint32_t t = alloc_block();
             if (t == 0) return 0;
-            zero_block(t);
             inode->i_block[13] = t;
             inode->i_blocks += spb;
             *dirty = 1;
+            new_t = 1;
         }
-        read_block(inode->i_block[13], dind_buf);       // level-1 table
-        uint32_t *l1 = (uint32_t *)dind_buf;
+        uint32_t *l1 = wtable(1, inode->i_block[13], new_t);
         uint32_t outer = idx / per;
         uint32_t inner = idx % per;
 
+        int new_l2 = 0;
         if (l1[outer] == 0) {
             uint32_t t = alloc_block();
             if (t == 0) return 0;
-            zero_block(t);
             l1[outer] = t;
-            write_block(inode->i_block[13], dind_buf);
+            db_dirty = 1;
             inode->i_blocks += spb;
             *dirty = 1;
+            new_l2 = 1;
         }
-        read_block(l1[outer], indirect_buf);            // level-2 table
-        uint32_t *l2 = (uint32_t *)indirect_buf;
+        uint32_t *l2 = wtable(0, l1[outer], new_l2);
         if (l2[inner] == 0) {
             uint32_t blk = alloc_block();
             if (blk == 0) return 0;
-            zero_block(blk);
+            if (zero) zero_block(blk); else if (fresh) *fresh = 1;
             l2[inner] = blk;
-            write_block(l1[outer], indirect_buf);
+            ib_dirty = 1;
             inode->i_blocks += spb;
             *dirty = 1;
         }
@@ -597,7 +703,19 @@ void ext2_get_inode(uint32_t inode_num, ext2_inode_t *out) {
     get_inode(inode_num, out);
 }
 
-int ext2_write(uint32_t inode_num, uint32_t offset, const void *buf, uint32_t len) {
+// Whole blocks waiting to go out together: they follow each other on the disk.
+#define WRUN_BYTES 65536
+static uint8_t wrun[WRUN_BYTES] __attribute__((aligned(WRUN_BYTES)));
+static uint32_t wrun_first, wrun_n;
+
+static void wrun_flush(void) {
+    if (!wrun_n) return;
+    uint32_t spb = block_size / 512;
+    blkdev_write_sectors((uint64_t)wrun_first * spb, wrun_n * spb, wrun);
+    wrun_n = 0;
+}
+
+static int write_impl(uint32_t inode_num, uint32_t offset, const void *buf, uint32_t len) {
     if (!mounted) return -1;
     ext2_inode_t inode;
     get_inode(inode_num, &inode);
@@ -605,22 +723,39 @@ int ext2_write(uint32_t inode_num, uint32_t offset, const void *buf, uint32_t le
     const uint8_t *in = (const uint8_t *)buf;
     uint32_t total = 0;
     int dirty = 0;
+    wrun_n = 0;
 
     while (total < len) {
         uint32_t pos = offset + total;
         uint32_t block_index = pos / block_size;
         uint32_t block_off = pos % block_size;
-        uint32_t blk = get_or_alloc_block(&inode, block_index, &dirty);
+        int fresh = 0;
+        uint32_t blk = get_or_alloc_block(&inode, block_index, &dirty, 0, &fresh);
         if (blk == 0) break;
 
         uint32_t chunk = block_size - block_off;
         if (chunk > len - total) chunk = len - total;
 
-        read_block(blk, block_buf);
-        for (uint32_t i = 0; i < chunk; i++) block_buf[block_off + i] = in[total + i];
-        write_block(blk, block_buf);
+        if (chunk == block_size) {
+            // a whole block: nothing to read first; it joins the run if it
+            // comes right after it on the disk
+            if (wrun_n && (blk != wrun_first + wrun_n || (wrun_n + 1) * block_size > WRUN_BYTES))
+                wrun_flush();
+            if (!wrun_n) wrun_first = blk;
+            for (uint32_t i = 0; i < block_size; i++) wrun[wrun_n * block_size + i] = in[total + i];
+            wrun_n++;
+        } else {
+            wrun_flush();
+            // part of a block: what is not written stays as it was -- zeros,
+            // for a block just taken
+            if (fresh) { for (uint32_t i = 0; i < block_size; i++) block_buf[i] = 0; }
+            else read_block(blk, block_buf);
+            for (uint32_t i = 0; i < chunk; i++) block_buf[block_off + i] = in[total + i];
+            write_block(blk, block_buf);
+        }
         total += chunk;
     }
+    wrun_flush();
 
     if (offset + total > inode.i_size) {
         inode.i_size = offset + total;
@@ -632,6 +767,12 @@ int ext2_write(uint32_t inode_num, uint32_t offset, const void *buf, uint32_t le
     }
     if (dirty) put_inode(inode_num, &inode);
     return (int)total;
+}
+
+int ext2_write(uint32_t inode_num, uint32_t offset, const void *buf, uint32_t len) {
+    int r = write_impl(inode_num, offset, buf, len);
+    ext2_flush();
+    return r;
 }
 
 static uint32_t dirent_reclen(uint8_t name_len) {
@@ -714,7 +855,7 @@ static int add_dirent(uint32_t dir_inode_num, const char *name, uint8_t name_len
     // No room in existing blocks: append a fresh directory block.
     int dirty = 0;
     uint32_t bi = dir.i_size / block_size;
-    uint32_t blk = get_or_alloc_block(&dir, bi, &dirty);
+    uint32_t blk = get_or_alloc_block(&dir, bi, &dirty, 1, 0);
     if (blk == 0) return 0;
     for (uint32_t i = 0; i < block_size; i++) block_buf[i] = 0;
     ext2_dirent_hdr_t *de = (ext2_dirent_hdr_t *)block_buf;
@@ -767,7 +908,7 @@ static void free_inode_data(const ext2_inode_t *inode) {
     uint32_t per = block_size / 4;
 
     // Data blocks first (resolve_block walks direct + single + double indirect).
-    // free_block uses bmp_buf/gd_buf, so resolve_block's dind_buf/indirect_buf
+    // free_block uses its own bitmap buffer, so resolve_block's dind_buf/indirect_buf
     // images are not disturbed between calls.
     uint32_t num_blocks = (inode->i_size + block_size - 1) / block_size;
     for (uint32_t bi = 0; bi < num_blocks; bi++) {
@@ -796,7 +937,7 @@ static void free_inode_data(const ext2_inode_t *inode) {
 // i_blocks is decremented for every freed block: get_or_alloc_block increments
 // it on the way up, so failing to mirror that here makes e2fsck report a wrong
 // block count.
-int ext2_truncate(uint32_t inode_num, uint32_t new_size) {
+static int ext2_truncate_impl(uint32_t inode_num, uint32_t new_size) {
     if (!mounted) return 0;
 
     ext2_inode_t inode;
@@ -824,7 +965,7 @@ int ext2_truncate(uint32_t inode_num, uint32_t new_size) {
         }
     }
 
-    // single-indirect blocks. free_block() works out of bmp_buf/gd_buf, so the
+    // single-indirect blocks. free_block() works out of its own bitmap buffer, so the
     // pointer table can safely stay in indirect_buf across these calls.
     if (old_blocks > 12 && inode.i_block[12]) {
         read_block(inode.i_block[12], indirect_buf);
@@ -908,7 +1049,7 @@ int ext2_truncate(uint32_t inode_num, uint32_t new_size) {
     return 1;
 }
 
-int ext2_create(uint32_t parent_inode_num, const char *name, int is_dir,
+static int ext2_create_impl(uint32_t parent_inode_num, const char *name, int is_dir,
                 uint32_t *out_inode_num) {
     if (!mounted) return 0;
     uint8_t nlen = 0;
@@ -929,7 +1070,7 @@ int ext2_create(uint32_t parent_inode_num, const char *name, int is_dir,
 
     if (is_dir) {
         int dirty = 0;
-        uint32_t blk = get_or_alloc_block(&ni, 0, &dirty);
+        uint32_t blk = get_or_alloc_block(&ni, 0, &dirty, 1, 0);
         if (blk == 0) { free_inode(ino); return 0; }
         for (uint32_t i = 0; i < block_size; i++) block_buf[i] = 0;
         ext2_dirent_hdr_t *d1 = (ext2_dirent_hdr_t *)block_buf;
@@ -963,7 +1104,7 @@ int ext2_create(uint32_t parent_inode_num, const char *name, int is_dir,
     return 1;
 }
 
-int ext2_unlink(uint32_t parent_inode_num, const char *name) {
+static int ext2_unlink_impl(uint32_t parent_inode_num, const char *name) {
     if (!mounted) return 0;
     uint8_t nlen = 0;
     while (name[nlen]) nlen++;
@@ -1018,7 +1159,7 @@ int ext2_unlink(uint32_t parent_inode_num, const char *name) {
     return 1;
 }
 
-int ext2_move(uint32_t old_parent, const char *old_name,
+static int ext2_move_impl(uint32_t old_parent, const char *old_name,
               uint32_t new_parent, const char *new_name) {
     if (!mounted) return 0;
     uint8_t oldlen = 0; while (old_name[oldlen]) oldlen++;
@@ -1057,4 +1198,30 @@ int ext2_move(uint32_t old_parent, const char *old_name,
         put_inode(new_parent, &np);
     }
     return 1;
+}
+
+// The public calls that change the filesystem: each writes what it changed
+// in memory before it returns (see ext2_flush).
+int ext2_truncate(uint32_t inode_num, uint32_t new_size) {
+    int r = ext2_truncate_impl(inode_num, new_size);
+    ext2_flush();
+    return r;
+}
+
+int ext2_create(uint32_t parent_inode_num, const char *name, int is_dir, uint32_t *out_inode_num) {
+    int r = ext2_create_impl(parent_inode_num, name, is_dir, out_inode_num);
+    ext2_flush();
+    return r;
+}
+
+int ext2_unlink(uint32_t parent_inode_num, const char *name) {
+    int r = ext2_unlink_impl(parent_inode_num, name);
+    ext2_flush();
+    return r;
+}
+
+int ext2_move(uint32_t old_parent, const char *old_name, uint32_t new_parent, const char *new_name) {
+    int r = ext2_move_impl(old_parent, old_name, new_parent, new_name);
+    ext2_flush();
+    return r;
 }

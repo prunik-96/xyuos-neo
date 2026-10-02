@@ -932,6 +932,7 @@ static int cap_glow(int n, int b) { return glow_of(KEY_CAP(n, b)); }
 static int join_hint = -1;          // the window a dragged tab would join
 
 static const char *pane_title(struct pane *p);
+static const char *program_label(const char *file);
 
 // Everything about a frame's top that can change without the window moving:
 // what is lit, what is held, the other tabs and their names.
@@ -1002,7 +1003,7 @@ static void tab_rect_i(int n, int i, int *tx, int *ty, int *tw, int *th) {
     int room = bx - 12 - PLUS_S - TAB_GAP - left;
     int w[TAB_MAX], total = 0;
     for (int j = 0; j < k; j++) {
-        int ww = 38 + ui_text_w(pane_title(&panes[nodes[m[j]].pane_idx]), UI_F13B) + 40;
+        int ww = 38 + ui_text_w(program_label(pane_title(&panes[nodes[m[j]].pane_idx])), UI_F13B) + 40;
         if (ww > 240) ww = 240;
         if (ww < 60) ww = 60;
         w[j] = ww;
@@ -1313,7 +1314,7 @@ static void paint_chrome(int n, int focus) {
             int glow = glow_of(KEY_TAB(n, i, 0));
             ui_round_fill(qx, qy + 3, qw, qh - 9, 12, T->plate,
                           (focus ? 120 : 80) + glow * 90 / 256);
-            const char *nm = pane_title(&panes[nodes[m[i]].pane_idx]);
+            const char *nm = program_label(pane_title(&panes[nodes[m[i]].pane_idx]));
             int ix = qx + 10, iy = qy + 3 + (qh - 9 - 16) / 2;
             if (!ui_icon(ix, iy, nm, ICON_SMALL))
                 ui_round_fill(ix + 2, iy + 2, 12, 12, 6, T->title_text_dim, 200);
@@ -1380,7 +1381,7 @@ static void paint_chrome(int n, int focus) {
         int saved[4];
         ui_clip_get(saved);
         ui_clip(tx, ty, tw - 36, th);
-        ui_text_fit(ix + 26, ty + (th - ui_line_h(UI_F13B)) / 2, tw - 36 - 38, ttl, UI_F13B,
+        ui_text_fit(ix + 26, ty + (th - ui_line_h(UI_F13B)) / 2, tw - 36 - 38, program_label(ttl), UI_F13B,
                     focus ? ink : dim);
         ui_clip_set(saved);
         int cx, cy, cw, chh;

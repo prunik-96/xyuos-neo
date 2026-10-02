@@ -65,14 +65,14 @@ ISO    := build/xyuos_neo.iso
 DISK_MB := 128
 
 RAW_USER_PROGS  := test1
-LIBC_C_PROGS    := files note view taskmgr play hello_c fstest spin parent keywait sh fm edit cc run \
+LIBC_C_PROGS    := note view taskmgr play hello_c fstest spin parent keywait sh fm edit cc run \
                    ls cat echo wc grep head tail sort uniq tee hexdump \
                    cp mv touch stat ps free uname sleep kill loop bigfile yes count crash \
                    plasma devmgr control web ftest netlog memtest vmtest thrtest \
                    sigtest sigchild shmtest shmchild partest notify
 LIBC_CXX_PROGS  := hello_cpp cpptest
 # Built on libtext (see "the text stack" below).
-TEXT_PROGS      := texttest fonts
+TEXT_PROGS      := texttest fonts files
 # The interactive shell / file manager / editor now live in the kernel WM pane
 # engine (kernel/wm/), so there are no separate userland shell binaries; these
 # remaining userland programs are just the boot demos.

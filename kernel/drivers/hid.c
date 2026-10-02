@@ -22,6 +22,7 @@ void hid_mouse_boot(hid_mouse_fmt *f) {
     f->x = 8;      f->xs = 8; f->xsig = 1;
     f->y = 16;     f->ys = 8; f->ysig = 1;
     f->wheel = 24; f->ws = 8; f->wsig = 1;
+    f->abs = 0; f->xmax = f->ymax = 0;
 }
 
 int hid_parse_mouse(const uint8_t *d, int len, hid_mouse_fmt *f) {
@@ -29,7 +30,7 @@ int hid_parse_mouse(const uint8_t *d, int len, hid_mouse_fmt *f) {
     for (int i = 0; i < 256; i++) pos[i] = 0;
 
     uint32_t page = 0, rsize = 0, rcount = 0;
-    int32_t lmin = 0;
+    int32_t lmin = 0, lmax = 0;
     uint8_t rid = 0;
     uint32_t usages[16];
     int nus = 0;
@@ -41,6 +42,9 @@ int hid_parse_mouse(const uint8_t *d, int len, hid_mouse_fmt *f) {
     f->btn[0] = f->btn[1] = f->btn[2] = -1;
     f->xs = f->ys = f->ws = 0;
     f->xsig = f->ysig = f->wsig = 0;
+    f->abs = 0;
+    f->xmax = f->ymax = 0;
+    int x_abs = 0, y_abs = 0;
 
     for (int i = 0; i < len; ) {
         uint8_t p = d[i];
@@ -63,6 +67,7 @@ int hid_parse_mouse(const uint8_t *d, int len, hid_mouse_fmt *f) {
         if (type == 1) {                                   // global
             if (tag == 0x0) page = u;
             else if (tag == 0x1) lmin = s;
+            else if (tag == 0x2) lmax = size == 4 || lmin < 0 ? s : (int32_t)u;
             else if (tag == 0x7) rsize = u;
             else if (tag == 0x9) rcount = u;
             else if (tag == 0x8) rid = (uint8_t)u;
@@ -82,12 +87,14 @@ int hid_parse_mouse(const uint8_t *d, int len, hid_mouse_fmt *f) {
                     }
                     int bit = pos[rid];
                     if (variable && usage) {
-                        if (usage == U_X && relative && x_rid < 0) {
+                        if (usage == U_X && x_rid < 0) {
                             f->x = (int16_t)bit; f->xs = (uint8_t)rsize;
                             f->xsig = lmin < 0; x_rid = rid;
-                        } else if (usage == U_Y && relative && y_rid < 0) {
+                            x_abs = !relative; f->xmax = lmax;
+                        } else if (usage == U_Y && y_rid < 0) {
                             f->y = (int16_t)bit; f->ys = (uint8_t)rsize;
                             f->ysig = lmin < 0; y_rid = rid;
+                            y_abs = !relative; f->ymax = lmax;
                         } else if (usage == U_WHEEL && relative && w_rid < 0) {
                             f->wheel = (int16_t)bit; f->ws = (uint8_t)rsize;
                             f->wsig = lmin < 0; w_rid = rid;
@@ -106,7 +113,9 @@ int hid_parse_mouse(const uint8_t *d, int len, hid_mouse_fmt *f) {
         }
     }
 
-    if (x_rid < 0 || y_rid != x_rid) { f->x = f->y = -1; return 0; }
+    if (x_rid < 0 || y_rid != x_rid || x_abs != y_abs) { f->x = f->y = -1; return 0; }
+    if (x_abs && (f->xmax <= 0 || f->ymax <= 0)) { f->x = f->y = -1; return 0; }
+    f->abs = (uint8_t)x_abs;
     // Everything else must be in the same report as X and Y to be read with
     // them; a wheel or button described in some other report is left out.
     if (w_rid != x_rid) f->wheel = -1;

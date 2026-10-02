@@ -91,4 +91,7 @@ size_t readline(char *buf, size_t max);
 }
 #endif
 
+/* Rename or move a file (POSIX). 0, or -1. */
+int rename(const char *oldpath, const char *newpath);
+
 #endif

@@ -265,12 +265,7 @@ int blkdev_read_sectors(uint64_t lba, uint32_t count, void *buf) {
 }
 
 int blkdev_write_sectors(uint64_t lba, uint32_t count, const void *buf) {
-    if (backend == BACKEND_VIRTIO) {
-        for (uint32_t i = 0; i < count; i++)
-            if (!virtio_blk_write_sector(lba + i, (const uint8_t *)buf + i * 512))
-                return 0;
-        return 1;
-    }
+    if (backend == BACKEND_VIRTIO) return virtio_blk_write_sectors(lba, count, buf);
     if (backend == BACKEND_STICK) {
         if (lba + count > stick_sectors) return 0;
         return usb_disk_write(stick_dev, (uint32_t)(stick_first + lba), count, buf);

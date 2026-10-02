@@ -30,6 +30,10 @@ void mouse_set_present(int yes);
 // Feed one HID boot-protocol report: button bitmap plus relative motion.
 void mouse_inject(uint8_t buttons, int dx, int dy, int wheel);
 
+// The same from a pointer that says where it IS: x of 0..xmax across the
+// screen, y of 0..ymax down it.
+void mouse_inject_abs(uint8_t buttons, int x, int xmax, int y, int ymax, int wheel);
+
 // Non-blocking; 1 if an event was dequeued.
 int  mouse_poll_event(struct mouse_event *out);
 

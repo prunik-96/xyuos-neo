@@ -20,9 +20,15 @@ typedef struct {
     int16_t x, y, wheel;         // first bit of each; -1 if absent
     uint8_t xs, ys, ws;          // their sizes in bits
     uint8_t xsig, ysig, wsig;    // whether they are signed
+    // A tablet or a touch screen -- or QEMU's usb-tablet -- says where the
+    // pointer IS, not how far it moved: X and Y run 0..xmax/ymax over the
+    // whole screen.
+    uint8_t abs;
+    int32_t xmax, ymax;
 } hid_mouse_fmt;
 
-// Fill `f` from a report descriptor. 1 if it describes relative X and Y.
+// Fill `f` from a report descriptor. 1 if it describes X and Y -- relative
+// (a mouse) or absolute (a tablet, f->abs set).
 int hid_parse_mouse(const uint8_t *desc, int len, hid_mouse_fmt *f);
 
 // The boot protocol's fixed layout, for a mouse whose descriptor could not be
