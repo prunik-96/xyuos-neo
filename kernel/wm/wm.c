@@ -230,6 +230,39 @@ static int theme = 0;      // index into THEMES[] (0 = light glass)
 // two can never drift apart into a table nobody reads.
 static int lang = 0;
 #define L(ru, en) (lang ? (en) : (ru))
+
+// --- the keyboard layout ------------------------------------------------------
+//
+// The keyboard drivers know the keys by their Latin letters. With the Russian
+// layout on, a letter going to a program is the one printed beside it on a
+// Russian keyboard (ЙЦУКЕН), sent as the two bytes of its UTF-8 -- a program
+// that only appends what it is given builds correct text without knowing.
+// Not with Ctrl, Alt or Win held: Ctrl+C is Ctrl+C in any layout.
+static int kbd_ru;
+static int kbd_chord;           // Alt and Shift went down together, nothing else yet
+
+static const char ru_keys[]   = "qwertyuiop[]asdfghjkl;'zxcvbnm,./`QWERTYUIOP{}ASDFGHJKL:\"ZXCVBNM<>?~@#$^&|";
+static const uint16_t ru_cps[] = {
+    0x439, 0x446, 0x443, 0x43A, 0x435, 0x43D, 0x433, 0x448, 0x449, 0x437, 0x445, 0x44A,   // й..ъ
+    0x444, 0x44B, 0x432, 0x430, 0x43F, 0x440, 0x43E, 0x43B, 0x434, 0x436, 0x44D,          // ф..э
+    0x44F, 0x447, 0x441, 0x43C, 0x438, 0x442, 0x44C, 0x431, 0x44E, '.', 0x451,            // я..ю . ё
+    0x419, 0x426, 0x423, 0x41A, 0x415, 0x41D, 0x413, 0x428, 0x429, 0x417, 0x425, 0x42A,   // Й..Ъ
+    0x424, 0x42B, 0x412, 0x410, 0x41F, 0x420, 0x41E, 0x41B, 0x414, 0x416, 0x42D,          // Ф..Э
+    0x42F, 0x427, 0x421, 0x41C, 0x418, 0x422, 0x42C, 0x411, 0x42E, ',', 0x401,            // Я..Ю , Ё
+    '"', 0x2116, ';', ':', '?', '/',                                                      // " № ; : ? /
+};
+
+static uint32_t ru_of(char a) {
+    for (int i = 0; ru_keys[i]; i++) if (ru_keys[i] == a) return ru_cps[i];
+    return 0;
+}
+
+static void kbd_toggle(void) {
+    kbd_ru = !kbd_ru;
+    dirty = 1;
+}
+
+int wm_kbd_ru(void) { return kbd_ru; }
 static int dblclick_ms = 400;   // how close two clicks must be to be a double
 #define TH (&THEMES[theme])
 
@@ -2048,8 +2081,8 @@ static int island_edge_now(void) { return island_edge; }
 #define ISL_ICON   44
 #define ISL_SLOT   52
 #define ISL_GAP    14
-#define ISL_STAT_W 172                 // the status pill, lying down
-#define ISL_STAT_H 112                 //                  standing up
+#define ISL_STAT_W 204                 // the status pill, lying down
+#define ISL_STAT_H 138                 //                  standing up
 #define ISL_R      26
 
 struct tb_item {
@@ -2154,6 +2187,14 @@ static void tb_layout(void) {
     else          { s->x = isl_x + at; s->y = isl_y + 10; s->w = ISL_STAT_W; s->h = ISLAND_H - 20; }
 }
 
+// Where the layout's little label sits in the status pill.
+#define LANG_CHIP_W 30
+#define LANG_CHIP_H 20
+static void lang_chip_at(const struct tb_item *it, int *x, int *y) {
+    if (it->w > it->h) { *x = it->x + 70; *y = it->y + (it->h - LANG_CHIP_H) / 2; }
+    else { *x = it->x + (it->w - LANG_CHIP_W) / 2; *y = it->y + 64; }
+}
+
 static int tb_item_at(int mx, int my) {
     for (int i = 0; i < tb_n; i++)
         if (mx >= tb_items[i].x && mx < tb_items[i].x + tb_items[i].w &&
@@ -2190,6 +2231,7 @@ static uint64_t taskbar_fingerprint(void) {
     hsh = (hsh ^ (uint64_t)wm_clock.hour) * FNV_P;
     hsh = (hsh ^ (uint64_t)wm_clock.min)  * FNV_P;
     hsh = (hsh ^ (uint64_t)wm_clock.day)  * FNV_P;
+    hsh = (hsh ^ (uint64_t)(kbd_ru + 5)) * FNV_P;
     return hsh;
 }
 
@@ -2398,6 +2440,12 @@ static void draw_island_now(void) {
             int up = net_is_up(), snd = audio_ready() > 0;
             char tm[6];
             two_digits(tm, wm_clock.hour); tm[2] = ':'; two_digits(tm + 3, wm_clock.min); tm[5] = 0;
+            int lx, ly;
+            lang_chip_at(it, &lx, &ly);
+            ui_round_fill(lx, ly, LANG_CHIP_W, LANG_CHIP_H, 6, ink, 34);
+            const char *lc = kbd_ru ? "RU" : "EN";
+            ui_text(lx + (LANG_CHIP_W - ui_text_w(lc, UI_F11)) / 2,
+                    ly + (LANG_CHIP_H - ui_line_h(UI_F11)) / 2, lc, UI_F11, ink);
             if (!vertical) {
                 glyph_draw(G_WIFI, it->x + 14, it->y + 13, 18, 0xFF000000 | (up ? ink : dim), 0);
                 glyph_draw(G_VOL, it->x + 42, it->y + 13, 18, 0xFF000000 | (snd ? ink : dim), 0);
@@ -2412,15 +2460,15 @@ static void draw_island_now(void) {
                 const char *mo = months_s[lang][(wm_clock.mon + 11) % 12];
                 while (*mo) dt[q++] = *mo++;
                 dt[q] = 0;
-                ui_text(it->x + 76, it->y + 3, tm, UI_F15B, ink);
-                ui_text(it->x + 76, it->y + 23, dt, UI_F11, dim);
+                ui_text(it->x + 108, it->y + 3, tm, UI_F15B, ink);
+                ui_text(it->x + 108, it->y + 23, dt, UI_F11, dim);
             } else {
                 int cx = it->x + it->w / 2;
                 glyph_draw(G_WIFI, cx - 10, it->y + 10, 20, 0xFF000000 | (up ? ink : dim), 0);
                 glyph_draw(G_VOL, cx - 10, it->y + 38, 20, 0xFF000000 | (snd ? ink : dim), 0);
                 char hh[3] = { tm[0], tm[1], 0 }, mm[3] = { tm[3], tm[4], 0 };
-                ui_text(cx - ui_text_w(hh, UI_F15B) / 2, it->y + 64, hh, UI_F15B, ink);
-                ui_text(cx - ui_text_w(mm, UI_F15B) / 2, it->y + 84, mm, UI_F15B, ink);
+                ui_text(cx - ui_text_w(hh, UI_F15B) / 2, it->y + 90, hh, UI_F15B, ink);
+                ui_text(cx - ui_text_w(mm, UI_F15B) / 2, it->y + 110, mm, UI_F15B, ink);
             }
             break;
         }
@@ -5976,8 +6024,15 @@ static void taskbar_click(int mx, int my) {
     case TB_ORB:
         start_toggle();
         break;
-    case TB_STATUS:
-        // The clock opens the control panel, and closes it again.
+    case TB_STATUS: {
+        // The layout's label switches the layout; the rest of the pill -- the
+        // clock -- opens the control panel, and closes it again.
+        int lx, ly;
+        lang_chip_at(it, &lx, &ly);
+        if (mx >= lx - 3 && mx < lx + LANG_CHIP_W + 3 && my >= ly - 3 && my < ly + LANG_CHIP_H + 3) {
+            kbd_toggle();
+            break;
+        }
         cc_open = !cc_open;
         if (cc_open) pop_t0 = now_ms();
         cc_vol_drag = 0;
@@ -5985,6 +6040,7 @@ static void taskbar_click(int mx, int my) {
         wp_dirty = 1;
         dirty = 1;
         break;
+    }
     case TB_APP: {
         int n = it->win;
         if (n >= 0 && nodes[n].used) {
@@ -6719,6 +6775,17 @@ void wm_route_input(void) {
         // what is HELD. They never mean a shortcut -- releasing Alt+F4 must not
         // close a second window -- and they only reach a program that asked for
         // them. Everything below this point may assume a key going down.
+        // Alt+Shift switches the layout when the second of the two is let go
+        // with nothing pressed in between (Alt+Shift+Tab is not a switch).
+        if (ev.pressed && ((ev.code == KEY_SHIFT && (ev.mods & KBD_MOD_ALT)) ||
+                           (ev.code == KEY_ALT && (ev.mods & KBD_MOD_SHIFT))))
+            kbd_chord = 1;
+        else if (ev.pressed && ev.code != KEY_SHIFT && ev.code != KEY_ALT)
+            kbd_chord = 0;
+        else if (!ev.pressed && kbd_chord && (ev.code == KEY_SHIFT || ev.code == KEY_ALT)) {
+            kbd_chord = 0;
+            kbd_toggle();
+        }
         if (!ev.pressed || ev.code == KEY_SHIFT || ev.code == KEY_CTRL ||
             ev.code == KEY_ALT || ev.code == KEY_SUPER) {
             if (focused >= 0 && nodes[focused].used) {
@@ -6781,6 +6848,7 @@ void wm_route_input(void) {
         }
 
         // --- Windows-style window management ---
+        if (ev.code == KEY_CHAR && ev.ascii == ' ' && super) { kbd_toggle(); continue; }
         if (ev.code == KEY_CHAR && ev.ascii == '	' && alt) {      // Alt+Tab
             push_binding(WMB_ALTTAB | (shift ? 1 : 0)); continue;
         }
@@ -6859,8 +6927,26 @@ void wm_route_input(void) {
         // reach here.)
         if (p->scroll != 0) { pane_scroll_reset(p); dirty = 1; }
 
-        // Ordinary input belongs to whoever owns the focused pane.
-        pane_push_event(p, &ev);
+        // Ordinary input belongs to whoever owns the focused pane -- in the
+        // layout that is on.
+        uint32_t cp = 0;
+        if (kbd_ru && ev.code == KEY_CHAR && !(ev.mods & (KBD_MOD_CTRL | KBD_MOD_ALT | KBD_MOD_SUPER)))
+            cp = ru_of(ev.ascii);
+        if (cp >= 0x80) {
+            struct kbd_event u = ev;
+            uint8_t b[3];
+            int nb = cp < 0x800 ? 2 : 3;
+            if (nb == 2) { b[0] = (uint8_t)(0xC0 | (cp >> 6)); b[1] = (uint8_t)(0x80 | (cp & 0x3F)); }
+            else {
+                b[0] = (uint8_t)(0xE0 | (cp >> 12));
+                b[1] = (uint8_t)(0x80 | ((cp >> 6) & 0x3F));
+                b[2] = (uint8_t)(0x80 | (cp & 0x3F));
+            }
+            for (int k = 0; k < nb; k++) { u.ascii = (char)b[k]; pane_push_event(p, &u); }
+        } else {
+            if (cp) ev.ascii = (char)cp;
+            pane_push_event(p, &ev);
+        }
         if (p->owner_pid > 0) process_wake_key();
     }
 

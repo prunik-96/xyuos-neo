@@ -343,6 +343,24 @@ int vol_mounts(char names[][8], int max) {
     return n;
 }
 
+int vol_eject(int i) {
+    if (i < 0 || i >= VOL_MAX || !vols[i].used) return 0;
+    int disk = vols[i].disk;
+    for (int k = 0; k < VOL_MAX; k++) {
+        struct vol *v = &vols[k];
+        if (!v->used || v->disk != disk) continue;
+        fatfs_unmount(v);
+        cache_drop(v);
+        v->used = 0;
+        v->gen++;
+    }
+    // Remembered as scanned: it is not found again until it comes back with
+    // a new id -- pulled out and put in.
+    return 1;
+}
+
+int vol_disk(int i) { return i >= 0 && i < VOL_MAX && vols[i].used ? vols[i].disk : -1; }
+
 struct vol *vol_get(int i) {
     if (i < 0 || i >= VOL_MAX) return NULL;
     vol_refresh();

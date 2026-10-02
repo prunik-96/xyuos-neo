@@ -224,6 +224,45 @@ void audio_title(const char *title) {
     xyuos_syscall3(SYS_AUDIO, AU_TITLE, (long)title, 0);
 }
 
+int readdir_x(const char *path, struct xdirent *out, int max) {
+    return (int)xyuos_syscall3(SYS_READDIR, (long)path, (long)out, max);
+}
+
+int volumes_list(struct uvol *out, int max) {
+    return (int)xyuos_syscall3(SYS_VOLUMES, VOLOP_LIST, (long)out, max);
+}
+
+int volume_eject(int index) {
+    return (int)xyuos_syscall3(SYS_VOLUMES, VOLOP_EJECT, index, 0);
+}
+
+int volume_space(int index, struct uvol *u) {
+    return (int)xyuos_syscall3(SYS_VOLUMES, VOLOP_SPACE, index, (long)u);
+}
+
+int clip_set(int type, const void *data, unsigned len) {
+    struct clip_req rq = { CLIPOP_SET, type, (void *)data, len, 0 };
+    return (int)xyuos_syscall3(SYS_CLIP, (long)&rq, 0, 0);
+}
+
+int clip_get(void *buf, unsigned room, int *type) {
+    struct clip_req rq = { CLIPOP_GET, 0, buf, room, 0 };
+    if (xyuos_syscall3(SYS_CLIP, (long)&rq, 0, 0) != 0) return -1;
+    if (type) *type = rq.type;
+    return (int)rq.result;
+}
+
+unsigned clip_seq(int *type) {
+    struct clip_req rq = { CLIPOP_SEQ, 0, 0, 0, 0 };
+    xyuos_syscall3(SYS_CLIP, (long)&rq, 0, 0);
+    if (type) *type = rq.type;
+    return rq.result;
+}
+
+int ui_lang(void) {
+    return (int)xyuos_syscall3(SYS_SETTING, SETOP_GET, SET_LANG, 0);
+}
+
 int notify(const char *title, const char *text) {
     return (int)xyuos_syscall3(SYS_NOTIFY, (long)title, (long)text, 0);
 }
@@ -234,6 +273,7 @@ int audio_play(const short *frames, int nframes) {
 
 int proc_stop(int pid) { return (int)xyuos_syscall3(SYS_PROCCTL, PC_STOP, pid, 0); }
 int proc_cont(int pid) { return (int)xyuos_syscall3(SYS_PROCCTL, PC_CONT, pid, 0); }
+int proc_alive(int pid) { return (int)xyuos_syscall3(SYS_PROCCTL, PC_ALIVE, pid, 0); }
 
 int font_cell(int *w, int *h) {
     long r = xyuos_syscall3(SYS_FONT, FONT_INFO, 0, 0);

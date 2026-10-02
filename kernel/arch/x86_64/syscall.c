@@ -13,6 +13,8 @@
 #include "../../drivers/rtc.h"
 #include "smp.h"
 #include "../../fs/vol.h"
+#include "../../fs/ext2.h"
+#include "../../kernel/clip.h"
 #include "../../fs/fatfs.h"
 #include "../../wm/wm.h"
 #include "../../net/net.h"
@@ -209,6 +211,86 @@ static uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 default: return (uint64_t)-1;
             }
         }
+        case SYS_READDIR: {
+            // The path, copied in a byte at a time like any string of unknown
+            // length; the array is checked whole before a byte is written.
+            static char kp[512];
+            int n = 0;
+            while (n < (int)sizeof kp - 1 && vmm_user_range_ok(a1 + (uint64_t)n, 1)) {
+                char ch = ((const char *)(uintptr_t)a1)[n];
+                if (!ch) break;
+                kp[n++] = ch;
+            }
+            kp[n] = 0;
+            int max = (int)a3;
+            if (max < 0 || max > 100000) return (uint64_t)-1;
+            if (max && !vmm_user_range_ok(a2, (uint64_t)max * sizeof(struct xdirent)))
+                return (uint64_t)-1;
+            return (uint64_t)(int64_t)vfs_readdir(kp, (struct xdirent *)(uintptr_t)a2, max);
+        }
+        case SYS_VOLUMES: {
+            if (a1 == VOLOP_EJECT) return vol_eject((int)a2) ? 0 : (uint64_t)-1;
+            if (a1 == VOLOP_SPACE) {
+                if (!vmm_user_range_ok(a3, sizeof(struct uvol))) return (uint64_t)-1;
+                struct uvol *o = (struct uvol *)(uintptr_t)a3;
+                uint64_t t = 0, f = 0;
+                if ((int64_t)a2 < 0) ext2_space(&t, &f);
+                else if (!vol_space((int)a2, &t, &f)) return (uint64_t)-1;
+                o->total = t;
+                o->free = f;
+                return 0;
+            }
+            if (a1 != VOLOP_LIST) return (uint64_t)-1;
+            int max = (int)a3;
+            if (max <= 0 || max > 16 || !vmm_user_range_ok(a2, (uint64_t)max * sizeof(struct uvol)))
+                return (uint64_t)-1;
+            struct uvol *o = (struct uvol *)(uintptr_t)a2;
+            static struct vol_info vi[VOL_MAX];
+            int nv = vol_list(vi, VOL_MAX), k = 0;
+            // The system disk first.
+            {
+                struct uvol *u = &o[k++];
+                for (unsigned i = 0; i < sizeof *u; i++) ((char *)u)[i] = 0;
+                u->mount[0] = '/';
+                const char *fs = "ext2";
+                for (int i = 0; fs[i]; i++) u->fs[i] = fs[i];
+                uint64_t t, f;
+                ext2_space(&t, &f);
+                u->total = t;
+                u->free = f;
+                u->index = -1;
+                u->usable = 1;
+            }
+            for (int i = 0; i < nv && k < max; i++) {
+                struct uvol *u = &o[k++];
+                for (unsigned j = 0; j < sizeof *u; j++) ((char *)u)[j] = 0;
+                u->mount[0] = '/';
+                for (int j = 0; vi[i].mount[j] && j < 14; j++) u->mount[1 + j] = vi[i].mount[j];
+                for (int j = 0; vi[i].label[j] && j < 63; j++) u->label[j] = vi[i].label[j];
+                for (int j = 0; vi[i].drive[j] && j < 47; j++) u->drive[j] = vi[i].drive[j];
+                for (int j = 0; vi[i].fs[j] && j < 7; j++) u->fs[j] = vi[i].fs[j];
+                u->total = vi[i].total;
+                u->free = vi[i].free;
+                u->index = vi[i].index;
+                u->usable = vi[i].type == VOL_FAT || vi[i].type == VOL_EXFAT;
+            }
+            return (uint64_t)k;
+        }
+        case SYS_CLIP: {
+            if (!vmm_user_range_ok(a1, sizeof(struct clip_req))) return (uint64_t)-1;
+            struct clip_req *rq = (struct clip_req *)(uintptr_t)a1;
+            if (rq->op == CLIPOP_SEQ) { rq->result = clip_seq(); rq->type = clip_type(); return 0; }
+            if (rq->len && !vmm_user_range_ok((uint64_t)(uintptr_t)rq->buf, rq->len))
+                return (uint64_t)-1;
+            if (rq->op == CLIPOP_SET) return clip_set(rq->type, rq->buf, rq->len) == 0 ? 0 : (uint64_t)-1;
+            if (rq->op == CLIPOP_GET) {
+                int t;
+                rq->result = clip_get(rq->buf, rq->len, &t);
+                rq->type = t;
+                return 0;
+            }
+            return (uint64_t)-1;
+        }
         case SYS_NOTIFY: {
             // Two strings of unknown length in the caller's memory, taken a
             // byte at a time like the track title.
@@ -387,6 +469,8 @@ static uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 case SET_DBLCLICK:
                     if (set) wm_set_dblclick_ms((int)a3);
                     return (uint64_t)wm_dblclick_ms();
+                case SET_LANG:
+                    return (uint64_t)wm_lang();
                 default:
                     return (uint64_t)-1;
             }
@@ -725,6 +809,7 @@ static uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
             if (a1 == PC_KILL) return (uint64_t)(int64_t)process_kill(pid);
             if (a1 == PC_STOP) return (uint64_t)(int64_t)process_suspend(pid);
             if (a1 == PC_CONT) return (uint64_t)(int64_t)process_resume(pid);
+            if (a1 == PC_ALIVE) return process_by_pid(pid) ? 1 : 0;
             return (uint64_t)-1;
         }
         case SYS_SPAWNWIN: {

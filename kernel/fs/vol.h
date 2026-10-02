@@ -49,6 +49,13 @@ int vol_space(int i, uint64_t *total, uint64_t *free_bytes);
 // including for "/usbfoo" and for a mount point with no volume behind it.
 int vol_of_path(const char *path, const char **rest);
 
+// Let go of volume i (and every other volume on its drive) so the drive can
+// be pulled out: nothing is left half-written, and nothing is read from it
+// again until it is plugged in anew. 1 on success.
+int vol_eject(int i);
+// The USB disk volume i is on, -1 if none.
+int vol_disk(int i);
+
 // The mount point names in use, for listing "/".
 int vol_mounts(char names[][8], int max);
 

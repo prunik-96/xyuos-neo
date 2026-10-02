@@ -250,6 +250,34 @@ int ext2_iterate_dir(const ext2_inode_t *dir_inode, ext2_dirent_cb cb, void *use
     return count;
 }
 
+int ext2_iterate_dir_ino(const ext2_inode_t *dir_inode, ext2_dirent_ino_cb cb, void *userdata) {
+    if ((dir_inode->i_mode & 0xF000) != EXT2_S_IFDIR) return 0;
+    int count = 0;
+    uint32_t num_blocks = (dir_inode->i_size + block_size - 1) / block_size;
+    for (uint32_t bi = 0; bi < num_blocks; bi++) {
+        uint32_t blk = resolve_block(dir_inode, bi);
+        if (blk == 0) continue;
+        read_block(blk, block_buf);
+        uint32_t pos = 0;
+        while (pos < block_size) {
+            ext2_dirent_hdr_t *de = (ext2_dirent_hdr_t *)(block_buf + pos);
+            if (de->rec_len == 0) break;
+            if (de->inode != 0 && de->name_len > 0) {
+                const char *name = (const char *)(block_buf + pos + sizeof(ext2_dirent_hdr_t));
+                cb(name, de->name_len, de->file_type == 2, de->inode, userdata);
+                count++;
+            }
+            pos += de->rec_len;
+        }
+    }
+    return count;
+}
+
+void ext2_space(uint64_t *total, uint64_t *free_bytes) {
+    *total = (uint64_t)sb.s_blocks_count * block_size;
+    *free_bytes = (uint64_t)sb.s_free_blocks_count * block_size;
+}
+
 int ext2_lookup(const char *path, uint32_t *out_inode_num, ext2_inode_t *out_inode) {
     if (!mounted) return 0;
 

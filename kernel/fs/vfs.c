@@ -4,6 +4,7 @@
 #include "fatfs.h"
 #include "../drivers/blkdev.h"
 #include "../mm/heap.h"
+#include "../arch/x86_64/syscall.h"
 #include <stddef.h>
 
 #define MAX_OPEN_FILES 16
@@ -482,4 +483,74 @@ uint32_t vfs_list_dir(const char *path, char *out_buf, uint32_t out_buf_len) {
     }
 
     return ctx.written;
+}
+
+// --- listings with sizes and times ---------------------------------------------
+
+struct rd_ctx { struct xdirent *out; int max, n; };
+
+static void rd_put(struct rd_ctx *c, const char *name, uint32_t nlen, int is_dir,
+                   uint64_t size, int64_t mtime, uint32_t flags) {
+    if (c->n < c->max) {
+        struct xdirent *e = &c->out[c->n];
+        uint32_t k = nlen < 255 ? nlen : 255;
+        for (uint32_t i = 0; i < k; i++) e->name[i] = name[i];
+        e->name[k] = 0;
+        e->size = is_dir ? 0 : size;
+        e->mtime = mtime;
+        e->is_dir = (uint32_t)is_dir;
+        e->flags = flags;
+    }
+    c->n++;
+}
+
+static void rd_vol_cb(const char *name, int is_dir, uint64_t size, int64_t mtime, void *ud) {
+    rd_put((struct rd_ctx *)ud, name, vstrlen(name), is_dir, size, mtime, 0);
+}
+
+// ext2 names and inode numbers are gathered first: reading an inode in the
+// middle of the walk would reuse the block buffer the walk is reading.
+#define RD_MAX 1024
+static struct { char name[256]; uint32_t ino; int is_dir; } rd_tmp[RD_MAX];
+static int rd_ntmp;
+static void rd_ext2_cb(const char *name, uint8_t nlen, int is_dir, uint32_t ino, void *ud) {
+    (void)ud;
+    if (rd_ntmp >= RD_MAX) return;
+    if ((nlen == 1 && name[0] == '.') || (nlen == 2 && name[0] == '.' && name[1] == '.')) return;
+    for (int i = 0; i < nlen; i++) rd_tmp[rd_ntmp].name[i] = name[i];
+    rd_tmp[rd_ntmp].name[nlen] = 0;
+    rd_tmp[rd_ntmp].ino = ino;
+    rd_tmp[rd_ntmp].is_dir = is_dir;
+    rd_ntmp++;
+}
+
+int vfs_readdir(const char *path, struct xdirent *out, int max) {
+    struct rd_ctx c = { out, max, 0 };
+    const char *rest;
+    int vi;
+    struct vol *v;
+    if (vol_of_path(path, &rest) >= 0) {
+        if (!vol_open_path(path, &vi, &v, &rest)) return -1;
+        if (!fatfs_list(v, rest, rd_vol_cb, &c)) return -1;
+        return c.n;
+    }
+    uint32_t ino;
+    ext2_inode_t dir;
+    if (!ext2_lookup(path, &ino, &dir) || (dir.i_mode & 0xF000) != EXT2_S_IFDIR) return -1;
+    rd_ntmp = 0;
+    ext2_iterate_dir_ino(&dir, rd_ext2_cb, 0);
+    for (int i = 0; i < rd_ntmp; i++) {
+        ext2_inode_t in;
+        ext2_get_inode(rd_tmp[i].ino, &in);
+        // The root's own "usb" directory is only a place for the drive to go:
+        // when the drive is there it is listed below, as the drive.
+        rd_put(&c, rd_tmp[i].name, vstrlen(rd_tmp[i].name), rd_tmp[i].is_dir, in.i_size,
+               in.i_mtime, 0);
+    }
+    if (path[0] == '/' && path[1] == '\0') {
+        char names[VOL_MAX][8];
+        int n = vol_mounts(names, VOL_MAX);
+        for (int i = 0; i < n; i++) rd_put(&c, names[i], vstrlen(names[i]), 1, 0, 0, XD_MOUNT);
+    }
+    return c.n;
 }

@@ -139,6 +139,29 @@ int  audio_volume(int pct);          /* pct < 0 just reads it back */
 /* Say what is playing, for the desktop to show (NULL: nothing). */
 void audio_title(const char *title);
 
+struct xdirent;
+struct uvol;
+/* A directory with sizes and times (struct xdirent, xyuos_syscall.h): how
+ * many entries it has (only `max` are written), or -1. */
+int readdir_x(const char *path, struct xdirent *out, int max);
+
+/* The drives: [0] is always the system disk ("/"), then every USB volume. */
+int volumes_list(struct uvol *out, int max);
+int volume_eject(int index);                 /* 0, or -1 */
+int volume_space(int index, struct uvol *u); /* fills total/free; index -1: the system */
+
+/* The clipboard, shared by every program. clip_set: 0 or -1. clip_get: the
+ * whole length (only `room` bytes copied), its CLIP_* kind in *type.
+ * clip_seq: changes whenever anything is copied. */
+int clip_set(int type, const void *data, unsigned len);
+/* 1 while process `pid` is there. */
+int proc_alive(int pid);
+int clip_get(void *buf, unsigned room, int *type);
+unsigned clip_seq(int *type);
+
+/* The desktop's language: 0 Russian, 1 English. */
+int ui_lang(void);
+
 /* A notice in the corner of the desktop for a few seconds. 0 or -1. */
 int notify(const char *title, const char *text);
 

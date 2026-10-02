@@ -37,6 +37,12 @@ uint32_t ext2_read(const ext2_inode_t *inode, uint32_t offset, void *buf, uint32
 // directory inode. Returns the number of entries visited.
 typedef void (*ext2_dirent_cb)(const char *name, uint8_t name_len, int is_dir, void *userdata);
 int ext2_iterate_dir(const ext2_inode_t *dir_inode, ext2_dirent_cb cb, void *userdata);
+// The same, with each entry's inode number.
+typedef void (*ext2_dirent_ino_cb)(const char *name, uint8_t name_len, int is_dir,
+                                   uint32_t ino, void *userdata);
+int ext2_iterate_dir_ino(const ext2_inode_t *dir_inode, ext2_dirent_ino_cb cb, void *userdata);
+// The filesystem's size and its free space, in bytes.
+void ext2_space(uint64_t *total, uint64_t *free_bytes);
 
 // --- write support ---
 

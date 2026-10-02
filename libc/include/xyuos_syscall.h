@@ -87,6 +87,7 @@ struct msgbox_req {
 #define PC_KILL   0
 #define PC_STOP   1
 #define PC_CONT   2
+#define PC_ALIVE  3
 
 #define FONT_INFO  0
 #define FONT_ATLAS 1
@@ -143,6 +144,51 @@ struct msgbox_req {
 
 // A notice on the desktop: a1 = title, a2 = text.
 #define SYS_NOTIFY    50
+
+// A directory listing with what a file manager shows: SYS_READDIR fills an
+// array of these. a1 = path, a2 = struct xdirent *, a3 = how many fit ->
+// how many there are (only that many written), or -1.
+#define SYS_READDIR   51
+struct xdirent {
+    char name[256];              // UTF-8
+    unsigned long long size;     // bytes; 0 for a directory
+    long long mtime;             // seconds since 1970, 0 if not known
+    unsigned int is_dir;
+    unsigned int flags;          // XD_MOUNT: a drive's mount point in "/"
+};
+#define XD_MOUNT 1
+
+// The drives: the system disk and every volume on a USB drive.
+// a1 = VOLOP_*.
+#define SYS_VOLUMES   52
+#define VOLOP_LIST  0            // a2 = struct uvol *, a3 = max -> how many
+#define VOLOP_EJECT 1            // a2 = index -> 0, or -1
+#define VOLOP_SPACE 2            // a2 = index (-1 the system), a3 = struct uvol * -> 0, or -1
+struct uvol {
+    char mount[16];              // "/" for the system, "/usb", "/usb2", ...
+    char label[64];              // the filesystem's own name, may be empty
+    char drive[48];              // what the drive calls itself
+    char fs[8];                  // "ext2", "FAT32", "exFAT", "NTFS", ...
+    unsigned long long total, free;   // bytes; free only after VOLOP_SPACE
+    int index;                   // -1 for the system disk
+    int usable;                  // its files can be opened
+};
+
+// The clipboard, shared by every program. a1 = struct clip_req *.
+#define SYS_CLIP      53
+#define CLIPOP_SET 0             // type, buf, len
+#define CLIPOP_GET 1             // buf, len = room -> result = whole length, type
+#define CLIPOP_SEQ 2             // -> result = a number that changes on every copy
+#define CLIP_NONE  0
+#define CLIP_TEXT  1             // UTF-8
+#define CLIP_FILES 2             // "copy\n" or "cut\n", then one path a line
+struct clip_req {
+    int op;
+    int type;
+    void *buf;
+    unsigned int len;
+    unsigned int result;
+};
 #define SHMOP_GET     0
 #define SHMOP_ATTACH  1
 #define SHMOP_DETACH  2
@@ -175,6 +221,7 @@ struct ui_palette {
 #define SET_KEY_RATE     3   /* auto-repeat interval, ms      */
 #define SET_MOUSE_SPEED  4   /* pointer speed, percent        */
 #define SET_DBLCLICK     5   /* double-click window, ms       */
+#define SET_LANG         6   /* the desktop's language: 0 Russian, 1 English */
 
 #define SI_DEVICES 3
 #define SI_UNAME  2

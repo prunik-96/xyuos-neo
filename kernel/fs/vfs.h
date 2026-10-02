@@ -54,4 +54,10 @@ int vfs_rename(const char *oldpath, const char *newpath);
 // Returns the number of bytes written.
 uint32_t vfs_list_dir(const char *path, char *out_buf, uint32_t out_buf_len);
 
+// A directory with sizes and times, into out[0..max) (which may be a program's
+// memory: it is written, never read). Returns how many entries there are, or
+// -1 if `path` is not a directory.
+struct xdirent;
+int vfs_readdir(const char *path, struct xdirent *out, int max);
+
 #endif

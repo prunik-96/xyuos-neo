@@ -835,12 +835,37 @@ static void draw_prompt(void) {
     line[0] = '\0';
 }
 
+/* The line is UTF-8: a Russian letter is two bytes and one place on the
+ * screen. Positions in `line` are bytes; the cursor on the screen counts
+ * characters -- the bytes that do not continue one. */
+static int is_cont(char c) { return ((unsigned char)c & 0xC0) == 0x80; }
+
+static int chars_before(int bytes) {
+    int n = 0;
+    for (int i = 0; i < bytes; i++) if (!is_cont(line[i])) n++;
+    return n;
+}
+
+static int char_back(int at) {
+    if (at <= 0) return 0;
+    at--;
+    while (at > 0 && is_cont(line[at])) at--;
+    return at;
+}
+
+static int char_fwd(int at) {
+    if (at >= line_len) return line_len;
+    at++;
+    while (at < line_len && is_cont(line[at])) at++;
+    return at;
+}
+
 static void redraw_line(void) {
     tty_move(sh_row, sh_col);
     tty_erase_line();
     tty_move(sh_row, sh_col);
     for (int i = 0; i < line_len; i++) putchar(line[i]);
-    int cc = sh_col + line_cur;
+    int cc = sh_col + chars_before(line_cur);
     int cols, rows;
     tty_size(&cols, &rows);
     if (cc >= cols) cc = cols - 1;
@@ -896,14 +921,15 @@ int main(int argc, char **argv) {
             }
             if (ev.code == KEY_BKSP) {
                 if (line_cur > 0) {
-                    memmove(&line[line_cur - 1], &line[line_cur], line_len - line_cur);
-                    line_cur--; line_len--; line[line_len] = '\0';
+                    int from = char_back(line_cur), n = line_cur - from;
+                    memmove(&line[from], &line[line_cur], line_len - line_cur);
+                    line_cur = from; line_len -= n; line[line_len] = '\0';
                     redraw_line();
                 }
                 continue;
             }
-            if (ev.code == KEY_LEFT)  { if (line_cur > 0)        { line_cur--; redraw_line(); } continue; }
-            if (ev.code == KEY_RIGHT) { if (line_cur < line_len) { line_cur++; redraw_line(); } continue; }
+            if (ev.code == KEY_LEFT)  { if (line_cur > 0)        { line_cur = char_back(line_cur); redraw_line(); } continue; }
+            if (ev.code == KEY_RIGHT) { if (line_cur < line_len) { line_cur = char_fwd(line_cur); redraw_line(); } continue; }
             if (ev.code == KEY_UP) {
                 if (hist_pos > 0) {
                     hist_pos--;
@@ -923,16 +949,20 @@ int main(int argc, char **argv) {
                 }
                 continue;
             }
-            if (ev.code == KEY_CHAR && ev.ascii >= 32 && ev.ascii < 127) {
+            /* Printable ASCII, or a byte of a UTF-8 letter (the Russian
+             * layout sends each of its letters as two of them). */
+            unsigned char ub = (unsigned char)ev.ascii;
+            if (ev.code == KEY_CHAR && ((ub >= 32 && ub < 127) || ub >= 0x80)) {
                 if (ev.mods & (KMOD_SUPER | KMOD_ALT | KMOD_CTRL)) continue;
                 if (line_len < LINE_MAX) {
                     memmove(&line[line_cur + 1], &line[line_cur], line_len - line_cur);
                     line[line_cur] = ev.ascii;
                     line_cur++; line_len++; line[line_len] = '\0';
                     /* Echo directly when appending at the end -- the common
-                     * case, and it avoids a full-line repaint per keystroke. */
+                     * case, and it avoids a full-line repaint per keystroke.
+                     * Mid-line, a letter's first byte waits for the rest. */
                     if (line_cur == line_len) putchar(ev.ascii);
-                    else redraw_line();
+                    else if (line_cur >= line_len || !is_cont(line[line_cur])) redraw_line();
                 }
                 continue;
             }
