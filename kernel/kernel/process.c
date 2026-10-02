@@ -7,6 +7,8 @@
 // kinds of switch, and `resume_kernel` records which one a process is
 // suspended by.
 
+#include "../net/net.h"
+#include "../net/sock.h"
 #include "process.h"
 #include "signal.h"
 #include "bkl.h"
@@ -795,6 +797,23 @@ static int block_current(void) {
     return 0;
 }
 
+// Let whatever else is runnable have the processor for a turn, from inside a
+// syscall that is waiting on something it has to poll for (the network): on
+// one core, a server in another program can answer this one only if this one
+// gives way. Returns at once when nothing else is runnable. Unlike a block, a
+// signal is NOT acted on here -- the caller is in the middle of something
+// that has to be finished or undone first; it is dealt with on the way out.
+int process_yield(void) {
+    process_t *me = current;
+    if (!me || !pick_next(me)) return 0;
+    me->state = PROC_READY;
+    me->resume_kernel = 1;
+    __asm__ volatile ("fxsave (%0)" : : "r"(me->fxstate) : "memory");
+    if (kctx_save(me->kctx) == 0)
+        kctx_restore(this_cpu()->idle_ctx, 1);     // never returns
+    return 1;
+}
+
 int process_block_on_key(void) {
     if (!current) return 0;
     current->state = PROC_BLOCKED;
@@ -1036,6 +1055,8 @@ void process_notify_exit(int code) {
     } else {
         stream_release(&dead->in);
         stream_release(&dead->out);
+        // Its sockets: a connection's last bytes and FIN still go out.
+        sock_release_owner(dead->pid);
 
         wake_parent_of(dead);
         // And tell it, in the way a parent can be told. Ignored by default,
@@ -1113,6 +1134,10 @@ static void cpu_loop(void) {
         // A USB device plugged in or pulled out: set up, or let go of. Here,
         // because that waits on the device, which the timer must not.
         if (bsp) usb_service();
+
+        // The connections programs hold: answered and kept moving while
+        // those programs are busy elsewhere or asleep.
+        if (bsp) net_service();
 
         // Something on the desktop is moving: its frame first, then whatever
         // is runnable (wm_wants_frame lets this happen once per frame, not on

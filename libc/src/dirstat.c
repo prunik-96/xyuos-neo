@@ -150,18 +150,7 @@ int closedir(DIR *d) {
 #include <poll.h>
 #include <sys/statvfs.h>
 
-/* Every descriptor here refers to a file on a local disk or to the terminal,
- * and a read from either returns without waiting. So everything asked about is
- * ready, which is the same answer a real poll() gives for ordinary files. */
-int poll(struct pollfd *fds, nfds_t nfds, int timeout) {
-    (void)timeout;
-    int n = 0;
-    for (nfds_t i = 0; i < nfds; i++) {
-        fds[i].revents = fds[i].events & (POLLIN | POLLOUT);
-        if (fds[i].revents) n++;
-    }
-    return n;
-}
+/* poll() is in socket.c, beside the sockets it waits on. */
 
 /* The kernel knows the block counts and has no call that reports them, so the
  * honest answer is the block size and zeros -- not an invented total that

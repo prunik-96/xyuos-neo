@@ -241,6 +241,7 @@ void process_notify_exit(int code);
 // woken so it can reach one.
 // Returns 0, or -1 if there is no such live process.
 int process_kill(int pid);
+int process_yield(void);       // from a polling wait in a syscall: others run a turn
 
 // The deepest live descendant of `pid` -- the process actually in the
 // foreground of a pane whose owner is `pid`. Returns `pid` itself when it has

@@ -135,6 +135,40 @@ struct uvol {
 #define ENVOP_GET 0
 #define ENVOP_SET 1
 
+// Sockets (kernel/net/sock.h). a1 = struct sock_req *; the answer is in
+// result: a count, a socket, or 0 -- or a negated errno.
+#define SYS_SOCKET    56
+#define SOCKOP_OPEN     0        // arg = 1 stream, 2 datagram       -> socket
+#define SOCKOP_BIND     1        // sid, ip, port
+#define SOCKOP_LISTEN   2        // sid, arg = backlog
+#define SOCKOP_ACCEPT   3        // sid                              -> socket; ip, port = the peer
+#define SOCKOP_CONNECT  4        // sid, ip, port
+#define SOCKOP_SEND     5        // sid, buf, len, arg = flags       -> bytes
+#define SOCKOP_SENDTO   6        // sid, buf, len, arg = flags, ip, port
+#define SOCKOP_RECV     7        // sid, buf, len, arg = flags       -> bytes; ip, port = from
+#define SOCKOP_SHUTDOWN 8        // sid, arg = how
+#define SOCKOP_CLOSE    9        // sid
+#define SOCKOP_NAME     10       // sid, arg = 1 peer / 0 own        -> ip, port
+#define SOCKOP_SETOPT   11       // sid, arg = option, val
+#define SOCKOP_GETOPT   12       // sid, arg = option                -> value
+#define SOCKOP_POLL     13       // buf = struct sock_pollent[len], arg = timeout ms (-1 forever)
+struct sock_req {
+    int op;
+    int sid;
+    int arg;
+    int val;
+    unsigned int ip;             // host order
+    unsigned short port;
+    unsigned short pad;
+    void *buf;
+    unsigned int len;
+    int result;
+};
+#ifndef SOCK_POLLENT_DEFINED
+#define SOCK_POLLENT_DEFINED
+struct sock_pollent { int sid; short events, revents; };
+#endif
+
 // The wall clock and the time zone. a1 = CLOCKOP_*.
 #define SYS_CLOCK     55
 #define CLOCKOP_NOW_MS  0        // -> UTC, milliseconds since 1970

@@ -16,6 +16,7 @@
 #include "../../fs/ext2.h"
 #include "../../kernel/clip.h"
 #include "../../kernel/clock.h"
+#include "../../net/sock.h"
 #include "../../drivers/sensors.h"
 #include "../../fs/fatfs.h"
 #include "../../wm/wm.h"
@@ -120,6 +121,11 @@ void syscall_init(void) {
 // name somebody else's pane; there is no handle to forge.
 static struct pane *my_pane(void) {
     process_t *me = process_current();
+    // A thread is nobody's child; its window is its program's.
+    if (me && me->is_thread) {
+        process_t *prog = process_by_pid(me->tgid);
+        if (prog) me = prog;
+    }
     for (int hops = 0; me && hops < 8; hops++) {
         struct pane *p = wm_pane_for_pid(me->pid);
         if (p) return p;
@@ -594,6 +600,52 @@ static uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 wm_set_asleep(0);
                 wm_refresh();
             }
+            return 0;
+        }
+        case SYS_SOCKET: {
+            if (!vmm_user_range_ok(a1, sizeof(struct sock_req))) return (uint64_t)-1;
+            struct sock_req *rq = (struct sock_req *)(uintptr_t)a1;
+            int op = rq->op, sid = rq->sid;
+            uint32_t ip = rq->ip;
+            uint16_t port = rq->port;
+            int r;
+            switch (op) {
+            case SOCKOP_OPEN:     r = sock_open(rq->arg); break;
+            case SOCKOP_BIND:     r = sock_bind(sid, ip, port); break;
+            case SOCKOP_LISTEN:   r = sock_listen(sid, rq->arg); break;
+            case SOCKOP_ACCEPT:   ip = 0; port = 0; r = sock_accept(sid, &ip, &port); break;
+            case SOCKOP_CONNECT:  r = sock_connect(sid, ip, port); break;
+            case SOCKOP_SEND:
+            case SOCKOP_SENDTO:
+            case SOCKOP_RECV: {
+                void *buf = rq->buf;
+                int len = (int)rq->len;
+                if (len < 0) { r = -22; break; }
+                if (len && !vmm_user_range_ok((uint64_t)(uintptr_t)buf, (uint64_t)len)) return (uint64_t)-1;
+                if (op == SOCKOP_RECV) { ip = 0; port = 0; r = sock_recv(sid, buf, len, rq->arg, &ip, &port); }
+                else r = sock_send(sid, buf, len, rq->arg, ip, port, op == SOCKOP_SENDTO);
+                break;
+            }
+            case SOCKOP_SHUTDOWN: r = sock_shutdown(sid, rq->arg); break;
+            case SOCKOP_CLOSE:    r = sock_close(sid); break;
+            case SOCKOP_NAME:     ip = 0; port = 0; r = sock_name(sid, rq->arg, &ip, &port); break;
+            case SOCKOP_SETOPT:   r = sock_setopt(sid, rq->arg, rq->val); break;
+            case SOCKOP_GETOPT:   r = sock_getopt(sid, rq->arg); break;
+            case SOCKOP_POLL: {
+                int n = (int)rq->len;
+                if (n < 0 || n > 64) { r = -22; break; }
+                if (n && !vmm_user_range_ok((uint64_t)(uintptr_t)rq->buf, (uint64_t)n * sizeof(struct sock_pollent)))
+                    return (uint64_t)-1;
+                r = sock_poll((struct sock_pollent *)rq->buf, n, rq->arg);
+                break;
+            }
+            default: r = -22; break;
+            }
+            // The request is written back after the wait: it is the
+            // program's memory, and the program is the one running again.
+            rq->ip = ip;
+            rq->port = port;
+            rq->result = r;
             return 0;
         }
         case SYS_CLOCK: {

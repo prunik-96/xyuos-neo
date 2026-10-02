@@ -112,6 +112,28 @@ char *strerror(int e) {
         case ENOSPC:  return "no space left on device";
         case ESPIPE:  return "illegal seek";
         case ERANGE:  return "result out of range";
+        case EINTR:   return "interrupted";
+        case EAGAIN:  return "resource temporarily unavailable";
+        case EPIPE:   return "broken pipe";
+        case EMFILE:  return "too many open files";
+        case ENOTSOCK: return "not a socket";
+        case EDESTADDRREQ: return "destination address required";
+        case EMSGSIZE: return "message too long";
+        case EPROTONOSUPPORT: return "protocol not supported";
+        case EOPNOTSUPP: return "operation not supported";
+        case EAFNOSUPPORT: return "address family not supported";
+        case EADDRINUSE: return "address already in use";
+        case ENETDOWN: return "network is down";
+        case ENETUNREACH: return "network is unreachable";
+        case ECONNRESET: return "connection reset by peer";
+        case ENOBUFS: return "no buffer space available";
+        case EISCONN: return "already connected";
+        case ENOTCONN: return "not connected";
+        case ETIMEDOUT: return "connection timed out";
+        case ECONNREFUSED: return "connection refused";
+        case EHOSTUNREACH: return "no route to host";
+        case EALREADY: return "operation already in progress";
+        case EINPROGRESS: return "operation now in progress";
         default:      return "unknown error";
     }
 }

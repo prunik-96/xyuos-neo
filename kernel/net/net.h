@@ -79,6 +79,52 @@ void net_tcp_release(int h);
 // How many of the eight are currently held. For the status line and tests.
 int  net_tcp_open_count(void);
 
+// --- for programs' sockets ---------------------------------------------------
+//
+// Error numbers are the usual ones (the same as libc's errno), returned
+// negated where a call returns a count.
+#define NET_EINVAL        22
+#define NET_EMSGSIZE      90
+#define NET_EADDRINUSE    98
+#define NET_ENETDOWN     100
+#define NET_ECONNRESET   104
+#define NET_ENOBUFS      105
+#define NET_ETIMEDOUT    110
+#define NET_ECONNREFUSED 111
+#define NET_EHOSTUNREACH 113
+
+#define NET_TCP_DEAD    0        // reset, timed out, or never was
+#define NET_TCP_OPENING 1        // handshake under way
+#define NET_TCP_OPEN    2        // data can flow (the peer may have closed its side)
+
+int  net_tcp_start(uint32_t ip, uint16_t port, int rx_cap);   // no waiting: SYN sent
+int  net_tcp_state(int h);
+int  net_tcp_error(int h);                 // why it is dead: NET_E*, or 0
+int  net_tcp_send_some(int h, const void *data, int len);     // queued now, or -1
+int  net_tcp_send_room(int h);
+int  net_tcp_unacked(int h);
+void net_tcp_abort(int h);                 // a reset, and the handle back at once
+void net_tcp_names(int h, uint32_t *lip, uint16_t *lport, uint32_t *rip, uint16_t *rport);
+
+// A port to accept connections on (ip 0: any address of ours). Returns a
+// listener, or -NET_E*. accept gives the next finished handshake's handle,
+// or -1 when none is waiting.
+int  net_tcp_listen(uint32_t ip, uint16_t port, int backlog, int rx_cap);
+int  net_tcp_pending(int listener);
+int  net_tcp_accept(int listener);
+void net_tcp_unlisten(int listener);
+
+// UDP: a port with a queue of datagrams. open returns the socket or -NET_E*.
+int      net_udp_open(uint32_t ip, uint16_t port);       // port 0: any free one
+uint16_t net_udp_port(int u);
+int      net_udp_send(int u, uint32_t ip, uint16_t port, const void *data, int len);
+int      net_udp_recv(int u, void *buf, int len, uint32_t *ip, uint16_t *port, int peek);
+int      net_udp_pending(int u);
+void     net_udp_close(int u);
+
+int  net_active(void);       // anything open that needs looking after
+void net_service(void);      // look after it (the scheduler calls this)
+
 // One NTP exchange with `ip` (the simple client of RFC 4330), up to `tries`
 // requests a second apart. On an answer: *utc_ms is UTC at the moment it
 // arrived, *at_us that moment by pit_now_us(), *rtt_ms the round trip less the

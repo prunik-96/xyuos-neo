@@ -5,6 +5,7 @@
 #include "tls.h"
 #include "../kernel/kio.h"
 #include "../kernel/task.h"
+#include "../kernel/process.h"
 #include "../mm/heap.h"
 #include "../arch/x86_64/pit.h"
 #include <stddef.h>
@@ -231,8 +232,16 @@ static void arp_send(uint16_t oper, uint32_t tpa, const uint8_t *tha) {
     eth_send(oper == 2 ? tha : BCAST_MAC, ETH_ARP, &a, sizeof(a));
 }
 
+// Set while a received packet is being handled. An answer sent from in
+// there must not wait for anything: waiting means polling the card, and the
+// card is in the middle of handing us this very packet. So an address not yet
+// known is asked for and the answer is not waited for -- the packet is lost,
+// and TCP sends it again once the address is in the cache.
+static int rx_depth;
+
 static int arp_resolve(uint32_t ip, uint8_t *mac) {
     if (arp_lookup(ip, mac)) return 1;
+    if (rx_depth) { arp_send(1, ip, BCAST_MAC); return 0; }
     for (int tries = 0; tries < 4; tries++) {
         arp_send(1, ip, BCAST_MAC);
         uint64_t deadline = now_ms() + 300;
@@ -250,7 +259,48 @@ static int route_mac(uint32_t dstip, uint8_t *mac) {
     return arp_resolve(nexthop, mac);
 }
 
+static int is_loop(uint32_t ip) { return (ip >> 24) == 127; }
+
+// --- loopback -----------------------------------------------------------------
+//
+// A packet to 127.x.x.x, or to our own address, never reaches the card: it
+// waits here as a whole IP packet and net_poll() hands it to the input side,
+// exactly as if it had come off the wire. That is what lets a program talk to
+// a server on the same machine -- and test one without a second computer.
+
+#define LOOP_Q 64
+typedef struct { uint16_t len; uint8_t pkt[1500]; } loop_pkt_t;
+static loop_pkt_t *loopq;
+static int loop_head, loop_n;
+
+static int loop_send(uint32_t dstip, uint8_t proto, const void *payload, int len) {
+    if (len > 1480) return -1;
+    if (!loopq) {
+        loopq = kmalloc(sizeof(loop_pkt_t) * LOOP_Q);
+        if (!loopq) return -1;
+    }
+    if (loop_n == LOOP_Q) return -1;               // full: lost, as on a wire
+    loop_pkt_t *q = &loopq[(loop_head + loop_n) % LOOP_Q];
+    ip_hdr_t *ih = (ip_hdr_t *)q->pkt;
+    ih->ver_ihl = 0x45;
+    ih->tos = 0;
+    ih->total_len = htons((uint16_t)(sizeof(ip_hdr_t) + len));
+    ih->id = htons(ip_id++);
+    ih->flags_frag = 0;
+    ih->ttl = 64;
+    ih->proto = proto;
+    ih->checksum = 0;
+    ih->src = htonl(is_loop(dstip) ? dstip : our_ip);
+    ih->dst = htonl(dstip);
+    ih->checksum = htons(ip_checksum(ih, sizeof(ip_hdr_t)));
+    nmemcpy(q->pkt + sizeof(ip_hdr_t), payload, len);
+    q->len = (uint16_t)(sizeof(ip_hdr_t) + len);
+    loop_n++;
+    return 0;
+}
+
 static int ip_send(uint32_t dstip, uint8_t proto, const void *payload, int len) {
+    if (is_loop(dstip) || (our_ip && dstip == our_ip)) return loop_send(dstip, proto, payload, len);
     uint8_t mac[6];
     if (!route_mac(dstip, mac)) return -1;
     return ip_emit(mac, our_ip, dstip, proto, payload, len);
@@ -375,8 +425,8 @@ int net_ping(uint32_t ip, uint32_t *rtt_us) {
 // struct -- which was enough to fetch a page and hopeless for the twenty
 // files that follow it: they went one at a time, each waiting for the last.
 //
-// Still a client: we never listen, so a connection is always something we
-// opened and can always be named by the local port we chose for it.
+// Both ends now: connections we open, and ones that come in to a port a
+// program listens on (see "listening" below).
 //
 // A segment lost on the way used to be expensive out of all proportion. The
 // ones behind it were thrown away without a word, so the sender learned of
@@ -392,16 +442,27 @@ int net_ping(uint32_t ip, uint32_t *rtt_us) {
 // range noted, so that when the hole is filled the acknowledgement jumps over
 // all of it and nothing is sent twice.
 
-#define TCP_CONNS   16        // every slot's kept connection, and room to spare
-#define TCP_HELD    8         // ranges kept past a gap, per connection
+#define TCP_CONNS     32        // the browser's, and room for programs' sockets
+#define TCP_HELD      8         // ranges kept past a gap, per connection
+#define TCP_TX_CAP    (64 * 1024)
+#define TCP_MSS       1460
+#define TCP_RTO_SYN   600       // ms; a SYN is resent sooner than data
+#define TCP_RTO_INIT  1000
+#define TCP_RTO_MAX   8000
+#define TCP_RETRIES   8
+#define TCP_LINGER_MS 5000      // how long a closed handle's FIN may take to land
+#define TCP_LISTENERS 8
+#define TCP_BACKLOG   16
 
-enum { TCP_CLOSED, TCP_SYN_SENT, TCP_ESTABLISHED, TCP_CLOSING };
+// TCP_CLOSING: our FIN is out (or about to be); the peer may still send.
+enum { TCP_CLOSED, TCP_SYN_SENT, TCP_ESTABLISHED, TCP_CLOSING, TCP_SYN_RCVD };
 
 typedef struct {
     int      state;
-    uint32_t remote_ip;
+    uint32_t remote_ip, local_ip;
     uint16_t remote_port, local_port;
-    uint32_t snd_nxt;         // next sequence we will send
+
+    // --- receiving
     uint32_t rcv_nxt;         // next sequence we expect
     uint8_t *rx;              // from the kernel heap, sized by the opener
     int      rx_cap;
@@ -413,9 +474,43 @@ typedef struct {
     int      nheld;
     uint32_t held_lo[TCP_HELD], held_hi[TCP_HELD];
     int      adv_win;         // the window the peer was last told about
+
+    // --- sending
+    // Everything from snd_una on is kept in tx until it is acknowledged:
+    // tx_len bytes from tx_head, a ring. snd_nxt is how far it has been sent
+    // (it goes back to snd_una when a timer runs out), snd_max how far it
+    // ever went.
+    uint32_t iss, snd_una, snd_nxt, snd_max;
+    uint8_t *tx;
+    int      tx_head, tx_len;
+    int      snd_wnd;         // what the peer last said it would take
+    int      cwnd;            // what we dare have in flight
+    int      mss;             // the peer's largest segment
+    int      dupacks;
+    int      fin_want;        // FIN goes after the last queued byte
+    int      fin_sent;
+    uint32_t fin_seq;
+    uint64_t rtx_at;          // when to resend; 0 when nothing is out
+    int      rto, retries;
+
+    int      err;             // why it ended: 0, or NET_E*
+    int      listener;        // the listener it came in on, or -1
+    int      orphan;          // nobody holds it: freed once its FIN has gone
+    uint64_t orphan_until;
 } tcp_conn_t;
 
 static tcp_conn_t conns[TCP_CONNS];
+
+// The ports somebody is listening on, and the connections that came in on
+// each and are waiting to be accepted.
+static struct {
+    int      used;
+    uint16_t port;
+    uint32_t ip;              // 0 = any address of ours
+    int      backlog;
+    int      rx_cap;
+    int      q[TCP_BACKLOG], qn;
+} lsn[TCP_LISTENERS];
 
 // Remember which fetch opened a connection, so an abandoned one can be
 // shut without guessing. Defined with the fetch slots.
@@ -429,6 +524,7 @@ static uint32_t tcp_bytes_in;
 static tcp_conn_t *conn_of(int h) {
     if (h < 0 || h >= TCP_CONNS) return NULL;
     if (conns[h].state == TCP_CLOSED && conns[h].rx == NULL) return NULL;
+    if (conns[h].orphan) return NULL;
     return &conns[h];
 }
 
@@ -438,22 +534,32 @@ static int tcp_rx_space(const tcp_conn_t *c) {
     return c->rx_cap - c->rx_head - c->rx_len;
 }
 
-static void tcp_out(tcp_conn_t *c, uint8_t flags, const void *data, int len) {
-    uint8_t seg[sizeof(tcp_hdr_t) + 1460];
-    if (len > 1460) len = 1460;
+// a - b, for sequence numbers that wrap.
+static int32_t seqdiff(uint32_t a, uint32_t b) { return (int32_t)(a - b); }
+
+static void tx_copy(const tcp_conn_t *c, int off, uint8_t *dst, int n);
+
+// One segment. `seq` is where its first byte (or its SYN/FIN) sits; a SYN
+// carries our largest segment size, so the peer sends full ones. The bytes
+// come from `data`, or -- `data` NULL -- from the send ring at `off`, copied
+// straight into the segment (a kernel stack is 16 KB, and this can be deep).
+static void tcp_seg_from(tcp_conn_t *c, uint8_t flags, uint32_t seq, const void *data, int off, int len) {
+    uint8_t seg[sizeof(tcp_hdr_t) + 4 + TCP_MSS];
+    if (len > TCP_MSS) len = TCP_MSS;
+    int opt = (flags & TCP_SYN) ? 4 : 0;
     tcp_hdr_t *t = (tcp_hdr_t *)seg;
     t->src_port = htons(c->local_port);
     t->dst_port = htons(c->remote_port);
-    t->seq = htonl(c->snd_nxt);
+    t->seq = htonl(seq);
     t->ack = htonl(c->rcv_nxt);
-    t->data_off = (sizeof(tcp_hdr_t) / 4) << 4;
+    t->data_off = (uint8_t)(((sizeof(tcp_hdr_t) + opt) / 4) << 4);
     t->flags = flags;
     // Advertise what we can actually take. A fixed 8KB window made the peer
     // stop and wait for an acknowledgement every 8KB -- on a 100KB image that
     // is a dozen wasted round trips. 64KB is the most that fits in the field
     // without window scaling.
     {
-        int space = tcp_rx_space(c) + c->rx_head;   // after a compaction
+        int space = c->rx ? tcp_rx_space(c) + c->rx_head : 0;   // after a compaction
         if (space > 65535) space = 65535;
         if (space < 0) space = 0;
         t->window = htons((uint16_t)space);
@@ -461,25 +567,52 @@ static void tcp_out(tcp_conn_t *c, uint8_t flags, const void *data, int len) {
     }
     t->checksum = 0;
     t->urgent = 0;
-    if (len) nmemcpy(seg + sizeof(tcp_hdr_t), data, len);
+    if (opt) {
+        uint8_t *o = seg + sizeof(tcp_hdr_t);
+        o[0] = 2; o[1] = 4; o[2] = (uint8_t)(TCP_MSS >> 8); o[3] = (uint8_t)(TCP_MSS & 0xFF);
+    }
+    int hl = (int)sizeof(tcp_hdr_t) + opt;
+    if (len && data) nmemcpy(seg + hl, data, len);
+    else if (len) tx_copy(c, off, seg + hl, len);
 
     uint8_t pseudo[12];
-    uint32_t s = htonl(our_ip), d = htonl(c->remote_ip);
+    uint32_t s = htonl(c->local_ip), d = htonl(c->remote_ip);
     nmemcpy(pseudo, &s, 4); nmemcpy(pseudo + 4, &d, 4);
     pseudo[8] = 0; pseudo[9] = IPPROTO_TCP;
-    uint16_t l = htons((uint16_t)(sizeof(tcp_hdr_t) + len));
+    uint16_t l = htons((uint16_t)(hl + len));
     nmemcpy(pseudo + 10, &l, 2);
     uint32_t sum = csum_partial(pseudo, 12, 0);
-    sum = csum_partial(seg, sizeof(tcp_hdr_t) + len, sum);
+    sum = csum_partial(seg, hl + len, sum);
     t->checksum = htons(csum_fold(sum));
 
-    ip_send(c->remote_ip, IPPROTO_TCP, seg, sizeof(tcp_hdr_t) + len);
+    ip_send(c->remote_ip, IPPROTO_TCP, seg, hl + len);
+}
+
+static void tcp_seg(tcp_conn_t *c, uint8_t flags, uint32_t seq, const void *data, int len) {
+    tcp_seg_from(c, flags, seq, data, 0, len);
+}
+
+// An acknowledgement (or a bare flag) at the current position.
+static void tcp_out(tcp_conn_t *c, uint8_t flags, const void *data, int len) {
+    tcp_seg(c, flags, c->snd_nxt, data, len);
+}
+
+// A reset for a segment that belongs to nothing here.
+static void tcp_reset_reply(uint32_t to_ip, uint32_t from_ip, uint16_t to_port, uint16_t from_port,
+                            uint32_t seq, uint32_t ack, int use_ack) {
+    tcp_conn_t tmp;
+    nmemset(&tmp, 0, sizeof tmp);
+    tmp.remote_ip = to_ip;
+    tmp.local_ip = from_ip;
+    tmp.remote_port = to_port;
+    tmp.local_port = from_port;
+    tmp.rcv_nxt = ack;
+    tcp_seg(&tmp, (uint8_t)(TCP_RST | (use_ack ? TCP_ACK : 0)), seq, NULL, 0);
 }
 
 // Which connection does this segment belong to? The local port alone would
-// do, since we chose them and keep them distinct, but all four are checked:
-// a stray segment from an old connection whose port has been reused is
-// exactly the kind of thing that corrupts a stream days later.
+// do for the ones we opened, but a listener's connections all share its
+// port, so all four are checked.
 static tcp_conn_t *tcp_lookup(uint32_t srcip, uint16_t sport, uint16_t dport) {
     for (int i = 0; i < TCP_CONNS; i++) {
         tcp_conn_t *c = &conns[i];
@@ -490,9 +623,6 @@ static tcp_conn_t *tcp_lookup(uint32_t srcip, uint16_t sport, uint16_t dport) {
     }
     return NULL;
 }
-
-// a - b, for sequence numbers that wrap.
-static int32_t seqdiff(uint32_t a, uint32_t b) { return (int32_t)(a - b); }
 
 // How far past rcv_nxt the held data reaches.
 static int tcp_held_reach(const tcp_conn_t *c) {
@@ -555,78 +685,331 @@ static void tcp_held_join(tcp_conn_t *c) {
     }
 }
 
-static void tcp_input(uint32_t srcip, const uint8_t *seg, int len) {
+// --- sending ----------------------------------------------------------------------
+
+// Bytes [off, off+n) of what is queued, out of the ring into `dst`.
+static void tx_copy(const tcp_conn_t *c, int off, uint8_t *dst, int n) {
+    int at = (c->tx_head + off) % TCP_TX_CAP;
+    int first = TCP_TX_CAP - at < n ? TCP_TX_CAP - at : n;
+    nmemcpy(dst, c->tx + at, first);
+    if (n > first) nmemcpy(dst + first, c->tx, n - first);
+}
+
+static void tcp_arm(tcp_conn_t *c) {
+    if (!c->rtx_at) c->rtx_at = now_ms() + (uint64_t)c->rto;
+}
+
+// Send what the windows allow: the peer's, and our own estimate of the path.
+// Then the FIN, once everything before it has gone.
+static void tcp_push(tcp_conn_t *c) {
+    if (c->state != TCP_ESTABLISHED && c->state != TCP_CLOSING) return;
+    if (!c->tx) return;
+    int sent = seqdiff(c->snd_nxt, c->snd_una);
+    if (c->fin_sent) return;                      // all of it is out already
+    int wnd = c->snd_wnd < c->cwnd ? c->snd_wnd : c->cwnd;
+    while (sent < c->tx_len) {
+        int room = wnd - sent;
+        if (room <= 0) break;
+        int n = c->tx_len - sent;
+        if (n > c->mss) n = c->mss;
+        if (n > room) n = room;
+        tcp_seg_from(c, TCP_ACK | TCP_PSH, c->snd_nxt, NULL, sent, n);
+        c->snd_nxt += (uint32_t)n;
+        sent += n;
+        if (seqdiff(c->snd_nxt, c->snd_max) > 0) c->snd_max = c->snd_nxt;
+        tcp_arm(c);
+    }
+    if (c->fin_want && sent == c->tx_len) {
+        c->fin_seq = c->snd_nxt;
+        tcp_seg(c, TCP_FIN | TCP_ACK, c->snd_nxt, NULL, 0);
+        c->snd_nxt += 1;
+        c->fin_sent = 1;
+        c->state = TCP_CLOSING;
+        if (seqdiff(c->snd_nxt, c->snd_max) > 0) c->snd_max = c->snd_nxt;
+        tcp_arm(c);
+    }
+}
+
+// The oldest unacknowledged segment again, now (three duplicate
+// acknowledgements say it was lost).
+static void tcp_resend_first(tcp_conn_t *c) {
+    if (!c->tx_len) return;
+    int n = c->tx_len < c->mss ? c->tx_len : c->mss;
+    tcp_seg_from(c, TCP_ACK | TCP_PSH, c->snd_una, NULL, 0, n);
+}
+
+// Queue what fits; returns how much did. The caller pumps and comes back
+// for the rest.
+static int tcp_queue(tcp_conn_t *c, const uint8_t *p, int len) {
+    if (!c->tx || c->fin_want) return 0;
+    int room = TCP_TX_CAP - c->tx_len;
+    if (len > room) len = room;
+    for (int i = 0; i < len; ) {
+        int at = (c->tx_head + c->tx_len) % TCP_TX_CAP;
+        int n = TCP_TX_CAP - at < len - i ? TCP_TX_CAP - at : len - i;
+        nmemcpy(c->tx + at, p + i, n);
+        c->tx_len += n;
+        i += n;
+    }
+    tcp_push(c);
+    return len;
+}
+
+static void tcp_dead(tcp_conn_t *c, int err) {
+    c->state = TCP_CLOSED;
+    c->remote_closed = 1;
+    if (!c->err) c->err = err;
+    c->rtx_at = 0;
+}
+
+// The retransmission timer ran out.
+static void tcp_timeout(tcp_conn_t *c) {
+    c->rtx_at = 0;
+    int opening = c->state == TCP_SYN_SENT || c->state == TCP_SYN_RCVD;
+    // A SYN is asked again every 600 ms, five times, and then given up on --
+    // a host that is not there must not hold a page for long.
+    if (++c->retries > (opening ? 5 : TCP_RETRIES)) {
+        tcp_dead(c, NET_ETIMEDOUT);
+        return;
+    }
+    if (!opening) c->rto = c->rto * 2 > TCP_RTO_MAX ? TCP_RTO_MAX : c->rto * 2;
+    if (c->state == TCP_SYN_SENT) {
+        tcp_seg(c, TCP_SYN, c->iss, NULL, 0);
+        tcp_arm(c);
+        return;
+    }
+    if (c->state == TCP_SYN_RCVD) {
+        tcp_seg(c, TCP_SYN | TCP_ACK, c->iss, NULL, 0);
+        tcp_arm(c);
+        return;
+    }
+    int out = seqdiff(c->snd_nxt, c->snd_una);
+    if (out <= 0 && !(c->snd_wnd == 0 && c->tx_len > 0)) return;
+    // Back to the first unacknowledged byte, one segment at a time again.
+    c->snd_nxt = c->snd_una;
+    c->fin_sent = 0;
+    if (c->state == TCP_CLOSING && !c->fin_want) c->state = TCP_ESTABLISHED;
+    c->cwnd = c->mss;
+    int saved = c->snd_wnd;
+    if (c->snd_wnd == 0) c->snd_wnd = 1;          // a probe: is the window still shut?
+    tcp_push(c);
+    c->snd_wnd = saved;
+    tcp_arm(c);
+}
+
+// --- receiving --------------------------------------------------------------------
+
+static int tcp_mss_opt(const uint8_t *seg, int hlen) {
+    for (int i = (int)sizeof(tcp_hdr_t); i + 1 < hlen; ) {
+        uint8_t k = seg[i];
+        if (k == 0) break;
+        if (k == 1) { i++; continue; }
+        uint8_t l = seg[i + 1];
+        if (l < 2 || i + l > hlen) break;
+        if (k == 2 && l == 4) return seg[i + 2] << 8 | seg[i + 3];
+        i += l;
+    }
+    return 536;                                   // what is assumed without one
+}
+
+static int tcp_alloc(void);
+static void tcp_release(tcp_conn_t *c);
+
+// A handle given back whose connection has ended both ways: our FIN
+// acknowledged and theirs arrived (or it is dead).
+static int orphan_done(const tcp_conn_t *c) {
+    if (!c->orphan) return 0;
+    if (c->state == TCP_CLOSED) return 1;
+    return c->fin_sent && seqdiff(c->snd_una, c->fin_seq) > 0 && c->remote_closed;
+}
+
+// A SYN for a port somebody listens on: a new connection, half open.
+static void tcp_passive(int L, uint32_t srcip, uint32_t dstip, const tcp_hdr_t *t,
+                        const uint8_t *seg, int hlen) {
+    int pending = lsn[L].qn;
+    for (int i = 0; i < TCP_CONNS; i++)
+        if (conns[i].state == TCP_SYN_RCVD && conns[i].listener == L) pending++;
+    int h = pending < lsn[L].backlog ? tcp_alloc() : -1;
+    if (h < 0) {
+        tcp_reset_reply(srcip, dstip, ntohs(t->src_port), ntohs(t->dst_port), 0, ntohl(t->seq) + 1, 1);
+        return;
+    }
+    tcp_conn_t *c = &conns[h];
+    c->rx = kmalloc((size_t)lsn[L].rx_cap);
+    c->tx = kmalloc(TCP_TX_CAP);
+    if (!c->rx || !c->tx) { tcp_release(c); return; }
+    c->rx_cap = lsn[L].rx_cap;
+    c->remote_ip = srcip;
+    c->local_ip = dstip;
+    c->remote_port = ntohs(t->src_port);
+    c->local_port = ntohs(t->dst_port);
+    c->rcv_nxt = ntohl(t->seq) + 1;
+    c->iss = (uint32_t)(now_us() * 2654435761u);
+    c->snd_una = c->iss;
+    c->snd_nxt = c->snd_max = c->iss + 1;
+    c->mss = tcp_mss_opt(seg, hlen);
+    if (c->mss > TCP_MSS) c->mss = TCP_MSS;
+    c->snd_wnd = ntohs(t->window);
+    c->cwnd = 10 * c->mss;
+    c->rto = TCP_RTO_SYN;
+    c->listener = L;
+    c->state = TCP_SYN_RCVD;
+    tcp_seg(c, TCP_SYN | TCP_ACK, c->iss, NULL, 0);
+    tcp_arm(c);
+}
+
+static void tcp_input(uint32_t srcip, uint32_t dstip, const uint8_t *seg, int len) {
     if (len < (int)sizeof(tcp_hdr_t)) return;
     const tcp_hdr_t *t = (const tcp_hdr_t *)seg;
-
-    tcp_conn_t *c = tcp_lookup(srcip, ntohs(t->src_port), ntohs(t->dst_port));
-    if (!c) return;
 
     uint8_t flags = t->flags;
     uint32_t seq = ntohl(t->seq);
     uint32_t ack = ntohl(t->ack);
     int hlen = (t->data_off >> 4) * 4;
+    if (hlen < (int)sizeof(tcp_hdr_t) || hlen > len) return;
     int dlen = len - hlen;
     const uint8_t *data = seg + hlen;
 
+    tcp_conn_t *c = tcp_lookup(srcip, ntohs(t->src_port), ntohs(t->dst_port));
+    if (!c) {
+        if (flags & TCP_RST) return;
+        if ((flags & TCP_SYN) && !(flags & TCP_ACK)) {
+            for (int L = 0; L < TCP_LISTENERS; L++)
+                if (lsn[L].used && lsn[L].port == ntohs(t->dst_port) &&
+                    (!lsn[L].ip || lsn[L].ip == dstip)) {
+                    tcp_passive(L, srcip, dstip, t, seg, hlen);
+                    return;
+                }
+        }
+        // Nobody here: say so, rather than let the peer wait it out.
+        if (flags & TCP_ACK)
+            tcp_reset_reply(srcip, dstip, ntohs(t->src_port), ntohs(t->dst_port), ack, 0, 0);
+        else
+            tcp_reset_reply(srcip, dstip, ntohs(t->src_port), ntohs(t->dst_port), 0,
+                            seq + (uint32_t)dlen + ((flags & TCP_SYN) ? 1u : 0u), 1);
+        return;
+    }
+
     if (flags & TCP_RST) {
-        c->state = TCP_CLOSED;
-        c->remote_closed = 1;
+        tcp_dead(c, c->state == TCP_SYN_SENT ? NET_ECONNREFUSED : NET_ECONNRESET);
         return;
     }
 
     if (c->state == TCP_SYN_SENT) {
-        if ((flags & TCP_SYN) && (flags & TCP_ACK)) {
+        if ((flags & TCP_SYN) && (flags & TCP_ACK) && ack == c->iss + 1) {
             c->rcv_nxt = seq + 1;
-            c->snd_nxt = ack;             // our SYN acknowledged
+            c->snd_una = ack;
+            c->snd_nxt = c->snd_max = ack;
+            c->mss = tcp_mss_opt(seg, hlen);
+            if (c->mss > TCP_MSS) c->mss = TCP_MSS;
+            c->snd_wnd = ntohs(t->window);
+            c->cwnd = 10 * c->mss;
+            c->rto = TCP_RTO_INIT;
+            c->retries = 0;
+            c->rtx_at = 0;
             c->state = TCP_ESTABLISHED;
             tcp_out(c, TCP_ACK, NULL, 0);
+            tcp_push(c);
         }
         return;
     }
 
-    if (c->state == TCP_ESTABLISHED || c->state == TCP_CLOSING) {
-        uint32_t fin_seq = seq + (uint32_t)dlen;   // where a FIN here would sit
-        if (dlen > 0) {
-            // Drop the part we already have: a retransmission that overlaps.
-            int32_t ahead = seqdiff(seq, c->rcv_nxt);
-            if (ahead < 0) {
-                int dup = -ahead;
-                if (dup >= dlen) dlen = 0;
-                else { data += dup; dlen -= dup; seq = c->rcv_nxt; ahead = 0; }
-            }
-            if (dlen > 0) {
-                // Slide the unread bytes back to the front only when the
-                // room behind them has run out -- not on every read.
-                if (tcp_rx_space(c) < ahead + dlen) tcp_compact(c);
-                int space = tcp_rx_space(c);
-                int take = ahead >= space ? 0 : (dlen < space - ahead ? dlen : space - ahead);
-                if (take > 0) {
-                    nmemcpy(c->rx + c->rx_head + c->rx_len + ahead, data, take);
-                    if (ahead == 0) {
-                        c->rx_len += take;
-                        c->rcv_nxt += (uint32_t)take;   // only what was kept
-                        tcp_bytes_in += (uint32_t)take;
-                        tcp_held_join(c);
-                    } else {
-                        tcp_hold(c, seq, seq + (uint32_t)take);
-                    }
-                }
-            }
-            // Every data segment is answered, in order or not: past a gap
-            // the answer repeats the last acknowledgement, which is what
-            // tells the sender to resend the missing piece now rather than
-            // when its timer runs out.
-            tcp_out(c, TCP_ACK, NULL, 0);
+    if (c->state == TCP_SYN_RCVD) {
+        if ((flags & TCP_SYN) && !(flags & TCP_ACK)) {    // our SYN-ACK was lost
+            tcp_seg(c, TCP_SYN | TCP_ACK, c->iss, NULL, 0);
+            return;
         }
-        // A FIN counts only once everything before it has arrived: one that
-        // overtakes a lost segment would end the stream short.
-        if ((flags & TCP_FIN) && fin_seq == c->rcv_nxt) {
-            c->rcv_nxt += 1;
-            c->remote_closed = 1;
-            tcp_out(c, TCP_ACK, NULL, 0);
+        if (!(flags & TCP_ACK) || ack != c->iss + 1) return;
+        c->snd_una = ack;
+        c->rto = TCP_RTO_INIT;
+        c->retries = 0;
+        c->rtx_at = 0;
+        c->state = TCP_ESTABLISHED;
+        int L = c->listener;
+        if (L >= 0 && lsn[L].used && lsn[L].qn < TCP_BACKLOG)
+            lsn[L].q[lsn[L].qn++] = (int)(c - conns);
+        // and on, for any data it carries
+    }
+
+    if (c->state != TCP_ESTABLISHED && c->state != TCP_CLOSING) return;
+
+    // What the peer has acknowledged of ours.
+    if (flags & TCP_ACK) {
+        int32_t acked = seqdiff(ack, c->snd_una);
+        if (acked > 0 && seqdiff(ack, c->snd_max) <= 0) {
+            int data_acked = acked;
+            if (c->fin_sent && seqdiff(ack, c->fin_seq) > 0) data_acked -= 1;
+            if (data_acked > c->tx_len) data_acked = c->tx_len;
+            c->tx_head = (c->tx_head + data_acked) % TCP_TX_CAP;
+            c->tx_len -= data_acked;
+            c->snd_una = ack;
+            if (seqdiff(c->snd_nxt, ack) < 0) c->snd_nxt = ack;   // acknowledged past a resend
+            c->retries = 0;
+            c->rto = TCP_RTO_INIT;
+            c->dupacks = 0;
+            if (c->cwnd < 64 * 1024) c->cwnd += c->mss;
+            c->rtx_at = 0;
+            if (seqdiff(c->snd_nxt, c->snd_una) > 0) tcp_arm(c);
+            c->snd_wnd = ntohs(t->window);
+        } else if (acked == 0) {
+            int w = ntohs(t->window);
+            if (dlen == 0 && !(flags & (TCP_SYN | TCP_FIN)) && w == c->snd_wnd &&
+                seqdiff(c->snd_nxt, c->snd_una) > 0 && ++c->dupacks == 3)
+                tcp_resend_first(c);
+            c->snd_wnd = w;
         }
     }
+
+    uint32_t fin_seq = seq + (uint32_t)dlen;   // where a FIN here would sit
+    if (dlen > 0 && !c->remote_closed) {
+        // Drop the part we already have: a retransmission that overlaps.
+        int32_t ahead = seqdiff(seq, c->rcv_nxt);
+        if (ahead < 0) {
+            int dup = -ahead;
+            if (dup >= dlen) dlen = 0;
+            else { data += dup; dlen -= dup; seq = c->rcv_nxt; ahead = 0; }
+        }
+        if (dlen > 0) {
+            // Slide the unread bytes back to the front only when the
+            // room behind them has run out -- not on every read.
+            if (tcp_rx_space(c) < ahead + dlen) tcp_compact(c);
+            int space = tcp_rx_space(c);
+            int take = ahead >= space ? 0 : (dlen < space - ahead ? dlen : space - ahead);
+            if (take > 0) {
+                nmemcpy(c->rx + c->rx_head + c->rx_len + ahead, data, take);
+                if (ahead == 0) {
+                    c->rx_len += take;
+                    c->rcv_nxt += (uint32_t)take;   // only what was kept
+                    tcp_bytes_in += (uint32_t)take;
+                    tcp_held_join(c);
+                } else {
+                    tcp_hold(c, seq, seq + (uint32_t)take);
+                }
+            }
+        }
+        // Every data segment is answered, in order or not: past a gap
+        // the answer repeats the last acknowledgement, which is what
+        // tells the sender to resend the missing piece now rather than
+        // when its timer runs out.
+        tcp_out(c, TCP_ACK, NULL, 0);
+        // A connection nobody holds any more throws what arrives away.
+        if (c->orphan) { c->rx_head = 0; c->rx_len = 0; }
+    } else if (dlen > 0) {
+        tcp_out(c, TCP_ACK, NULL, 0);
+    }
+    // A FIN counts only once everything before it has arrived: one that
+    // overtakes a lost segment would end the stream short.
+    if ((flags & TCP_FIN) && fin_seq == c->rcv_nxt && !c->remote_closed) {
+        c->rcv_nxt += 1;
+        c->remote_closed = 1;
+        tcp_out(c, TCP_ACK, NULL, 0);
+    } else if ((flags & TCP_FIN) && c->remote_closed && seqdiff(fin_seq + 1, c->rcv_nxt) <= 0) {
+        tcp_out(c, TCP_ACK, NULL, 0);             // our ACK of it was lost
+    }
+    tcp_push(c);
+    // Its last segment: free it now rather than at the next timer pass --
+    // over the loopback a whole connection can open and close inside one.
+    if (orphan_done(c)) tcp_release(c);
 }
 
 // A local port nobody else here is using. They are ours to choose and the
@@ -638,81 +1021,127 @@ static uint16_t tcp_pick_port(void) {
         uint16_t p = (uint16_t)(40000 + (roll++ % 20000));
         int taken = 0;
         for (int i = 0; i < TCP_CONNS; i++)
-            if (conns[i].state != TCP_CLOSED && conns[i].local_port == p)
+            if ((conns[i].state != TCP_CLOSED || conns[i].rx) && conns[i].local_port == p)
                 taken = 1;
+        for (int i = 0; i < TCP_LISTENERS; i++)
+            if (lsn[i].used && lsn[i].port == p) taken = 1;
         if (!taken) return p;
     }
     return 0;
 }
 
-static void tcp_release(tcp_conn_t *c) {
-    if (c->rx) kfree(c->rx);
-    nmemset(c, 0, sizeof(*c));
+static int tcp_alloc(void) {
+    for (int i = 0; i < TCP_CONNS; i++)
+        if (orphan_done(&conns[i])) tcp_release(&conns[i]);
+    for (int i = 0; i < TCP_CONNS; i++)
+        if (conns[i].state == TCP_CLOSED && conns[i].rx == NULL && conns[i].tx == NULL) {
+            nmemset(&conns[i], 0, sizeof conns[i]);
+            conns[i].listener = -1;
+            conns[i].mss = 536;
+            conns[i].rto = TCP_RTO_INIT;
+            return i;
+        }
+    return -1;
 }
 
-// Open a connection and return its handle, or -1. `rx_cap` is how much of
-// the stream may sit unread before the peer is told to stop: the plain-HTTP
-// path accumulates a whole response and wants a great deal, TLS drains every
-// record as it lands and wants very little.
-static int tcp_open(uint32_t ip, uint16_t port, int rx_cap) {
-    int h = -1;
-    for (int i = 0; i < TCP_CONNS; i++)
-        if (conns[i].state == TCP_CLOSED && conns[i].rx == NULL) { h = i; break; }
-    if (h < 0) return -1;                    // all eight are in use
+static void tcp_release(tcp_conn_t *c) {
+    if (c->rx) kfree(c->rx);
+    if (c->tx) kfree(c->tx);
+    nmemset(c, 0, sizeof(*c));
+    c->listener = -1;
+}
 
+// Begin a connection: the SYN goes out, and the answer comes in on its own.
+// Returns the handle, or -1 (none free, no memory, no port).
+static int tcp_start(uint32_t ip, uint16_t port, int rx_cap, uint16_t lport) {
+    int h = tcp_alloc();
+    if (h < 0) return -1;
     if (rx_cap < 8192) rx_cap = 8192;
     tcp_conn_t *c = &conns[h];
-    nmemset(c, 0, sizeof(*c));
     c->rx = kmalloc((size_t)rx_cap);
-    if (!c->rx) return -1;
+    c->tx = kmalloc(TCP_TX_CAP);
+    if (!c->rx || !c->tx) { tcp_release(c); return -1; }
     c->rx_cap = rx_cap;
-
     c->remote_ip = ip;
+    c->local_ip = is_loop(ip) ? ip : our_ip;
     c->remote_port = port;
-    c->local_port = tcp_pick_port();
-    c->snd_nxt = 0x1000 + (uint32_t)(now_ms() & 0xFFFF);
-    c->state = TCP_SYN_SENT;
+    c->local_port = lport ? lport : tcp_pick_port();
     if (c->local_port == 0) { tcp_release(c); return -1; }
+    c->iss = (uint32_t)(now_us() * 2654435761u);
+    c->snd_una = c->iss;
+    c->snd_nxt = c->snd_max = c->iss + 1;          // the SYN takes one
+    c->rto = TCP_RTO_SYN;
+    c->state = TCP_SYN_SENT;
+    tcp_seg(c, TCP_SYN, c->iss, NULL, 0);
+    tcp_arm(c);
+    return h;
+}
 
-    for (int tries = 0; tries < 5; tries++) {
-        uint32_t isn = c->snd_nxt;
-        tcp_out(c, TCP_SYN, NULL, 0);
-        c->snd_nxt = isn + 1;                // SYN consumes one sequence number
-        uint64_t deadline = now_ms() + 600;
-        while (now_ms() < deadline) {
-            net_poll();
-            if (c->state == TCP_ESTABLISHED) { af_note_socket(h); return h; }
-            if (c->state == TCP_CLOSED) { tcp_release(c); return -1; }
-        }
-        c->snd_nxt = isn;                    // retransmit with the same ISN
-    }
+// Open a connection and wait for it. Returns the handle, or -1. `rx_cap`
+// is how much of the stream may sit unread before the peer is told to stop:
+// the plain-HTTP path accumulates a whole response and wants a great deal,
+// TLS drains every record as it lands and wants very little.
+static int tcp_open(uint32_t ip, uint16_t port, int rx_cap) {
+    int h = tcp_start(ip, port, rx_cap, 0);
+    if (h < 0) return -1;
+    tcp_conn_t *c = &conns[h];
+    while (c->state == TCP_SYN_SENT) net_poll();  // the timer gives up on it
+    if (c->state == TCP_ESTABLISHED) { af_note_socket(h); return h; }
     tcp_release(c);
     return -1;
 }
 
+// Queue all of it, pumping while the buffer is full.
 static void tcp_send_data(tcp_conn_t *c, const void *data, int len) {
     const uint8_t *p = data;
-    while (len > 0) {
-        int chunk = len > 1460 ? 1460 : len;
-        tcp_out(c, TCP_ACK | TCP_PSH, p, chunk);
-        c->snd_nxt += chunk;
-        p += chunk; len -= chunk;
-        // Pump once so the ACK for this segment is absorbed promptly.
-        net_poll();
+    uint64_t give_up = now_ms() + 30000;
+    while (len > 0 && (c->state == TCP_ESTABLISHED || c->state == TCP_CLOSING) && now_ms() < give_up) {
+        int n = tcp_queue(c, p, len);
+        p += n; len -= n;
+        if (len > 0) net_poll();
     }
 }
 
+// Shut our side: the FIN follows whatever is still queued.
 static void tcp_close(tcp_conn_t *c) {
     if (c->state == TCP_ESTABLISHED || c->state == TCP_CLOSING) {
-        tcp_out(c, TCP_FIN | TCP_ACK, NULL, 0);
-        c->snd_nxt += 1;
+        c->fin_want = 1;
+        tcp_push(c);
+    } else if (c->state == TCP_SYN_SENT || c->state == TCP_SYN_RCVD) {
+        tcp_dead(c, 0);
     }
-    c->state = TCP_CLOSED;
-    // The buffer stays until the handle is given back: a caller that closes
-    // is usually about to read what already arrived.
 }
 
-// --- the stream interface used by tls.c and net_http_get ------------------
+// Run every connection's timers: retransmission, and letting go of closed
+// handles whose FIN has landed (or never will).
+static int tcp_timers_busy;
+static uint64_t tcp_timers_last;
+static void tcp_timers(void) {
+    if (tcp_timers_busy) return;
+    uint64_t now = now_ms();
+    if (now == tcp_timers_last) return;
+    tcp_timers_last = now;
+    tcp_timers_busy = 1;
+    for (int i = 0; i < TCP_CONNS; i++) {
+        tcp_conn_t *c = &conns[i];
+        if (c->state == TCP_CLOSED && !c->rx) continue;
+        if (c->rtx_at && now >= c->rtx_at && c->state != TCP_CLOSED) tcp_timeout(c);
+        if (c->orphan) {
+            // Done when our FIN is acknowledged and theirs has come; past
+            // the linger, done anyway -- quietly if ours at least landed.
+            int fin_acked = c->fin_sent && seqdiff(c->snd_una, c->fin_seq) > 0;
+            int done = orphan_done(c);
+            if (done || now >= c->orphan_until) {
+                if (!done && !fin_acked)
+                    tcp_seg(c, TCP_RST | TCP_ACK, c->snd_nxt, NULL, 0);
+                tcp_release(c);
+            }
+        }
+    }
+    tcp_timers_busy = 0;
+}
+
+// --- the stream interface used by tls.c, net_http_get and the sockets --------------
 //
 // TLS needs to read a length-prefixed record, then the next one, which is not
 // something "drain everything then look at it" can do. These expose one
@@ -728,12 +1157,49 @@ int net_tcp_open(uint32_t ip, uint16_t port, int rx_cap) {
     return tcp_open(ip, port, rx_cap);
 }
 
+int net_tcp_start(uint32_t ip, uint16_t port, int rx_cap) {
+    return tcp_start(ip, port, rx_cap, 0);
+}
+
+int net_tcp_state(int h) {
+    tcp_conn_t *c = conn_of(h);
+    if (!c) return NET_TCP_DEAD;
+    if (c->state == TCP_SYN_SENT || c->state == TCP_SYN_RCVD) return NET_TCP_OPENING;
+    if (c->state == TCP_CLOSED) return NET_TCP_DEAD;
+    return NET_TCP_OPEN;
+}
+
+int net_tcp_error(int h) {
+    tcp_conn_t *c = conn_of(h);
+    return c ? c->err : 0;
+}
+
 int net_tcp_write(int h, const void *data, int len) {
     af_note_socket(h);
     tcp_conn_t *c = conn_of(h);
     if (!c || c->state != TCP_ESTABLISHED) return -1;
     tcp_send_data(c, data, len);
     return len;
+}
+
+// As much as fits now, without waiting; -1 if the connection cannot send.
+int net_tcp_send_some(int h, const void *data, int len) {
+    tcp_conn_t *c = conn_of(h);
+    if (!c || c->state != TCP_ESTABLISHED || c->fin_want) return -1;
+    return tcp_queue(c, (const uint8_t *)data, len);
+}
+
+// Room in the send buffer.
+int net_tcp_send_room(int h) {
+    tcp_conn_t *c = conn_of(h);
+    if (!c || !c->tx) return 0;
+    return TCP_TX_CAP - c->tx_len;
+}
+
+// Bytes queued and not yet acknowledged.
+int net_tcp_unacked(int h) {
+    tcp_conn_t *c = conn_of(h);
+    return c ? c->tx_len : 0;
 }
 
 int net_tcp_avail(int h) {
@@ -769,8 +1235,8 @@ void net_tcp_consume(int h, int n) {
     // Measured on a kept connection to GitHub's CDN: a 624 KB file whose
     // last two kilobytes came five seconds after the rest. A window grown by
     // two segments is worth saying so (RFC 1122, 4.2.3.3).
-    if (c->state == TCP_ESTABLISHED && !c->remote_closed) {
-        int win = c->rx_cap - c->rx_len;          // as tcp_out reckons it
+    if ((c->state == TCP_ESTABLISHED || c->state == TCP_CLOSING) && !c->remote_closed) {
+        int win = c->rx_cap - c->rx_len;          // as tcp_seg reckons it
         if (win > 65535) win = 65535;
         if (win - c->adv_win >= 2 * 1460) tcp_out(c, TCP_ACK, NULL, 0);
     }
@@ -795,11 +1261,27 @@ void net_tcp_shutdown(int h) {
     if (c) tcp_close(c);
 }
 
-// Give the handle back. After this it is somebody else's.
+// Give the handle back. After this it is somebody else's -- though the
+// connection itself may stay a few seconds more, until its last bytes and
+// its FIN have been acknowledged.
 void net_tcp_release(int h) {
     tcp_conn_t *c = conn_of(h);
     if (!c) return;
     tcp_close(c);
+    if (c->state == TCP_CLOSING || c->state == TCP_ESTABLISHED) {
+        c->orphan = 1;
+        c->orphan_until = now_ms() + TCP_LINGER_MS;
+        c->rx_head = c->rx_len = 0;
+        return;
+    }
+    tcp_release(c);
+}
+
+// Throw it away now: a reset to the peer, the handle free at once.
+void net_tcp_abort(int h) {
+    tcp_conn_t *c = conn_of(h);
+    if (!c) return;
+    if (c->state != TCP_CLOSED) tcp_seg(c, TCP_RST | TCP_ACK, c->snd_nxt, NULL, 0);
     tcp_release(c);
 }
 
@@ -808,6 +1290,167 @@ int net_tcp_open_count(void) {
     for (int i = 0; i < TCP_CONNS; i++)
         if (conns[i].rx) n++;
     return n;
+}
+
+void net_tcp_names(int h, uint32_t *lip, uint16_t *lport, uint32_t *rip, uint16_t *rport) {
+    tcp_conn_t *c = conn_of(h);
+    if (!c) return;
+    if (lip) *lip = c->local_ip ? c->local_ip : our_ip;
+    if (lport) *lport = c->local_port;
+    if (rip) *rip = c->remote_ip;
+    if (rport) *rport = c->remote_port;
+}
+
+// --- listening ----------------------------------------------------------------------
+
+int net_tcp_listen(uint32_t ip, uint16_t port, int backlog, int rx_cap) {
+    if (!port) return -NET_EINVAL;
+    for (int i = 0; i < TCP_LISTENERS; i++)
+        if (lsn[i].used && lsn[i].port == port) return -NET_EADDRINUSE;
+    for (int i = 0; i < TCP_LISTENERS; i++) {
+        if (lsn[i].used) continue;
+        lsn[i].used = 1;
+        lsn[i].port = port;
+        lsn[i].ip = ip;
+        lsn[i].backlog = backlog < 1 ? 1 : (backlog > TCP_BACKLOG ? TCP_BACKLOG : backlog);
+        lsn[i].rx_cap = rx_cap < 8192 ? 8192 : rx_cap;
+        lsn[i].qn = 0;
+        return i;
+    }
+    return -NET_ENOBUFS;
+}
+
+int net_tcp_pending(int L) {
+    if (L < 0 || L >= TCP_LISTENERS || !lsn[L].used) return 0;
+    return lsn[L].qn;
+}
+
+// The oldest connection that came in and has finished its handshake, or -1.
+int net_tcp_accept(int L) {
+    if (L < 0 || L >= TCP_LISTENERS || !lsn[L].used || !lsn[L].qn) return -1;
+    int h = lsn[L].q[0];
+    for (int i = 1; i < lsn[L].qn; i++) lsn[L].q[i - 1] = lsn[L].q[i];
+    lsn[L].qn--;
+    conns[h].listener = -1;
+    return h;
+}
+
+void net_tcp_unlisten(int L) {
+    if (L < 0 || L >= TCP_LISTENERS || !lsn[L].used) return;
+    for (int i = 0; i < lsn[L].qn; i++) net_tcp_abort(lsn[L].q[i]);
+    for (int i = 0; i < TCP_CONNS; i++)
+        if (conns[i].state == TCP_SYN_RCVD && conns[i].listener == L) net_tcp_abort(i);
+    nmemset(&lsn[L], 0, sizeof lsn[L]);
+}
+
+// --- UDP for programs ---------------------------------------------------------------
+//
+// A port, and a queue of what arrived on it -- several datagrams, each with
+// where it came from. (The boxes above are for the kernel's own one-question
+// exchanges: DNS, NTP.)
+
+#define UDP_SOCKS 16
+#define UDP_QLEN  16
+#define UDP_MAX   1472                // one Ethernet frame; there is no fragmenting
+
+typedef struct { uint32_t ip; uint16_t port; uint16_t len; uint8_t data[UDP_MAX]; } udp_dgram_t;
+static struct {
+    int          used;
+    uint16_t     port;
+    uint32_t     ip;                  // bound to this address of ours, 0 = any
+    int          head, n;
+    udp_dgram_t *q;
+} usk[UDP_SOCKS];
+
+static int udp_port_taken(uint16_t p) {
+    for (int i = 0; i < UDP_SOCKS; i++) if (usk[i].used && usk[i].port == p) return 1;
+    return p == 68 || p == 53;
+}
+
+int net_udp_open(uint32_t ip, uint16_t port) {
+    if (port && udp_port_taken(port)) return -NET_EADDRINUSE;
+    if (!port) {
+        static uint16_t roll;
+        for (int t = 0; t < 7000 && !port; t++) {
+            uint16_t p = (uint16_t)(33000 + (roll++ % 7000));
+            if (!udp_port_taken(p)) port = p;
+        }
+        if (!port) return -NET_EADDRINUSE;
+    }
+    for (int i = 0; i < UDP_SOCKS; i++) {
+        if (usk[i].used) continue;
+        usk[i].q = kmalloc(sizeof(udp_dgram_t) * UDP_QLEN);
+        if (!usk[i].q) return -NET_ENOBUFS;
+        usk[i].used = 1;
+        usk[i].port = port;
+        usk[i].ip = ip;
+        usk[i].head = usk[i].n = 0;
+        return i;
+    }
+    return -NET_ENOBUFS;
+}
+
+uint16_t net_udp_port(int u) { return u >= 0 && u < UDP_SOCKS && usk[u].used ? usk[u].port : 0; }
+
+void net_udp_close(int u) {
+    if (u < 0 || u >= UDP_SOCKS || !usk[u].used) return;
+    kfree(usk[u].q);
+    nmemset(&usk[u], 0, sizeof usk[u]);
+}
+
+int net_udp_pending(int u) {
+    if (u < 0 || u >= UDP_SOCKS || !usk[u].used) return 0;
+    return usk[u].n;
+}
+
+static int udp_deliver(uint32_t src, uint32_t dst, uint16_t sport, uint16_t dport,
+                       const uint8_t *data, int len) {
+    for (int i = 0; i < UDP_SOCKS; i++) {
+        if (!usk[i].used || usk[i].port != dport) continue;
+        if (usk[i].ip && usk[i].ip != dst && dst != 0xFFFFFFFF) continue;
+        if (usk[i].n == UDP_QLEN) return 1;           // full: this one is lost, as UDP may
+        udp_dgram_t *d = &usk[i].q[(usk[i].head + usk[i].n) % UDP_QLEN];
+        if (len > UDP_MAX) len = UDP_MAX;
+        d->ip = src;
+        d->port = sport;
+        d->len = (uint16_t)len;
+        nmemcpy(d->data, data, len);
+        usk[i].n++;
+        return 1;
+    }
+    return 0;
+}
+
+// The next datagram: copied into buf (cut to `len`), its sender, its whole
+// length returned; -1 when there is none.
+int net_udp_recv(int u, void *buf, int len, uint32_t *ip, uint16_t *port, int peek) {
+    if (u < 0 || u >= UDP_SOCKS || !usk[u].used || !usk[u].n) return -1;
+    udp_dgram_t *d = &usk[u].q[usk[u].head];
+    int n = d->len < len ? d->len : len;
+    nmemcpy(buf, d->data, n);
+    if (ip) *ip = d->ip;
+    if (port) *port = d->port;
+    int whole = d->len;
+    if (!peek) { usk[u].head = (usk[u].head + 1) % UDP_QLEN; usk[u].n--; }
+    return whole;
+}
+
+static int udp_send(uint32_t dstip, uint16_t sport, uint16_t dport, const void *data, int len);
+
+int net_udp_send(int u, uint32_t ip, uint16_t port, const void *data, int len) {
+    if (u < 0 || u >= UDP_SOCKS || !usk[u].used) return -NET_EINVAL;
+    if (len > UDP_MAX) return -NET_EMSGSIZE;
+    if (!is_loop(ip) && !up) return -NET_ENETDOWN;
+    if (udp_send(ip, usk[u].port, port, data, len) != 0) return -NET_EHOSTUNREACH;
+    return len;
+}
+
+// Is anything open that needs the network looked after in the background?
+int net_active(void) {
+    for (int i = 0; i < TCP_CONNS; i++) if (conns[i].rx) return 1;
+    for (int i = 0; i < TCP_LISTENERS; i++) if (lsn[i].used) return 1;
+    for (int i = 0; i < UDP_SOCKS; i++) if (usk[i].used) return 1;
+    return 0;
 }
 
 // ==========================================================================
@@ -1327,6 +1970,23 @@ void net_log_clear(void) { log_next = log_count = 0; }
 //  HTTP
 // ==========================================================================
 
+// A wait in a program's own system call (not a fetch on its own stack, and
+// not in the middle of a packet) gives way to other programs every couple of
+// milliseconds -- the server it is talking to may be one of them.
+static void net_give_way(void) {
+    if (af_running || rx_depth || !process_current()) return;
+    static uint64_t last;
+    uint64_t t = now_us();
+    if (t - last < 2000) return;
+    last = t;
+    // Interrupts are off for the length of a syscall, so the timer that
+    // wakes a program sleeping on its own wait -- the server, in its accept()
+    // -- would never come. Let a pending one in (the lock is ours already:
+    // it is taken again, not waited for), then give way.
+    __asm__ volatile ("sti; nop; nop; cli" ::: "memory");
+    process_yield();
+}
+
 int net_http_get(const char *host, uint32_t ip, uint16_t port,
                  const char *path, char *buf, int max, int keep_headers,
                  const char *post, int postlen, const char *xhdr) {
@@ -1335,7 +1995,13 @@ int net_http_get(const char *host, uint32_t ip, uint16_t port,
     // This path keeps the whole response in the socket until it has all
     // arrived, so it asks for a large buffer; TLS, which drains each record
     // as it lands, asks for a small one.
-    int h = tcp_open(ip, port, 262144);
+    int h = tcp_start(ip, port, 262144, 0);
+    if (h >= 0) {
+        tcp_conn_t *oc = &conns[h];
+        while (oc->state == TCP_SYN_SENT) { net_poll(); net_give_way(); }
+        if (oc->state == TCP_ESTABLISHED) af_note_socket(h);
+        else { tcp_release(oc); h = -1; }
+    }
     if (h < 0) {
         net_log_add(host, path, -1, 0, (uint32_t)started, NET_LOG_FAIL);
         return -1;
@@ -1381,6 +2047,7 @@ int net_http_get(const char *host, uint32_t ip, uint16_t port,
     int seen = c->rx_len;
     while (!c->remote_closed) {
         net_poll();
+        net_give_way();
         if (c->rx_len != seen) { seen = c->rx_len; last = now_ms(); }
         if (now_ms() - last > 4000) break;         // stall timeout
         if (c->rx_len >= c->rx_cap) break;
@@ -1566,7 +2233,7 @@ static void handle_arp(const uint8_t *p, int len) {
         arp_send(2, spa, a->sha);       // reply to a request for us
 }
 
-static void handle_udp(uint32_t srcip, const uint8_t *p, int len) {
+static void handle_udp(uint32_t srcip, uint32_t dstip, const uint8_t *p, int len) {
     if (len < (int)sizeof(udp_hdr_t)) return;
     const udp_hdr_t *u = (const udp_hdr_t *)p;
     uint16_t dport = ntohs(u->dst_port);
@@ -1593,6 +2260,8 @@ static void handle_udp(uint32_t srcip, const uint8_t *p, int len) {
         b->have = 1;
         return;
     }
+    // A program's socket on that port.
+    udp_deliver(srcip, dstip, ntohs(u->src_port), dport, data, dlen);
 }
 
 static void handle_icmp(uint32_t srcip, const uint8_t *p, int len) {
@@ -1622,15 +2291,17 @@ static void handle_ip(const uint8_t *p, int len) {
     if (ihl < 20 || ihl > len) return;
     uint32_t src = ntohl(ih->src);
     uint32_t dst = ntohl(ih->dst);
-    // Accept traffic to us or to broadcast (DHCP).
-    if (our_ip && dst != our_ip && dst != 0xFFFFFFFF) return;
+    // Accept traffic to us, to broadcast (DHCP), and to ourselves.
+    if (our_ip && dst != our_ip && dst != 0xFFFFFFFF && !is_loop(dst)) return;
+    // Without an address yet, the only conversation from outside is DHCP's.
+    if (!up && !is_loop(dst) && ih->proto == IPPROTO_TCP) return;
     int plen = (int)ntohs(ih->total_len) - ihl;
     if (plen < 0 || plen > len - ihl) plen = len - ihl;
     const uint8_t *payload = p + ihl;
     switch (ih->proto) {
         case IPPROTO_ICMP: handle_icmp(src, payload, plen); break;
-        case IPPROTO_UDP:  handle_udp(src, payload, plen); break;
-        case IPPROTO_TCP:  tcp_input(src, payload, plen); break;
+        case IPPROTO_UDP:  handle_udp(src, dst, payload, plen); break;
+        case IPPROTO_TCP:  tcp_input(src, dst, payload, plen); break;
         default: break;
     }
 }
@@ -1642,16 +2313,59 @@ void net_rx(const uint8_t *frame, uint16_t len) {
     uint16_t type = ntohs(e->type);
     const uint8_t *payload = frame + sizeof(eth_hdr_t);
     int plen = len - sizeof(eth_hdr_t);
+    rx_depth++;
     if (type == ETH_ARP) handle_arp(payload, plen);
     else if (type == ETH_IP) handle_ip(payload, plen);
+    rx_depth--;
 }
 
 /* net_poll is the single place every wait in this file and in tls.c passes
  * through, which makes it the one place that needs to know about slices --
  * af_running and af_slice_end are set by the async section above. */
+// The packets waiting on the loopback, into the input side. Not nested: a
+// reply one of them makes is queued and taken by the same loop.
+static int loop_draining;
+static uint8_t loop_pkt[1500];
+static void loop_drain(void) {
+    if (!loop_n || loop_draining) return;
+    loop_draining = 1;
+    for (int budget = 256; loop_n && budget; budget--) {
+        loop_pkt_t *q = &loopq[loop_head];
+        int len = q->len;
+        nmemcpy(loop_pkt, q->pkt, len);
+        loop_head = (loop_head + 1) % LOOP_Q;
+        loop_n--;
+        rx_depth++;
+        handle_ip(loop_pkt, len);
+        rx_depth--;
+    }
+    loop_draining = 0;
+}
+
 void net_poll(void) {
-    nic_poll();
-    if (af_running && now_us() >= af_slice_end) task_yield_back();
+    // Never the card inside the card: a nested poll would start on the
+    // receive ring the outer one is still walking.
+    static int polling;
+    if (!polling) {
+        polling = 1;
+        nic_poll();
+        polling = 0;
+    }
+    loop_drain();
+    tcp_timers();
+    if (af_running && !rx_depth && now_us() >= af_slice_end) task_yield_back();
+}
+
+// From the scheduler's loop on the first core, between processes: keeps the
+// connections programs hold moving -- answers, acknowledgements, resends --
+// while those programs are busy with something else, or asleep.
+void net_service(void) {
+    static uint64_t last;
+    if (!loop_n && !net_active()) return;
+    uint64_t now = now_ms();
+    if (now == last) return;
+    last = now;
+    net_poll();
 }
 
 // ==========================================================================

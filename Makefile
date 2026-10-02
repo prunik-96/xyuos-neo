@@ -66,6 +66,7 @@ DISK_MB := 128
 
 RAW_USER_PROGS  := test1
 LIBC_C_PROGS    := note view taskmgr play hello_c fstest spin parent keywait sh fm edit cc run \
+                   socktest nc httpd \
                    ls cat echo wc grep head tail sort uniq tee hexdump \
                    cp mv touch stat ps free uname sleep kill loop bigfile yes count crash \
                    plasma devmgr control web ftest netlog memtest vmtest thrtest \
@@ -85,7 +86,7 @@ LIBC_SRCS := libc/src/syscalls.c libc/src/stdio.c libc/src/stdlib.c libc/src/mal
              libc/src/math.c libc/src/readline.c libc/src/dirstat.c \
              libc/src/inet.c libc/src/regex.c libc/src/thread.c \
              libc/src/timecal.c libc/src/posixbits.c libc/src/mman.c \
-             libc/src/signal.c libc/src/shm.c libc/src/start.c libc/src/env.c
+             libc/src/signal.c libc/src/shm.c libc/src/start.c libc/src/env.c libc/src/socket.c
 LIBC_OBJS := $(patsubst libc/src/%.c,build/libc_%.o,$(LIBC_SRCS))
 LIBC_CXX_OBJS := build/libc_cxxabi_stubs.o
 LIBC_A    := build/libc.a

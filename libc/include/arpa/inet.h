@@ -20,6 +20,11 @@ int inet_aton(const char *src, struct in_addr *dst);
 /* And back to text. Returns `dst`, or NULL if it would not fit. */
 const char *inet_ntop(int af, const void *src, char *dst, socklen_t size);
 
+/* The two oldest: a dotted quad to an address (INADDR_NONE if it is not
+ * one), and back -- into a buffer of its own, overwritten every call. */
+in_addr_t inet_addr(const char *src);
+char     *inet_ntoa(struct in_addr in);
+
 #ifdef __cplusplus
 }
 #endif

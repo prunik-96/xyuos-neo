@@ -31,7 +31,14 @@ int open(const char *path, int flags, ...) {
     return (int)(kfd + FD_OFFSET);
 }
 
+/* Sockets are descriptors too (socket.c). */
+int  __sock_fd(int fd);
+long __sock_read(int fd, void *buf, unsigned long len);
+long __sock_write(int fd, const void *buf, unsigned long len);
+int  __sock_close(int fd);
+
 long read(int fd, void *buf, unsigned long len) {
+    if (__sock_fd(fd)) return __sock_read(fd, buf, len);
     /* stdin: the kernel decides what that means -- a redirected file if the
      * shell set one up, otherwise a keypress. Returns 0 at end of input, which
      * is what makes `prog < file` terminate. */
@@ -41,12 +48,14 @@ long read(int fd, void *buf, unsigned long len) {
 }
 
 long write(int fd, const void *buf, unsigned long len) {
+    if (__sock_fd(fd)) return __sock_write(fd, buf, len);
     if (fd == 1 || fd == 2) return xyuos_console_write(buf, len);
     if (fd < FD_OFFSET) return -1;
     return xyuos_writefd(fd - FD_OFFSET, buf, len);
 }
 
 int close(int fd) {
+    if (__sock_fd(fd)) return __sock_close(fd);
     if (fd < FD_OFFSET) return 0;                 /* closing a std stream is a no-op */
     xyuos_close(fd - FD_OFFSET);
     return 0;

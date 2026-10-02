@@ -1,19 +1,17 @@
-/* Internet addresses -- the numbers, not the sockets.
- *
- * A browser needs these to read an address out of a URL and decide whether it
- * is a name or a number: "http://192.168.1.1/" has to be told from
- * "http://example.com/" before anything is looked up. That is arithmetic on
- * text, and it works here.
- *
- * What is NOT here is a socket. This system does its networking in the kernel
- * behind one call, and declaring socket() and connect() so that programs
- * compile and then fail would be worse than not declaring them.
- */
+/* Internet addresses: the shapes sockets take them in (see sys/socket.h),
+ * and the byte-order helpers. */
 #ifndef NETINET_IN_H
 #define NETINET_IN_H
 
 #include <stdint.h>
 #include <sys/socket.h>
+
+#define IPPROTO_IP   0
+#define IPPROTO_ICMP 1
+#define IPPROTO_TCP  6
+#define IPPROTO_UDP  17
+#define IPPROTO_IPV6 41
+#define IPPROTO_RAW  255
 
 typedef uint16_t in_port_t;
 typedef uint32_t in_addr_t;

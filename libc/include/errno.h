@@ -54,9 +54,17 @@ extern int errno;
 #define ELOOP        40
 
 // The network range, for code that expects it to exist.
+#define ENOTSOCK     88
+#define EDESTADDRREQ 89
+#define EMSGSIZE     90
+#define EPROTOTYPE   91
+#define ENOPROTOOPT  92
+#define EPROTONOSUPPORT 93
 #define EOPNOTSUPP   95
 #define EAFNOSUPPORT 97
 #define EADDRINUSE   98
+#define EADDRNOTAVAIL 99
+#define ENETDOWN    100
 #define ENETUNREACH 101
 #define ECONNABORTED 103
 #define ECONNRESET  104

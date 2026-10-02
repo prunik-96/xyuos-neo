@@ -13,8 +13,20 @@ extern "C" {
 #define O_TRUNC   01000
 #define O_APPEND  02000
 #define O_BINARY  0        /* no text/binary distinction here */
+#define O_NONBLOCK 04000
+#define O_NDELAY  O_NONBLOCK
+#define O_CLOEXEC 02000000
+
+#define F_DUPFD   0
+#define F_GETFD   1
+#define F_SETFD   2
+#define F_GETFL   3
+#define F_SETFL   4
+#define FD_CLOEXEC 1
 
 int open(const char *path, int flags, ...);
+/* F_GETFL / F_SETFL with O_NONBLOCK on a socket; the rest answer 0. */
+int fcntl(int fd, int cmd, ...);
 
 #ifdef __cplusplus
 }

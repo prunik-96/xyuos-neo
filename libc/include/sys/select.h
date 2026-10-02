@@ -1,11 +1,5 @@
-/* Waiting on descriptors.
- *
- * The types are here because portable code declares an fd_set on its way past
- * whether or not it ever waits on one. select() itself is declared and not
- * written: this system has no descriptor to wait on that would not already
- * have answered, and a select() that returned a lie would be worse than a
- * link error naming the file that wanted it.
- */
+/* Waiting on descriptors: select() is poll() (see poll.h) in the older
+ * clothes. Sockets are numbered from 32, so they fit in FD_SETSIZE. */
 #ifndef SYS_SELECT_H
 #define SYS_SELECT_H
 
@@ -30,8 +24,6 @@ typedef struct {
 extern "C" {
 #endif
 
-/* Declared so that code mentioning it compiles; not written, so that code
- * calling it says so at link time instead of at runtime. */
 int select(int nfds, fd_set *rd, fd_set *wr, fd_set *ex, struct timeval *tv);
 
 #ifdef __cplusplus

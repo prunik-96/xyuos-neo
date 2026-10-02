@@ -648,6 +648,7 @@ static int cmd_cd(const char *arg) {
     if (!st.is_dir) { printf(T("cd: это не папка: %s\n", "cd: not a directory: %s\n"), path); return 1; }
     snprintf(prev_cwd, sizeof prev_cwd, "%s", cwd);
     snprintf(cwd, sizeof(cwd), "%s", path);
+    setenv("PWD", cwd, 1);
     return 0;
 }
 
