@@ -40,14 +40,19 @@ static int  sel = -1, top, hover = -1;
 static char status[180];
 
 static struct si_mem mem;
+static struct si_cpu cpu;
+static int have_cpu;
+
+static int en;
+#define T(ru, eng) (en ? (eng) : (ru))
 
 static const char *state_name(int st, int stopped) {
-    if (stopped) return "suspended";
+    if (stopped) return T("приостановлен", "suspended");
     switch (st) {
-        case 1: return "ready";
-        case 2: return "running";
-        case 3: return "blocked";
-        case 4: return "exited";
+        case 1: return T("готов", "ready");
+        case 2: return T("работает", "running");
+        case 3: return T("ждёт", "blocked");
+        case 4: return T("завершён", "exited");
         default: return "?";
     }
 }
@@ -58,6 +63,7 @@ static void refresh(void) {
     long n = xyuos_sysinfo(SI_PROCS, procs, sizeof procs);
     nproc = (n > 0) ? (int)(n / (long)sizeof(struct si_proc)) : 0;
     xyuos_sysinfo(SI_MEM, &mem, sizeof mem);
+    have_cpu = xyuos_sysinfo(SI_CPU, &cpu, sizeof cpu) == (long)sizeof cpu;
 
     unsigned now = uptime_ms();
     unsigned dt = now - prev_ms;
@@ -91,11 +97,20 @@ static void refresh(void) {
 
 static int row_h(gui_t *g) { return g->fh + 10; }
 
+/* The processor strip: a line of name and temperature, then one tile per
+ * core, eight to a row. */
+#define CORE_COLS 8
+static int core_rows(void) {
+    int n = have_cpu ? cpu.ncpu : 1;
+    return (n + CORE_COLS - 1) / CORE_COLS;
+}
+static int cpu_h(gui_t *g) { return 8 + g->fh + 8 + core_rows() * (g->fh + 8) + 6; }
+
 static void list_rect(gui_t *g, int *x, int *y, int *w, int *h) {
     *x = 0;
-    *y = TOOL_H + HEAD_H;
+    *y = TOOL_H + cpu_h(g) + HEAD_H;
     *w = g->w;
-    *h = g->h - TOOL_H - HEAD_H - STAT_H;
+    *h = g->h - *y - STAT_H;
     if (*h < 0) *h = 0;
 }
 
@@ -117,12 +132,76 @@ static void columns(gui_t *g, int *pid, int *name, int *cpu, int *state, int *wi
     *win   = w * 86 / 100;
 }
 
-static const char *btn_label[] = { "End task", "Suspend", "Resume", "Refresh" };
-#define NBTN ((int)(sizeof btn_label / sizeof btn_label[0]))
+static const char *btn_ru[] = { "Завершить", "Приостановить", "Продолжить", "Обновить" };
+static const char *btn_en[] = { "End task", "Suspend", "Resume", "Refresh" };
+#define NBTN 4
+#define btn_label (en ? btn_en : btn_ru)
 
 static void btn_rect(gui_t *g, int i, int *x, int *y, int *w, int *h) {
-    int bw = g->fw * 11, gap = 6;
+    int bw = g->fw * 15, gap = 6;
     *w = bw; *h = TOOL_H - 12; *x = 8 + i * (bw + gap); *y = 6;
+}
+
+/* A load as a colour: green, yellow, red. */
+static unsigned load_col(int pct) {
+    return pct > 60 ? 0xE05A3A : (pct > 20 ? 0xE0B040 : 0x46C06A);
+}
+
+static void draw_cpu(gui_t *g, int y0, int h) {
+    gui_fill(g, 0, y0, g->w, h, GC_WIN);
+    gui_fill(g, 0, y0 + h - 1, g->w, 1, GC_EDGE);
+    int ty = y0 + 8;
+    char t[160];
+
+    /* The temperature on the right, the name in what is left. */
+    char temp[64];
+    unsigned tcol = GC_DIM;
+    if (!have_cpu || cpu.temp_mc == -1000000) {
+        snprintf(temp, sizeof temp, T("температура: нет данных", "temperature: n/a"));
+    } else {
+        int tc = cpu.temp_mc;
+        int neg = tc < 0;
+        if (neg) tc = -tc;
+        int o = snprintf(temp, sizeof temp, "%s%s%d.%d°C", T("температура ", "temperature "),
+                         neg ? "-" : "", tc / 1000, (tc % 1000) / 100);
+        /* Each die after it, when there is more than the control value. */
+        for (int i = 0; i < cpu.nccd && i < 2 && o < (int)sizeof temp - 12; i++)
+            if (cpu.ccd_mc[i] != -1000000)
+                o += snprintf(temp + o, sizeof temp - (size_t)o, "  CCD%d %d°", i + 1, cpu.ccd_mc[i] / 1000);
+        tcol = cpu.temp_mc >= 85000 ? 0xE05A3A : (cpu.temp_mc >= 70000 ? 0xE0B040 : GC_TEXT);
+    }
+    int tw = gui_len(temp) * g->fw;
+    gui_text(g, g->w - tw - 12, ty, temp, tcol);
+
+    /* The average clock of the cores that report one. */
+    int sum = 0, nk = 0;
+    if (have_cpu) for (int i = 0; i < cpu.ncpu; i++) if (cpu.mhz[i] > 0) { sum += cpu.mhz[i]; nk++; }
+    const char *model = have_cpu && cpu.model[0] ? cpu.model : T("процессор", "processor");
+    if (nk)
+        snprintf(t, sizeof t, "%s   %d.%02d %s", model, sum / nk / 1000, sum / nk % 1000 / 10, T("ГГц", "GHz"));
+    else
+        snprintf(t, sizeof t, "%s", model);
+    gui_text_clip(g, 12, ty, t, GC_TEXT, g->w - tw - 36);
+
+    /* One tile per core: its load as a bar, its clock (or its load) as text. */
+    int n = have_cpu ? cpu.ncpu : 1;
+    int cols = n < CORE_COLS ? n : CORE_COLS;
+    int tile_w = (g->w - 24 - (cols - 1) * 4) / cols, tile_h = g->fh + 4;
+    int yy = ty + g->fh + 8;
+    for (int i = 0; i < n; i++) {
+        int x = 12 + (i % CORE_COLS) * (tile_w + 4);
+        int y = yy + (i / CORE_COLS) * (g->fh + 8);
+        int ld = have_cpu ? cpu.load[i] : 0;
+        if (ld < 0) ld = 0;
+        if (ld > 100) ld = 100;
+        gui_panel(g, x, y, tile_w, tile_h, GC_PANEL, GC_EDGE);
+        int bw = (tile_w - 2) * ld / 100;
+        if (bw > 0) gui_fill(g, x + 1, y + 1, bw, tile_h - 2, gui_mix(GC_PANEL, load_col(ld), 70));
+        int mz = have_cpu ? cpu.mhz[i] : 0;
+        if (mz > 0) snprintf(t, sizeof t, "%d  %d.%02d", i, mz / 1000, mz % 1000 / 10);
+        else        snprintf(t, sizeof t, "%d  %d%%", i, ld);
+        gui_text_clip(g, x + 5, y + 2, t, GC_TEXT, tile_w - 8);
+    }
 }
 
 static void draw(gui_t *g) {
@@ -144,15 +223,20 @@ static void draw(gui_t *g) {
         gui_button(g, x, y, w, h, btn_label[i], st);
     }
 
+    /* the processor */
+    int ch = cpu_h(g);
+    draw_cpu(g, TOOL_H, ch);
+
     /* column headings */
-    gui_vgrad(g, 0, TOOL_H, g->w, HEAD_H, GC_BAR, GC_BAR2);
-    gui_fill(g, 0, TOOL_H + HEAD_H - 1, g->w, 1, GC_EDGE);
-    int hy = TOOL_H + (HEAD_H - g->fh) / 2;
+    int hy0 = TOOL_H + ch;
+    gui_vgrad(g, 0, hy0, g->w, HEAD_H, GC_BAR, GC_BAR2);
+    gui_fill(g, 0, hy0 + HEAD_H - 1, g->w, 1, GC_EDGE);
+    int hy = hy0 + (HEAD_H - g->fh) / 2;
     gui_text(g, cpid, hy, "PID", GC_DIM);
-    gui_text(g, cname, hy, "Name", GC_DIM);
-    gui_text(g, ccpu, hy, "CPU", GC_DIM);
-    gui_text(g, cstate, hy, "State", GC_DIM);
-    gui_text(g, cwin, hy, "Window", GC_DIM);
+    gui_text(g, cname, hy, T("Имя", "Name"), GC_DIM);
+    gui_text(g, ccpu, hy, T("ЦП", "CPU"), GC_DIM);
+    gui_text(g, cstate, hy, T("Состояние", "State"), GC_DIM);
+    gui_text(g, cwin, hy, T("Окно", "Window"), GC_DIM);
 
     /* rows */
     int lx, ly, lw, lh;
@@ -186,14 +270,14 @@ static void draw(gui_t *g) {
         if (barw > 0)
             gui_fill(g, ccpu, y + 3, barw, rh - 6,
                      gui_mix(GC_PANEL,
-                             pct > 60 ? 0xE05A3A : (pct > 20 ? 0xE0B040 : 0x46C06A),
+                             load_col(pct),
                              70));
         snprintf(t, sizeof t, "%d%%", pct);
         gui_text(g, ccpu, ty, t, GC_TEXT);
 
         gui_text(g, cstate, ty, state_name(p->state, p->stopped),
                  p->stopped ? GC_WARN : GC_DIM);
-        if (p->pane) gui_text(g, cwin, ty, "yes", GC_DIM);
+        if (p->pane) gui_text(g, cwin, ty, T("да", "yes"), GC_DIM);
     }
     if (need_sb) gui_scrollbar(g, lx + lw - SBW, ly, SBW, lh, top, vis, nproc);
 
@@ -208,7 +292,7 @@ static void draw(gui_t *g) {
         total = mem.total_frames * mem.page_size / (1024 * 1024);
     }
     char t[160];
-    snprintf(t, sizeof t, "%d processes   memory %lu / %lu MB", nproc, used, total);
+    snprintf(t, sizeof t, T("процессов: %d   память %lu / %lu МБ", "%d processes   memory %lu / %lu MB"), nproc, used, total);
     gui_text_clip(g, 10, sty, t, GC_TEXT, g->w - 240);
 
     int bx = g->w - 190, bw = 160, bh = g->fh + 2;
@@ -230,16 +314,16 @@ static void act(int which) {
     switch (which) {
         case 0:
             /* SIGKILL: End task is not a request. */
-            if (kill(pid, SIGKILL) == 0) snprintf(status, sizeof status, "ended %s (pid %d)", name, pid);
-            else snprintf(status, sizeof status, "cannot end pid %d", pid);
+            if (kill(pid, SIGKILL) == 0) snprintf(status, sizeof status, T("завершён %s (pid %d)", "ended %s (pid %d)"), name, pid);
+            else snprintf(status, sizeof status, T("не удалось завершить pid %d", "cannot end pid %d"), pid);
             break;
         case 1:
-            if (proc_stop(pid) == 0) snprintf(status, sizeof status, "suspended %s", name);
-            else snprintf(status, sizeof status, "cannot suspend pid %d", pid);
+            if (proc_stop(pid) == 0) snprintf(status, sizeof status, T("приостановлен %s", "suspended %s"), name);
+            else snprintf(status, sizeof status, T("не удалось приостановить pid %d", "cannot suspend pid %d"), pid);
             break;
         case 2:
-            if (proc_cont(pid) == 0) snprintf(status, sizeof status, "resumed %s", name);
-            else snprintf(status, sizeof status, "cannot resume pid %d", pid);
+            if (proc_cont(pid) == 0) snprintf(status, sizeof status, T("продолжен %s", "resumed %s"), name);
+            else snprintf(status, sizeof status, T("не удалось продолжить pid %d", "cannot resume pid %d"), pid);
             break;
         default:
             status[0] = 0;
@@ -250,6 +334,7 @@ static void act(int which) {
 
 int main(void) {
     gui_t g;
+    en = ui_lang() == 1;
     if (!gui_open(&g)) return 1;
 
     prev_ms = uptime_ms();

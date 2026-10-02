@@ -11,6 +11,7 @@
 #include <stddef.h>
 #include "../../mm/vmm.h"
 #include "../../kernel/bkl.h"
+#include "../../drivers/sensors.h"
 #include "smp.h"
 #include "pit.h"
 
@@ -343,6 +344,8 @@ uint64_t irq_handler(struct interrupt_frame *frame) {
     // lock -- a delay loop, a timeout -- and if time only moved forward under
     // the lock, it would wait for ever for a clock that was waiting for it.
     if (vec == 32) pit_tick_fast();
+    // Each core measures its own clock (its counters are its own).
+    if (timer) sensors_tick();
 
     // End of interrupt NOW, before the lock rather than after the handler.
     //

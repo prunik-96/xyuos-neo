@@ -325,6 +325,20 @@ struct net_status {
 #define SI_PROCS  1   // an array of struct si_proc; returns bytes written
 #define SI_UNAME  2   // a NUL-terminated string
 #define SI_DEVICES 3  // an array of struct si_dev; returns bytes written
+#define SI_CPU    4   // one struct si_cpu
+// The processor now: temperature (AMD Ryzen; SENSOR_NONE, -1000000, where it
+// cannot be read) and each core's load and effective clock.
+struct si_cpu {
+    int temp_mc;                 // Tctl, millidegrees Celsius
+    int nccd;
+    int ccd_mc[8];               // each core die
+    int ncpu;
+    int load[32];                // percent
+    int mhz[32];                 // effective clock, 0 when not known
+    int base_mhz;
+    char model[64];
+};
+
 
 struct si_mem {
     uint64_t page_size;

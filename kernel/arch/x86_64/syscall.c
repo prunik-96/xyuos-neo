@@ -15,6 +15,7 @@
 #include "../../fs/vol.h"
 #include "../../fs/ext2.h"
 #include "../../kernel/clip.h"
+#include "../../drivers/sensors.h"
 #include "../../fs/fatfs.h"
 #include "../../wm/wm.h"
 #include "../../net/net.h"
@@ -497,6 +498,37 @@ static uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 m->total_frames = pmm_total_frame_count();
                 m->free_frames = pmm_free_frame_count();
                 return sizeof(*m);
+            }
+            if (a1 == SI_CPU) {
+                if (a3 < sizeof(struct si_cpu)) return (uint64_t)-1;
+                struct si_cpu *c = (struct si_cpu *)buf;
+                c->temp_mc = sensors_temp_mc();
+                c->nccd = sensors_nccd();
+                if (c->nccd > 8) c->nccd = 8;
+                for (int i = 0; i < 8; i++) c->ccd_mc[i] = i < c->nccd ? sensors_ccd_mc(i) : SENSOR_NONE;
+                c->ncpu = smp_cpu_count();
+                if (c->ncpu < 1) c->ncpu = 1;
+                if (c->ncpu > 32) c->ncpu = 32;
+                for (int i = 0; i < 32; i++) {
+                    c->load[i] = i < c->ncpu ? smp_core_load(i) : 0;
+                    c->mhz[i] = i < c->ncpu ? sensors_core_mhz(i) : 0;
+                }
+                c->base_mhz = sensors_base_mhz();
+                // the brand string, CPUID 0x80000002..4
+                uint32_t r[12];
+                for (int k = 0; k < 3; k++)
+                    __asm__ volatile ("cpuid" : "=a"(r[k*4]), "=b"(r[k*4+1]), "=c"(r[k*4+2]), "=d"(r[k*4+3])
+                                      : "a"(0x80000002u + k), "c"(0));
+                const char *s = (const char *)r;
+                int o = 0, sp = 1;
+                for (int k = 0; k < 48 && s[k] && o < 63; k++) {
+                    if (s[k] == ' ' && sp) continue;
+                    sp = s[k] == ' ';
+                    c->model[o++] = s[k];
+                }
+                while (o && c->model[o - 1] == ' ') o--;
+                c->model[o] = 0;
+                return sizeof *c;
             }
             if (a1 == SI_PROCS) {
                 int max = (int)(a3 / sizeof(struct si_proc));

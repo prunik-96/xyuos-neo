@@ -85,6 +85,10 @@ static void pit_irq_handler(struct interrupt_frame *frame) {
     splash_tick();
 }
 
+// The timestamp counter's rate in MHz: on AMD and recent Intel processors
+// the base clock, which MPERF counts at too.
+uint64_t pit_tsc_mhz(void) { return tsc_per_us; }
+
 void pit_init(uint32_t frequency_hz) {
     uint32_t divisor = PIT_BASE_FREQ / frequency_hz;
 

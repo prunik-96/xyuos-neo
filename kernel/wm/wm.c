@@ -18,6 +18,7 @@
 #include "../drivers/audio.h"
 #include "../drivers/xhci.h"
 #include "../drivers/power.h"
+#include "../drivers/sensors.h"
 #include "../net/net.h"
 #include "ui.h"
 #include "wall.h"
@@ -2034,6 +2035,22 @@ static void draw_gadget(void) {
     char v[8]; int q;
     // CPU -- one bar per core, so all cores are visible at once.
     draw_text_t(tx, yy, "CPU", 0x0066C2E0);
+    {
+        // What the processor says of itself, where it says it: the control
+        // temperature and the cores' average effective clock.
+        char sv[32]; int sq = 0;
+        int tmc = sensors_temp_mc();
+        if (tmc != SENSOR_NONE && tmc > 0) { napp(sv, &sq, (unsigned)(tmc / 1000)); sapp(sv, &sq, "C  "); }
+        unsigned msum = 0, mn = 0;
+        for (int c = 0; c < nc; c++) { int mz = sensors_core_mhz(c); if (mz > 0) { msum += (unsigned)mz; mn++; } }
+        if (mn) {
+            unsigned avg = msum / mn;
+            napp(sv, &sq, avg / 1000); sapp(sv, &sq, ".");
+            if (avg % 1000 / 10 < 10) sapp(sv, &sq, "0");
+            napp(sv, &sq, avg % 1000 / 10); sapp(sv, &sq, "GHz");
+        }
+        if (sq) draw_text_t(tx + 5 * (int)GW, yy, sv, 0x00B8C0CC);
+    }
     q = 0; napp(v, &q, cur_cpu); sapp(v, &q, "%");
     draw_text_t(gx + gw - 12 - q * (int)GW, yy, v, 0x00E6ECF5);   // overall load
     yy += (int)GH + 4;

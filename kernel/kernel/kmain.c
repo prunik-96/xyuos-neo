@@ -23,6 +23,7 @@
 #include "../drivers/audio.h"
 #include "../drivers/xhci.h"
 #include "../drivers/virtio_gpu.h"
+#include "../drivers/sensors.h"
 #include "../drivers/power.h"
 #include "../wm/wm.h"
 #include "../wm/splash.h"
@@ -336,6 +337,7 @@ void kernel_main(uint32_t multiboot_addr) {
     // 0x60. Harmless in QEMU/BIOS -- returns 0 if there is no xHCI, and the
     // PS/2 driver keeps working alongside it. xhci_poll() is driven by the
     // timer tick (see pit.c).
+    sensors_init();               // the CPU's thermometer and clock counters
     power_init(multiboot_addr);   // ACPI: learn how to power off / reset
 
     // Before the filesystem: the root filesystem may be on the USB stick the
