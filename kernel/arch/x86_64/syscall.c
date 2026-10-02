@@ -195,6 +195,28 @@ static uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 default: return (uint64_t)-1;
             }
         }
+        case SYS_NOTIFY: {
+            // Two strings of unknown length in the caller's memory, taken a
+            // byte at a time like the track title.
+            char title[48], text[96];
+            const uint64_t src[2] = { a1, a2 };
+            char *dst[2] = { title, text };
+            const int cap[2] = { (int)sizeof title, (int)sizeof text };
+            for (int k = 0; k < 2; k++) {
+                int n = 0;
+                if (src[k]) {
+                    while (n < cap[k] - 1 && vmm_user_range_ok(src[k] + (uint64_t)n, 1)) {
+                        char c = ((const char *)(uintptr_t)src[k])[n];
+                        if (!c) break;
+                        dst[k][n++] = c;
+                    }
+                }
+                dst[k][n] = 0;
+            }
+            if (!title[0]) return (uint64_t)-1;
+            wm_notify(title, text);
+            return 0;
+        }
         case SYS_SHM: {
             switch (a1) {
                 case SHMOP_GET: {

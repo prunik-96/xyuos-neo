@@ -22,6 +22,12 @@ void wm_poll(void);
 // process is left: a desktop with every window closed is still a desktop.
 int wm_running(void);
 
+// A notice in the corner of the screen, for a few seconds: a title and a
+// line of text, with one of the glyphs of glyphs.h on a square of `col`.
+// Not shown while "do not disturb" is on.
+void wm_notify(const char *title, const char *text);
+void wm_notify_glyph(const char *title, const char *text, int g, unsigned int col);
+
 // Hold off every repaint (1) and allow them again (0). For the screen-off
 // sleep: the screen stays black until whoever blanked it says otherwise.
 void wm_set_asleep(int on);

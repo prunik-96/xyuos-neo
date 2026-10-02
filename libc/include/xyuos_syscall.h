@@ -140,6 +140,9 @@ struct msgbox_req {
 
 // Shared memory. op=a1; see sys/shm.h.
 #define SYS_SHM       49
+
+// A notice on the desktop: a1 = title, a2 = text.
+#define SYS_NOTIFY    50
 #define SHMOP_GET     0
 #define SHMOP_ATTACH  1
 #define SHMOP_DETACH  2

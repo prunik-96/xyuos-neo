@@ -224,6 +224,10 @@ void audio_title(const char *title) {
     xyuos_syscall3(SYS_AUDIO, AU_TITLE, (long)title, 0);
 }
 
+int notify(const char *title, const char *text) {
+    return (int)xyuos_syscall3(SYS_NOTIFY, (long)title, (long)text, 0);
+}
+
 int audio_play(const short *frames, int nframes) {
     return (int)xyuos_syscall3(SYS_AUDIO, AU_WRITE, (long)frames, nframes);
 }

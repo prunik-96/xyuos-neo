@@ -89,6 +89,12 @@ typedef struct {
     uint32_t content_bg;               // terminal background
     uint32_t bar_a, bar_b;             // taskbar gradient
     uint32_t menu_bg;                  // start menu / Alt+Tab panel tint
+    // What floats over the windows -- the island, the launcher, the panel, a
+    // notice -- is glass tinted with `frost` (and a little of the accent),
+    // and the plates laid on that glass, a switch or a row under the pointer,
+    // are `plate`. White and white in the light theme; slate in the dark.
+    uint32_t frost, plate;
+    int      frost_a;                  // added to each glass's own strength
     uint32_t orb;                      // start orb accent
     uint32_t title_text, title_text_dim;
     uint32_t bar_text, bar_dim;
@@ -123,6 +129,7 @@ static theme_t THEMES[] = {
         .content_bg = 0x001C2026,
         .bar_a = 0x00CFE3F7, .bar_b = 0x007FA9D6,
         .menu_bg = 0x00DCE8F5,
+        .frost = 0x00FFFFFF, .plate = 0x00FFFFFF, .frost_a = 0,
         .orb = 0x003E86C8,
         .title_text = 0x001E2329, .title_text_dim = 0x006B7480,
         .bar_text = 0x00133154, .bar_dim = 0x00436486,
@@ -149,6 +156,7 @@ static theme_t THEMES[] = {
         .content_bg = 0x000B0D12,
         .bar_a = 0x002A303C, .bar_b = 0x000C0E14,
         .menu_bg = 0x00101820,
+        .frost = 0x00121821, .plate = 0x00313A49, .frost_a = 30,
         .orb = 0x003E9BE0,
         .title_text = 0x00E6ECF5, .title_text_dim = 0x008A93A2,
         .bar_text = 0x00E6ECF5, .bar_dim = 0x008A93A2,
@@ -194,6 +202,8 @@ struct wm_node {
     int ws;                      // workspace this window lives on
     int state;                   // WIN_NORMAL / WIN_MAX / WIN_MIN
     int pinned;                  // kept above every window that is not
+    char path[48];               // the program it was opened with ("" a shell)
+    char arg[96];                // ... and what it was given to open
 
     uint32_t x, y, w, h;         // frame rectangle on screen
     uint32_t sx, sy, sw, sh;     // geometry remembered across a maximise
@@ -880,10 +890,11 @@ static void paint_chrome(int n, int focus) {
     // Light on the glass: a sheen down the strip, a fine bright edge round
     // the whole window and a faint dark one just outside it, so a pale window
     // still has an outline against a pale wallpaper.
-    ui_mat sheen = { UI_GRAD, 0x00FFFFFF, 0x00FFFFFF, focus ? 60 : 36, 0, y, y + TITLE_H };
+    int sa = T->dark ? (focus ? 24 : 14) : (focus ? 60 : 36);
+    ui_mat sheen = { UI_GRAD, 0x00FFFFFF, 0x00FFFFFF, sa, 0, y, y + TITLE_H };
     ui_rrect(x, y, w, TITLE_H, R, UI_TOP, &sheen);
     if (!maxed) {
-        ui_rrect_line(x, y, w, h, R, UI_ALL, 0x00FFFFFF, focus ? 150 : 110);
+        ui_rrect_line(x, y, w, h, R, UI_ALL, 0x00FFFFFF, T->dark ? (focus ? 70 : 50) : (focus ? 150 : 110));
         ui_rrect_line(x + 1, y + 1, w - 2, h - 2, R - 1, UI_ALL, 0x00FFFFFF, 30);
     }
 
@@ -934,11 +945,11 @@ static void paint_chrome(int n, int focus) {
         cap_rect(nd, b, &bx, &by, &bw, &bh);
         int glow = cap_glow(n, b);
         int pressed = press_key == KEY_CAP(n, b) && glow;
-        uint32_t fill = 0x00FFFFFF, gc = 0xFF000000 | T->title_text;
+        uint32_t fill = T->plate, gc = 0xFF000000 | T->title_text;
         int a = focus ? 110 : 70;
         a += glow * (focus ? 120 : 140) / 256;
         if (b == WB_CLOSE && glow) {
-            fill = ui_mix(0x00FFFFFF, 0x00E5484D, glow);
+            fill = ui_mix(T->plate, 0x00E5484D, glow);
             a = 120 + glow * 135 / 256;
             gc = 0xFF000000 | ui_mix(T->title_text, 0x00FFFFFF, glow);
         }
@@ -1416,6 +1427,7 @@ static void draw_gadget(void) {
 // drawing, the hit-testing and the hover all read it.
 
 static int start_open;                 // the launcher (defined further down)
+static int cc_open;                    // the control panel (likewise)
 
 #define ISL_BOTTOM 0
 #define ISL_LEFT   1
@@ -1558,6 +1570,7 @@ static uint64_t taskbar_fingerprint(void) {
     hsh = (hsh ^ (uint64_t)island_edge) * FNV_P;
     hsh = (hsh ^ (uint64_t)focused) * FNV_P;
     hsh = (hsh ^ (uint64_t)start_open) * FNV_P;
+    hsh = (hsh ^ (uint64_t)(cc_open + 2)) * FNV_P;
     hsh = (hsh ^ (uint64_t)(press_key + 7)) * FNV_P;
     hsh = (hsh ^ (uint64_t)TH->accent) * FNV_P;
     for (int i = 0; i < tb_n; i++) {
@@ -1681,6 +1694,12 @@ static int dow(int y, int m, int d) {          // 0 = Sunday
     return (y + y / 4 - y / 100 + y / 400 + t[(m - 1) % 12] + d) % 7;
 }
 
+// The accent as a colour for text and small marks on the glass: a shade
+// darker on the light theme's white, a shade lighter on the dark one's slate.
+static uint32_t accent_ink(const theme_t *T, int k) {
+    return T->dark ? ui_mix(T->accent, 0x00FFFFFF, k) : ui_mix(T->accent, 0, k);
+}
+
 // A program's name as a person reads it, for the name over its icon.
 static const char *program_label(const char *file) {
     static const struct { const char *f, *n; } names[] = {
@@ -1706,7 +1725,7 @@ static void draw_island_now(void) {
     ui_glass_forget(&isl_glass);
     ui_glass_take(&isl_glass, 0, 0);
     ui_glass_draw(&isl_glass, x, y, w, h, ISL_R, 0, 0, 0, 0, 0, 0,
-                  ui_mix(0x00FFFFFF, T->accent, 60), 120);
+                  ui_mix(T->frost, T->accent, 60), 120 + T->frost_a);
     ui_glass_rim(x, y, w, h, ISL_R);
 
     int hot = -1;
@@ -1719,7 +1738,7 @@ static void draw_island_now(void) {
         case TB_ORB: {
             int R = ISL_ICON / 2;
             if (start_open || glow)
-                ui_round_fill(it->x - 3, it->y - 3, ISL_ICON + 6, ISL_ICON + 6, R + 3, 0x00FFFFFF,
+                ui_round_fill(it->x - 3, it->y - 3, ISL_ICON + 6, ISL_ICON + 6, R + 3, T->plate,
                               start_open ? 200 : glow * 160 / 256);
             glyph_logo(it->x + R, it->y + R + (pressed ? 1 : 0), R - (pressed ? 1 : 0), T->accent);
             break;
@@ -1730,7 +1749,7 @@ static void draw_island_now(void) {
                 int a = active ? 150 : 0;
                 a += glow * 90 / 256;
                 if (a > 230) a = 230;
-                ui_round_fill(it->x + 1, it->y + 1, ISL_SLOT - 2, ISL_SLOT - 2, 16, 0x00FFFFFF, a);
+                ui_round_fill(it->x + 1, it->y + 1, ISL_SLOT - 2, ISL_SLOT - 2, 16, T->plate, a);
             }
             int ix = it->x + (ISL_SLOT - ISL_ICON) / 2, iy = it->y + (ISL_SLOT - ISL_ICON) / 2;
             if (pressed) iy++;
@@ -1743,7 +1762,7 @@ static void draw_island_now(void) {
             // Running: a dot by it -- a longer one for the window in front.
             if (it->nwin) {
                 int len = active ? 14 : 5;
-                uint32_t c = active ? T->accent : 0x00505A68;
+                uint32_t c = active ? T->accent : T->title_text_dim;
                 switch (island_edge) {
                 case ISL_BOTTOM: ui_round_fill(it->x + ISL_SLOT / 2 - len / 2, y + h - 7, len, 4, 2, c, 255); break;
                 case ISL_TOP:    ui_round_fill(it->x + ISL_SLOT / 2 - len / 2, y + 3, len, 4, 2, c, 255); break;
@@ -1754,8 +1773,8 @@ static void draw_island_now(void) {
             break;
         }
         case TB_STATUS: {
-            ui_round_fill(it->x, it->y, it->w, it->h, vertical ? 22 : it->h / 2, 0x00FFFFFF,
-                          110 + glow * 100 / 256);
+            ui_round_fill(it->x, it->y, it->w, it->h, vertical ? 22 : it->h / 2, T->plate,
+                          cc_open ? 235 : 110 + glow * 100 / 256);
             uint32_t ink = T->title_text, dim = T->title_text_dim;
             int up = net_is_up(), snd = audio_ready() > 0;
             char tm[6];
@@ -1802,7 +1821,7 @@ static void draw_island_now(void) {
         default:         lx = x - tw - 10; ly = it->y + ISL_SLOT / 2 - th / 2; break;
         }
         ui_shadow(lx, ly, tw, th, 15, 10, 50, 3, 0);
-        ui_round_fill(lx, ly, tw, th, 15, 0x00FFFFFF, 240);
+        ui_round_fill(lx, ly, tw, th, 15, T->plate, 240);
         ui_text(lx + 12, ly + (th - ui_line_h(UI_F13)) / 2, label, UI_F13, T->title_text);
     }
 }
@@ -1855,6 +1874,19 @@ static int sample_stats(void) {
     s_last = now;
 
     rtc_read(&wm_clock);
+
+    // Something new started playing: say what.
+    {
+        static char last_title[AUDIO_TITLE_MAX];
+        const char *t = audio_title();
+        if (t[0] && !str_same(t, last_title)) {
+            str_put(last_title, t, sizeof last_title);
+            wm_notify_glyph("Сейчас играет", t, G_MUSIC, 0x00E06A4C);
+        } else if (!t[0]) {
+            last_title[0] = 0;
+        }
+    }
+
     uint64_t total = pmm_total_frame_count(), freef = pmm_free_frame_count();
     int mem = total ? (int)((total - freef) * 100 / total) : 0;
     cur_cpu = (uint8_t)cpu; cur_mem = (uint8_t)mem;
@@ -2596,9 +2628,9 @@ static void prog_icon(const char *file, int x, int y, int s) {
     glyph_app(x, y, s, col, g);
 }
 
-static ukeep sm_keep;
-static ui_glass sm_glass;
-static int sm_glass_fresh;                 // its memory matches what is under
+static ukeep pop_keep;
+static ui_glass pop_glass;
+static int pop_glass_fresh;                 // its memory matches what is under
 
 static void sm_reach(int *rx, int *ry, int *rw, int *rh) {
     int x, y, w, h;
@@ -2615,18 +2647,18 @@ static void draw_start_menu(void) {
 
     ui_shadow(x, y, w, h, 24, 34, 80, 14, 0);
     ui_shadow(x, y, w, h, 24, 4, 34, 1, 0);
-    ui_glass_place(&sm_glass, x, y, w, h, 16);
-    if (!sm_glass_fresh) {
-        ui_glass_forget(&sm_glass);
-        ui_glass_take(&sm_glass, 0, 0);
-        sm_glass_fresh = 1;
+    ui_glass_place(&pop_glass, x, y, w, h, 16);
+    if (!pop_glass_fresh) {
+        ui_glass_forget(&pop_glass);
+        ui_glass_take(&pop_glass, 0, 0);
+        pop_glass_fresh = 1;
     }
-    ui_glass_draw(&sm_glass, x, y, w, h, 24, 0, 0, 0, 0, 0, 0,
-                  ui_mix(0x00FFFFFF, T->accent, 40), 165);
+    ui_glass_draw(&pop_glass, x, y, w, h, 24, 0, 0, 0, 0, 0, 0,
+                  ui_mix(T->frost, T->accent, 40), 165 + T->frost_a);
     ui_glass_rim(x, y, w, h, 24);
 
     // Search.
-    ui_round_fill(x + 24, y + 24, w - 48, 44, 22, 0x00FFFFFF, 235);
+    ui_round_fill(x + 24, y + 24, w - 48, 44, 22, T->plate, 235);
     glyph_draw(G_SEARCH, x + 40, y + 37, 18, 0xFF000000 | dim, 0);
     {
         int ty = y + 46 - ui_line_h(UI_F15) / 2;
@@ -2661,14 +2693,14 @@ static void draw_start_menu(void) {
                 lt[n] = 0;
                 if (lt[0] >= 'a' && lt[0] <= 'z') lt[0] = (char)(lt[0] - 32);
                 ui_text(lx + 14, yy + (rh - ui_line_h(UI_F13B)) / 2 + 2, lt, UI_F13B,
-                        ui_mix(T->accent, 0, 40));
+                        accent_ink(T, 40));
             } else {
                 const struct start_item *it = &start_items[sm_rows[r].item];
                 int glow = glow_of(KEY_SM(SMK_ROW, r));
                 int sel = (r == start_sel);
                 if (sel || glow) {
                     int a = (sel ? 150 : 0) + glow * 90 / 256;
-                    ui_round_fill(lx + 4, yy + 1, lw - 8, rh - 2, 12, 0x00FFFFFF, a > 230 ? 230 : a);
+                    ui_round_fill(lx + 4, yy + 1, lw - 8, rh - 2, 12, T->plate, a > 230 ? 230 : a);
                 }
                 prog_icon(it->name_file, lx + 12, yy + (rh - 30) / 2, 30);
                 ui_text_fit(lx + 54, yy + (rh - ui_line_h(UI_F13)) / 2, lw - 70, it->name, UI_F13, ink);
@@ -2684,7 +2716,7 @@ static void draw_start_menu(void) {
             int cx, cy;
             ln_cell(i, &cx, &cy);
             int glow = glow_of(KEY_SM(SMK_PIN, i));
-            if (glow) ui_round_fill(cx - 6, cy - 6, 92, 92, 18, 0x00FFFFFF, glow * 170 / 256);
+            if (glow) ui_round_fill(cx - 6, cy - 6, 92, 92, 18, T->plate, glow * 170 / 256);
             int pressed = press_key == KEY_SM(SMK_PIN, i) && glow;
             prog_icon(ln_pins[i], cx + 18, cy + 4 + (pressed ? 1 : 0), 44);
             const char *lbl = program_label(ln_pins[i]);
@@ -2705,7 +2737,7 @@ static void draw_start_menu(void) {
             int rx, ry, rw, rh;
             ln_recent_row(i, &rx, &ry, &rw, &rh);
             int glow = glow_of(KEY_SM(SMK_REC, i));
-            if (glow) ui_round_fill(rx, ry, rw, rh, 12, 0x00FFFFFF, glow * 150 / 256);
+            if (glow) ui_round_fill(rx, ry, rw, rh, 12, T->plate, glow * 150 / 256);
             const char *file = base_name(recents[i].path);
             prog_icon(file, rx + 12, ry + 7, 32);
             const char *title = recents[i].arg[0] ? base_name(recents[i].arg) : program_label(file);
@@ -2727,14 +2759,14 @@ static void draw_start_menu(void) {
         ln_all_link(&ax, &ay, &aw, &ah);
         const char *lbl = sm_all ? "Назад" : "Все программы";
         int glow = glow_of(KEY_SM(SMK_ALL, 0));
-        if (glow) ui_round_fill(ax, ay, aw, ah, 13, 0x00FFFFFF, glow * 160 / 256);
+        if (glow) ui_round_fill(ax, ay, aw, ah, 13, T->plate, glow * 160 / 256);
         int tw = ui_text_w(lbl, UI_F12);
         ui_text(ax + aw - 12 - tw, ay + (ah - ui_line_h(UI_F12)) / 2, lbl, UI_F12,
-                ui_mix(T->accent, 0, 50));
+                accent_ink(T, 50));
     }
 
     // Foot: you, the settings, the power.
-    ui_blend(x + 20, y + h - 64, w - 40, 1, 0x00000000, 22);
+    ui_blend(x + 20, y + h - 64, w - 40, 1, T->dark ? 0x00FFFFFF : 0x00000000, 22);
     {
         rast_path p;
         rast_path_init(&p);
@@ -2751,9 +2783,9 @@ static void draw_start_menu(void) {
         ln_foot_btn(i, &bx, &by);
         int glow = glow_of(KEY_SM(SMK_FOOT, i));
         int on = (i == 1 && sm_power_open);
-        ui_round_fill(bx, by, 36, 36, 18, on ? T->accent : 0x00FFFFFF, on ? 255 : 150 + glow * 90 / 256);
+        ui_round_fill(bx, by, 36, 36, 18, on ? T->accent : T->plate, on ? 255 : 150 + glow * 90 / 256);
         glyph_draw(i ? G_POWER : G_GEAR, bx + 8, by + 8, 20, 0xFF000000 | (on ? 0x00FFFFFF : ink),
-                   0xFF000000 | (on ? T->accent : 0x00FFFFFF));
+                   0xFF000000 | (on ? T->accent : T->plate));
     }
 
     // The power choice, over everything.
@@ -2762,7 +2794,7 @@ static void draw_start_menu(void) {
         sm_power_rect(0, &px, &py, &pw, &ph);
         int bh = POWER_ROWS * ph + 12, by0 = py - 6;
         ui_shadow(px, by0, pw, bh, 16, 16, 70, 5, 0);
-        ui_round_fill(px, by0, pw, bh, 16, 0x00FFFFFF, 245);
+        ui_round_fill(px, by0, pw, bh, 16, T->plate, 245);
         static const char *const pw_names[POWER_ROWS] = { "Перезагрузить", "Выключить" };
         for (int i = 0; i < POWER_ROWS; i++) {
             int rx, ry, rw, rh;
@@ -2774,6 +2806,444 @@ static void draw_start_menu(void) {
     }
 }
 
+
+// --- the control panel ------------------------------------------------------------
+//
+// It rises from the island's clock: switches for the network, quiet, the
+// dark theme and keeping this layout of windows; the volume; what is
+// playing; this month. Glass, like the launcher, and the two never show at
+// once -- they share the keeping of what is under them.
+
+#define CC_W 380
+#define CC_H 568
+static int dnd;                     // "do not disturb": notices are not shown
+static int cc_vol_drag;             // the volume knob is held
+
+static int popup_open(void) { return start_open || cc_open; }
+
+static void cc_geom(int *x, int *y, int *w, int *h) {
+    int W = (int)fb_get_width(), H = (int)fb_get_height();
+    tb_layout();
+    const struct tb_item *s = &tb_items[tb_n - 1];       // the status pill is last
+    *w = CC_W;
+    *h = CC_H;
+    if (*h > H - 2 * TASKBAR_H) *h = H - 2 * TASKBAR_H;
+    switch (island_edge) {
+    case ISL_LEFT:  *x = isl_x + isl_w + 14; *y = s->y + s->h - *h; break;
+    case ISL_RIGHT: *x = isl_x - 14 - *w;    *y = s->y + s->h - *h; break;
+    case ISL_TOP:   *x = s->x + s->w - *w;   *y = isl_y + isl_h + 14; break;
+    default:        *x = s->x + s->w - *w;   *y = isl_y - 14 - *h; break;
+    }
+    if (*x < 8) *x = 8;
+    if (*x + *w > W - 8) *x = W - 8 - *w;
+    if (*y < 8) *y = 8;
+    if (*y + *h > H - 8) *y = H - 8 - *h;
+}
+
+static void cc_toggle_rect(int i, int *tx, int *ty, int *tw, int *th) {
+    int x, y, w, h;
+    cc_geom(&x, &y, &w, &h);
+    *tx = x + 20 + (i % 2) * 174;
+    *ty = y + 20 + (i / 2) * 72;
+    *tw = 166;
+    *th = 62;
+}
+
+static void cc_vol_track(int *vx, int *vy, int *vw) {
+    int x, y, w, h;
+    cc_geom(&x, &y, &w, &h);
+    *vx = x + 60; *vy = y + 182 + 10; *vw = w - 84;
+}
+
+static void cc_player_rect(int *px, int *py, int *pw, int *ph) {
+    int x, y, w, h;
+    cc_geom(&x, &y, &w, &h);
+    *px = x + 20; *py = y + 230; *pw = w - 40; *ph = 86;
+}
+
+#define KEY_CC(k, a) (0x40000 | ((k) << 8) | (a))
+#define CCK_TOGGLE 1
+#define CCK_VOL    2
+#define CCK_PLAYER 3
+#define CCK_INSIDE 4
+
+static int cc_key_at(int mx, int my) {
+    int x, y, w, h;
+    cc_geom(&x, &y, &w, &h);
+    if (mx < x || my < y || mx >= x + w || my >= y + h) return -1;
+    for (int i = 0; i < 4; i++) {
+        int tx, ty, tw, th;
+        cc_toggle_rect(i, &tx, &ty, &tw, &th);
+        if (mx >= tx && mx < tx + tw && my >= ty && my < ty + th) return KEY_CC(CCK_TOGGLE, i);
+    }
+    int vx, vy, vw;
+    cc_vol_track(&vx, &vy, &vw);
+    if (mx >= vx - 12 && mx < vx + vw + 12 && my >= vy - 14 && my < vy + 26) return KEY_CC(CCK_VOL, 0);
+    int px, py, pw, ph;
+    cc_player_rect(&px, &py, &pw, &ph);
+    if (mx >= px && mx < px + pw && my >= py && my < py + ph) return KEY_CC(CCK_PLAYER, 0);
+    return KEY_CC(CCK_INSIDE, 0);
+}
+
+static void cc_set_volume_at(int mx) {
+    int vx, vy, vw;
+    cc_vol_track(&vx, &vy, &vw);
+    int v = (mx - vx) * 100 / (vw > 0 ? vw : 1);
+    if (v < 0) v = 0;
+    if (v > 100) v = 100;
+    audio_set_volume(v);
+    menu_dirty = 1;
+    dirty = 1;
+    tb_valid = 0;                    // the island's speaker shows it too
+}
+
+static const char *const month_names_ru[12] = {
+    "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
+    "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь" };
+
+static int days_in(int y, int m) {
+    static const int d[12] = { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+    if (m == 2 && ((y % 4 == 0 && y % 100 != 0) || y % 400 == 0)) return 29;
+    return d[(m + 11) % 12];
+}
+
+static void draw_control(void) {
+    if (!cc_open) return;
+    const theme_t *T = TH;
+    int x, y, w, h;
+    cc_geom(&x, &y, &w, &h);
+    uint32_t ink = T->title_text, dim = T->title_text_dim, acc = T->accent;
+
+    ui_shadow(x, y, w, h, 24, 34, 80, 14, 0);
+    ui_shadow(x, y, w, h, 24, 4, 34, 1, 0);
+    ui_glass_place(&pop_glass, x, y, w, h, 16);
+    if (!pop_glass_fresh) {
+        ui_glass_forget(&pop_glass);
+        ui_glass_take(&pop_glass, 0, 0);
+        pop_glass_fresh = 1;
+    }
+    ui_glass_draw(&pop_glass, x, y, w, h, 24, 0, 0, 0, 0, 0, 0, ui_mix(T->frost, acc, 40), 165 + T->frost_a);
+    ui_glass_rim(x, y, w, h, 24);
+
+    // The switches.
+    static const char *const names[4] = { "Сеть", "Не беспокоить", "Тёмная тема", "Раскладка" };
+    static const int glyphs[4] = { G_WIFI, G_BELL, G_MOON, G_SAVE };
+    int on[4] = { net_is_up(), dnd, TH->dark, 0 };
+    const char *sub[4] = { on[0] ? "Подключено" : "Нет сети", dnd ? "Вкл." : "Выкл.",
+                           TH->dark ? "Вкл." : "Выкл.", "Сохранить стол" };
+    for (int i = 0; i < 4; i++) {
+        int tx, ty, tw, th;
+        cc_toggle_rect(i, &tx, &ty, &tw, &th);
+        int glow = glow_of(KEY_CC(CCK_TOGGLE, i));
+        uint32_t bg = on[i] ? acc : T->plate;
+        ui_round_fill(tx, ty, tw, th, 18, on[i] ? ui_mix(acc, 0xFFFFFF, glow * 40 / 256) : bg,
+                      on[i] ? 255 : 170 + glow * 70 / 256);
+        uint32_t chip = on[i] ? ui_mix(acc, 0x00FFFFFF, 70) : ui_mix(T->plate, acc, 40);
+        ui_round_fill(tx + 10, ty + 13, 36, 36, 18, chip, 255);
+        glyph_draw(glyphs[i], tx + 18, ty + 21, 20, on[i] ? 0xFFFFFFFF : (0xFF000000 | accent_ink(T, 60)),
+                   0xFF000000 | chip);
+        ui_text(tx + 54, ty + 12, names[i], UI_F13B, on[i] ? 0x00FFFFFF : ink);
+        ui_text(tx + 54, ty + 32, sub[i], UI_F11, on[i] ? 0x00EEF4FF : dim);
+    }
+
+    // The volume.
+    {
+        int vx, vy, vw;
+        cc_vol_track(&vx, &vy, &vw);
+        int snd = audio_ready() > 0, v = audio_volume();
+        glyph_draw(G_VOL, x + 26, vy - 4, 20, 0xFF000000 | (snd ? ink : dim), 0);
+        ui_round_fill(vx, vy, vw, 12, 6, T->plate, 170);
+        ui_round_fill(vx, vy, vw * v / 100 + 6, 12, 6, acc, 255);
+        int kx = vx + vw * v / 100 - 11;
+        int glow = glow_of(KEY_CC(CCK_VOL, 0));
+        ui_shadow(kx, vy - 5, 22, 22, 11, 6, 50, 2, 0);
+        ui_round_fill(kx, vy - 5, 22, 22, 11, 0x00FFFFFF, 255);
+        if (glow || cc_vol_drag) ui_round_fill(kx + 6, vy + 1, 10, 10, 5, acc, cc_vol_drag ? 255 : glow);
+    }
+
+    // What is playing.
+    {
+        int px, py, pw, ph;
+        cc_player_rect(&px, &py, &pw, &ph);
+        int glow = glow_of(KEY_CC(CCK_PLAYER, 0));
+        ui_round_fill(px, py, pw, ph, 18, T->plate, 170 + glow * 60 / 256);
+        ui_round_grad(px + 12, py + 12, 62, 62, 14, UI_ALL, 0x00F4A38C, 255, 0x00C0508F, 255);
+        glyph_draw(G_MUSIC, px + 29, py + 29, 28, 0xE0FFFFFF, 0);
+        const char *t = audio_title();
+        ui_text_fit(px + 88, py + 18, pw - 100, t[0] ? t : "Ничего не играет", UI_F15B, ink);
+        ui_text(px + 88, py + 42, t[0] ? "Музыка · играет" : "Музыка", UI_F12, dim);
+    }
+
+    // The month.
+    {
+        int cy = y + 332, ch = h - 352;
+        ui_round_fill(x + 20, cy, w - 40, ch, 18, T->plate, 170);
+        char title[32];
+        int q = 0;
+        const char *mn = month_names_ru[(wm_clock.mon + 11) % 12];
+        while (*mn) title[q++] = *mn++;
+        title[q++] = ' ';
+        q += u2s(title + q, (unsigned)wm_clock.year);
+        title[q] = 0;
+        ui_text(x + 36, cy + 14, title, UI_F15B, ink);
+        static const char *const wd[7] = { "Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс" };
+        for (int i = 0; i < 7; i++) {
+            int tw = ui_text_w(wd[i], UI_F11);
+            ui_text(x + 36 + i * 44 + 14 - tw / 2, cy + 46, wd[i], UI_F11, dim);
+        }
+        int first = (dow(wm_clock.year, wm_clock.mon, 1) + 6) % 7;   // Monday = 0
+        int nd = days_in(wm_clock.year, wm_clock.mon);
+        for (int d = 1; d <= nd; d++) {
+            int cell = first + d - 1, col = cell % 7, row = cell / 7;
+            int dx = x + 36 + col * 44 + 14, dy = cy + 72 + row * 28;
+            if (dy > cy + ch - 24) break;
+            char b[3];
+            int bl = u2s(b, (unsigned)d);
+            b[bl] = 0;
+            if (d == wm_clock.day) ui_round_fill(dx - 14, dy - 4, 28, 26, 13, acc, 255);
+            int tw = ui_text_w(b, UI_F12);
+            ui_text(dx - tw / 2, dy, b, UI_F12, d == wm_clock.day ? 0x00FFFFFF : (col >= 5 ? dim : ink));
+        }
+    }
+}
+
+// --- notices ------------------------------------------------------------------------
+//
+// A card of glass in the corner -- what is playing now, a layout kept, a
+// program's word -- that comes in, stays a few seconds and goes. One at a
+// time; a newer one waits its turn.
+
+#define NOTE_MAX  4
+#define NOTE_SHOW 5000
+#define NOTE_FADE 260
+static struct { char title[48]; char text[96]; int g; uint32_t col; } notes[NOTE_MAX];
+static int note_n;
+static uint64_t note_t0;            // when the first one in the queue came up
+static int note_drawn;              // a notice was on the screen last frame
+static ukeep note_keep;
+static ui_glass note_glass;
+
+void wm_notify_glyph(const char *title, const char *text, int g, uint32_t col) {
+    if (dnd) return;
+    if (note_n >= NOTE_MAX) return;
+    str_put(notes[note_n].title, title, sizeof notes[0].title);
+    str_put(notes[note_n].text, text ? text : "", sizeof notes[0].text);
+    notes[note_n].g = g;
+    notes[note_n].col = col;
+    if (note_n == 0) note_t0 = now_ms();
+    note_n++;
+    dirty = 1;
+}
+
+void wm_notify(const char *title, const char *text) {
+    wm_notify_glyph(title, text, G_BELL, 0x003C7FD8);
+}
+
+static void note_geom(int *x, int *y, int *w, int *h) {
+    *w = 380; *h = 86;
+    *x = (int)fb_get_width() - *w - 24;
+    *y = island_edge == ISL_TOP ? TASKBAR_H + 10 : 24;
+    if (island_edge == ISL_RIGHT) *x -= TASKBAR_H - 10;
+}
+
+// How far in the first notice is: 0..256, or -1 when it is done.
+static int note_alpha(void) {
+    if (!note_n) return -1;
+    uint64_t t = now_ms() - note_t0;
+    if (t < NOTE_FADE) return (int)(t * 256 / NOTE_FADE);
+    if (t < NOTE_SHOW) return 256;
+    if (t < NOTE_SHOW + NOTE_FADE) return 256 - (int)((t - NOTE_SHOW) * 256 / NOTE_FADE);
+    return -1;
+}
+
+static int note_animating(void) {
+    if (!note_n) return 0;
+    uint64_t t = now_ms() - note_t0;
+    return t < NOTE_FADE || t >= NOTE_SHOW;
+}
+
+static void note_next(void) {
+    for (int i = 1; i < note_n; i++) notes[i - 1] = notes[i];
+    note_n--;
+    note_t0 = now_ms();
+}
+
+static void draw_note(void) {
+    int x, y, w, h;
+    note_geom(&x, &y, &w, &h);
+    int rx = x - 40, ry = y - 30, rw = w + 80, rh = h + 80;
+    int a = note_alpha();
+    if (a < 0 && note_n) { note_next(); a = note_alpha(); }
+    if (a < 0 && !note_drawn) return;
+    if (!note_animating() && note_drawn && a >= 0 && !dmg_meets(rx, ry, rw, rh)) return;
+
+    uk_place(&note_keep, rx, ry, rw, rh);
+    uk_take(&note_keep);
+    uk_restore(&note_keep);
+    if (a < 0) { note_drawn = 0; dmg_add(rx, ry, rx + rw, ry + rh); return; }
+
+    const theme_t *T = TH;
+    ui_shadow(x, y, w, h, 20, 26, 70, 10, 0);
+    ui_glass_place(&note_glass, x, y, w, h, 16);
+    ui_glass_forget(&note_glass);
+    ui_glass_take(&note_glass, 0, 0);
+    ui_glass_draw(&note_glass, x, y, w, h, 20, 0, 0, 0, 0, 0, 0, ui_mix(T->frost, T->accent, 40),
+                  170 + T->frost_a);
+    ui_glass_rim(x, y, w, h, 20);
+    glyph_app(x + 18, y + 20, 44, notes[0].col, notes[0].g);
+    ui_text_fit(x + 76, y + 18, w - 100, notes[0].title, UI_F13B, T->title_text);
+    ui_text_fit(x + 76, y + 40, w - 100, notes[0].text, UI_F13, T->title_text_dim);
+
+    // Fading: the card blended with what it covers.
+    if (a < 256) {
+        volatile uint8_t *base = fb_get_base();
+        uint32_t pitch = fb_get_pitch();
+        for (int j = 0; j < note_keep.h; j++) {
+            uint32_t *d = (uint32_t *)(base + (size_t)(note_keep.y + j) * pitch) + note_keep.x;
+            const uint32_t *k = note_keep.px + (size_t)j * note_keep.w;
+            for (int i = 0; i < note_keep.w; i++) d[i] = ui_mix(k[i], d[i], a);
+        }
+    }
+    fb_mark_rect((uint32_t)note_keep.x, (uint32_t)note_keep.y, (uint32_t)note_keep.w, (uint32_t)note_keep.h);
+    note_drawn = 1;
+    dmg_add(rx, ry, rx + rw, ry + rh);
+}
+
+static int note_hit(int mx, int my) {
+    if (!note_n) return 0;
+    int x, y, w, h;
+    note_geom(&x, &y, &w, &h);
+    return mx >= x && mx < x + w && my >= y && my < y + h;
+}
+
+// --- keeping the layout of windows ----------------------------------------------------
+//
+// "Keep this layout": which programs have windows, with what in them, where
+// and how big -- written to /home/.layout, and opened again just so when the
+// desktop next starts.
+
+#define LAYOUT_FILE "/home/.layout"
+
+static int layout_save(void) {
+    static char buf[4096];
+    int n = 0;
+    int win[MAX_NODES];
+    int nw = collect_windows(cur_ws, win, MAX_NODES);
+    for (int i = 0; i < nw && n < (int)sizeof buf - 300; i++) {
+        const struct wm_node *nd = &nodes[win[i]];
+        if (nd->state == WIN_MIN) continue;
+        // path|arg|x|y|w|h|maximised
+        const char *p = nd->path[0] ? nd->path : "-";
+        for (int k = 0; p[k]; k++) buf[n++] = p[k];
+        buf[n++] = '|';
+        for (int k = 0; nd->arg[k] && k < 95; k++) buf[n++] = nd->arg[k];
+        buf[n++] = '|';
+        uint32_t v[5] = { nd->state == WIN_MAX ? nd->sx : nd->x, nd->state == WIN_MAX ? nd->sy : nd->y,
+                          nd->state == WIN_MAX ? nd->sw : nd->w, nd->state == WIN_MAX ? nd->sh : nd->h,
+                          nd->state == WIN_MAX };
+        for (int k = 0; k < 5; k++) {
+            n += u2s(buf + n, v[k]);
+            buf[n++] = k < 4 ? '|' : '\n';
+        }
+    }
+    vfs_unlink(LAYOUT_FILE);
+    if (vfs_create(LAYOUT_FILE) != 0) return 0;
+    int fd = vfs_open(LAYOUT_FILE);
+    if (fd < 0) return 0;
+    int ok = vfs_write(fd, buf, (uint32_t)n) == n;
+    vfs_close(fd);
+    return ok;
+}
+
+static int new_window_run(const char *path, const char *arg);
+static void toggle_maximize(void);
+static void restore_window(int n);
+
+// Returns how many windows it opened.
+static int layout_restore(void) {
+    static char buf[4096];
+    int opened = 0;
+    int fd = vfs_open(LAYOUT_FILE);
+    if (fd < 0) return 0;
+    int n = vfs_read(fd, buf, sizeof buf - 1);
+    vfs_close(fd);
+    if (n <= 0) return 0;
+    buf[n] = 0;
+    char *line = buf;
+    while (*line) {
+        char *end = line;
+        while (*end && *end != '\n') end++;
+        char save = *end;
+        *end = 0;
+        // Split on '|' into seven fields.
+        char *f[7];
+        int k = 0;
+        f[k++] = line;
+        for (char *c = line; *c && k < 7; c++) if (*c == '|') { *c = 0; f[k++] = c + 1; }
+        if (k == 7) {
+            uint32_t v[5];
+            for (int j = 0; j < 5; j++) {
+                v[j] = 0;
+                for (char *c = f[2 + j]; *c >= '0' && *c <= '9'; c++) v[j] = v[j] * 10 + (uint32_t)(*c - '0');
+            }
+            int pid = new_window_run(f[0][0] == '-' ? 0 : f[0], f[1][0] ? f[1] : 0);
+            if (pid > 0) opened++;
+            if (pid > 0 && focused >= 0) {
+                struct wm_node *nd = &nodes[focused];
+                nd->x = v[0]; nd->y = v[1]; nd->w = v[2]; nd->h = v[3];
+                if (v[4]) toggle_maximize();
+                layout_window(focused);
+            }
+        }
+        *end = save;
+        line = *end ? end + 1 : end;
+    }
+    relayout();
+    return opened;
+}
+
+// A click inside the open control panel.
+static void cc_click(int key) {
+    int kind = (key >> 8) & 0xFF, arg = key & 0xFF;
+    switch (kind) {
+    case CCK_TOGGLE:
+        if (arg == 0) {
+            cc_open = 0;
+            wp_dirty = 1;
+            new_window_run("/bin/netlog", 0);
+        } else if (arg == 1) {
+            dnd = !dnd;
+        } else if (arg == 2) {
+            wm_theme_set(theme == 0 ? 1 : 0);
+        } else {
+            if (layout_save())
+                wm_notify_glyph("Раскладка сохранена", "Окна откроются так же при следующем запуске.",
+                                G_SAVE, TH->accent);
+            else
+                wm_notify_glyph("Не удалось сохранить", "Нет места в /home или диск только для чтения.",
+                                G_SAVE, 0x00C24A2F);
+        }
+        menu_dirty = 1;
+        dirty = 1;
+        tb_valid = 0;
+        break;
+    case CCK_PLAYER: {
+        // To the player's window, or start it.
+        int target = -1;
+        for (int i = 0; i < MAX_NODES; i++)
+            if (nodes[i].used && str_same(pane_title(&panes[nodes[i].pane_idx]), "play")) target = i;
+        cc_open = 0;
+        wp_dirty = 1;
+        if (target >= 0) restore_window(target);
+        else new_window_run("/bin/play", 0);
+        refresh_leaves();
+        dirty = 1;
+        break;
+    }
+    default:
+        break;
+    }
+}
 
 static void draw_alttab(void) {
     if (!alttab_active) return;
@@ -3317,7 +3787,7 @@ static int windows_changed(void) {
 
 static void render_all(void) {
     uint64_t t0 = pf_on ? rdtsc() : 0, t1, t2, t3, t4;
-    if (sample_stats() && start_open) menu_dirty = 1;   // the live tiles moved on
+    if (sample_stats() && popup_open()) menu_dirty = 1;   // the clock moved on
     cursor_restore();   // put back what the arrow covered last frame, first
     outline_hide();     // and the drag outline, which sits under the arrow
     // Kernel logging draws straight into the back buffer, and a wallpaper
@@ -3326,31 +3796,37 @@ static void render_all(void) {
     if (fb_console_wrote()) wp_dirty = 1;
     if (overlay_needs_repaint()) wp_dirty = 1;   // see the note above
 
-    // Only the menu changed -- a hover, a key, a tile ticking over: put back
-    // what it covered and draw it again. Nothing under it is touched.
-    if (start_open && !wp_dirty && sm_keep.have && !monitor_on && !anim.active &&
+    // Only the open menu or panel changed -- a hover, a key, the clock: put
+    // back what it covered and draw it again. Nothing under it is touched.
+    if (popup_open() && !wp_dirty && pop_keep.have && !monitor_on && !anim.active &&
         !windows_changed()) {
         ndmg = 0;
         dmg_all = 0;
         if (draw_taskbar()) {
-            // The island was drawn again, and part of it is under the menu:
-            // that part of what the menu keeps is out of date.
+            // The island was drawn again, and part of it is under the popup:
+            // that part of what the popup keeps is out of date.
             int rx, ry, rw, rh;
             island_reach(&rx, &ry, &rw, &rh);
-            uk_copy_in(&sm_keep, rx, ry, rx + rw, ry + rh);
-            sm_glass_fresh = 0;
+            uk_copy_in(&pop_keep, rx, ry, rx + rw, ry + rh);
+            pop_glass_fresh = 0;
             menu_dirty = 1;
         }
-        if (menu_dirty) { uk_restore(&sm_keep); draw_start_menu(); }
+        if (menu_dirty) {
+            uk_restore(&pop_keep);
+            draw_start_menu();
+            draw_control();
+            dmg_add(pop_keep.x, pop_keep.y, pop_keep.x + pop_keep.w, pop_keep.y + pop_keep.h);
+        }
         menu_dirty = 0;
+        draw_note();
         outline_show();
         cursor_draw();
         fb_present();
         return;
     }
-    // Anything else under an open menu: rebuild the frame clean, so what the
-    // menu saves of it is the desktop and not an old copy of itself.
-    if (start_open) wp_dirty = 1;
+    // Anything else under an open popup: rebuild the frame clean, so what the
+    // popup saves of it is the desktop and not an old copy of itself.
+    if (popup_open()) wp_dirty = 1;
     if (wp_dirty) { invalidate_pane_cache(); tb_valid = 0; }
     int full = wp_dirty;
     ndmg = 0;                 // nothing painted yet this frame
@@ -3363,17 +3839,21 @@ static void render_all(void) {
     draw_snap_preview();
     draw_alttab();
     draw_taskbar();
-    if (start_open) {
+    if (popup_open()) {
         int rx, ry, rw, rh;
-        sm_reach(&rx, &ry, &rw, &rh);
-        uk_place(&sm_keep, rx, ry, rw, rh);
-        uk_take(&sm_keep);
-        sm_glass_fresh = 0;
+        if (start_open) sm_reach(&rx, &ry, &rw, &rh);
+        else { int x, y, w, h; cc_geom(&x, &y, &w, &h); rx = x - 40; ry = y - 40; rw = w + 80; rh = h + 80; }
+        uk_place(&pop_keep, rx, ry, rw, rh);
+        uk_take(&pop_keep);
+        pop_glass_fresh = 0;
         draw_start_menu();
+        draw_control();
+        dmg_add(rx, ry, rx + rw, ry + rh);
         menu_dirty = 0;
     } else {
-        sm_keep.have = 0;
+        pop_keep.have = 0;
     }
+    draw_note();          // a notice in the corner, over everything but the modal box
     anim_frame();         // a window on its way in or out, over the finished frame
     draw_drag_ghost();    // follows the cursor, above the windows
     draw_message_box();   // above everything: it is modal
@@ -3615,6 +4095,8 @@ static int new_window_run(const char *path, const char *arg) {
     pane_init(&panes[pi], icols(nd->w), irows(nd->h));
     layout_window(n);
     wp_dirty = 1;
+    str_put(nd->path, path ? path : "", sizeof nd->path);
+    str_put(nd->arg, arg ? arg : "", sizeof nd->arg);
     if (path) {
         panes[pi].app_pane = 1;
         spawn_prog_in(pi, path, arg);
@@ -3884,7 +4366,7 @@ static int edge_cursor(int edge) {
 static int cursor_pick(int mx, int my) {
     if (busy_active()) return CUR_APPSTART;
     if (drag_mode == DRAG_RESIZE) return edge_cursor(drag_edge);
-    if (drag_mode != DRAG_NONE || start_open || wm_message_pending() || udrag_active)
+    if (drag_mode != DRAG_NONE || popup_open() || wm_message_pending() || udrag_active)
         return CUR_ARROW;
     if (my >= (int)fb_get_height() - TASKBAR_H) return CUR_ARROW;
     int n = window_at(mx, my);
@@ -4041,7 +4523,7 @@ void wm_pane_interior(struct pane *p, int *w, int *h) {
 static int present_pane_only(int n) {
     if (n < 0 || !nodes[n].used) return 0;
     if (nodes[n].ws != cur_ws || nodes[n].state == WIN_MIN) return 0;
-    if (start_open || alttab_active || monitor_on || udrag_active) return 0;
+    if (popup_open() || alttab_active || monitor_on || udrag_active) return 0;
     // Animating, the window is not where it will be.
     if (anim.active) return 0;
     // A program painting its own window would erase the strips without
@@ -4247,12 +4729,14 @@ static void push_binding(int code) {
 #define WMB_START     0xC0   /* open or close the start menu */
 
 static void start_toggle(void) {
+    cc_open = 0;
+    cc_vol_drag = 0;
     start_open = !start_open;
     start_qlen = 0;
     start_q[0] = 0;
     sm_power_open = 0;
     sm_all = 0;
-    sm_glass_fresh = 0;
+    pop_glass_fresh = 0;
     if (start_open) {
         start_build();
         sm_build_rows();
@@ -4351,9 +4835,18 @@ static void taskbar_click(int mx, int my) {
     if (i < 0) return;
     const struct tb_item *it = &tb_items[i];
     if (it->kind != TB_ORB) start_close();   // anything else on the island closes it
+    if (it->kind != TB_STATUS && cc_open) { cc_open = 0; wp_dirty = 1; }
     switch (it->kind) {
     case TB_ORB:
         start_toggle();
+        break;
+    case TB_STATUS:
+        // The clock opens the control panel, and closes it again.
+        cc_open = !cc_open;
+        cc_vol_drag = 0;
+        pop_glass_fresh = 0;
+        wp_dirty = 1;
+        dirty = 1;
         break;
     case TB_APP: {
         int n = it->win;
@@ -4447,6 +4940,9 @@ static void handle_mouse(const struct mouse_event *me) {
         } else if (start_open) {
             key = sm_key_at(mx, my);
             if (key == KEY_SM(SMK_INSIDE, 0)) key = -1;
+        } else if (cc_open) {
+            key = cc_key_at(mx, my);
+            if (key == KEY_CC(CCK_INSIDE, 0)) key = -1;
         } else {
             int n = window_at(mx, my);
             if (n >= 0) {
@@ -4455,6 +4951,24 @@ static void handle_mouse(const struct mouse_event *me) {
             }
         }
         if (hover_to(key)) { dirty = 1; menu_dirty = 1; }
+    }
+
+    // The volume knob follows the pointer while it is held.
+    if (cc_open && cc_vol_drag) {
+        if (me->buttons & MOUSE_LEFT) cc_set_volume_at(mx);
+        if (me->released & MOUSE_LEFT) { cc_vol_drag = 0; menu_dirty = 1; dirty = 1; }
+        return;
+    }
+    // The wheel over the panel turns the volume up and down.
+    if (cc_open && me->wheel && !on_taskbar) {
+        if (cc_key_at(mx, my) >= 0) {
+            int v = audio_volume() + (me->wheel > 0 ? 5 : -5);
+            audio_set_volume(v < 0 ? 0 : v > 100 ? 100 : v);
+            menu_dirty = 1;
+            dirty = 1;
+            tb_valid = 0;
+        }
+        return;
     }
 
     // The wheel scrolls the menu's list, three rows a notch.
@@ -4474,7 +4988,7 @@ static void handle_mouse(const struct mouse_event *me) {
     // Pointer motion and wheel over the focused window's interior belong to
     // the program, not to the WM. Button transitions fall through below --
     // those may start a drag or hit window chrome first.
-    if (drag_mode == DRAG_NONE && !on_taskbar && !start_open && !me->pressed && !me->released) {
+    if (drag_mode == DRAG_NONE && !on_taskbar && !popup_open() && !me->pressed && !me->released) {
         int n = window_at(mx, my);
         if (n >= 0 && n == focused && hit_test(n, mx, my) == HIT_CLIENT)
             pane_push_mouse(n, me);
@@ -4547,11 +5061,25 @@ static void handle_mouse(const struct mouse_event *me) {
         // The start menu is modal for the pointer: a press inside arms what
         // it is on (it fires on release, over the same thing), a press
         // anywhere else dismisses it.
+        // A notice: a click puts it away.
+        if (note_hit(mx, my)) { note_t0 = now_ms() - NOTE_SHOW; dirty = 1; return; }
+
         if (start_open && !on_taskbar) {
             int key = sm_key_at(mx, my);
             if (key < 0) { start_close(); return; }
             press_key = key;
             press_win = -3;
+            menu_dirty = 1;
+            return;
+        }
+        // The control panel: the volume is taken hold of at once; anything
+        // else fires on release, over the same thing. Outside, it closes.
+        if (cc_open && !on_taskbar) {
+            int key = cc_key_at(mx, my);
+            if (key < 0) { cc_open = 0; wp_dirty = 1; dirty = 1; return; }
+            if (key == KEY_CC(CCK_VOL, 0)) { cc_vol_drag = 1; cc_set_volume_at(mx); return; }
+            press_key = key;
+            press_win = -4;
             menu_dirty = 1;
             return;
         }
@@ -4646,6 +5174,12 @@ static void handle_mouse(const struct mouse_event *me) {
         }
         if (press_win == -3) {
             if (start_open && sm_key_at(mx, my) == was_key) start_click(was_key);
+            press_win = -1;
+            menu_dirty = 1;
+            return;
+        }
+        if (press_win == -4) {
+            if (cc_open && cc_key_at(mx, my) == was_key) cc_click(was_key);
             press_win = -1;
             menu_dirty = 1;
             return;
@@ -4828,6 +5362,9 @@ void wm_route_input(void) {
         // Ctrl+Esc opens the start menu, as it has on every Windows since 3.1.
         // Opening reads /bin from the disk, so it waits for wm_poll.
         if (ev.code == KEY_ESC && ctrl) { push_binding(WMB_START); continue; }
+
+        // The control panel takes Escape to close and nothing else.
+        if (cc_open && ev.code == KEY_ESC) { cc_open = 0; wp_dirty = 1; dirty = 1; continue; }
 
         // While the menu is up it owns the keyboard: no program should
         // receive the letters someone is typing into a search box. Each key
@@ -5062,6 +5599,7 @@ void wm_poll(void) {
     // A glow still fading in or out wants its next step drawn.
     if (hover_animating()) dirty = 1;
     if (anim.active) dirty = 1;                 // the next step of a window's way
+    if (note_animating()) dirty = 1;            // a notice coming or going
     // The spinning pointer turns a step every 60 ms, and turns back into the
     // arrow when its time is up.
     {
@@ -5124,5 +5662,6 @@ void wm_start(void) {
 
     started = 1;
     dirty = 1;
-    new_window();          // the first window, holding the first shell
+    // The windows kept with "keep this layout", or else a first shell.
+    if (!layout_restore()) new_window();
 }

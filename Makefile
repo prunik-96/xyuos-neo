@@ -69,7 +69,7 @@ LIBC_C_PROGS    := files note view taskmgr play hello_c fstest spin parent keywa
                    ls cat echo wc grep head tail sort uniq tee hexdump \
                    cp mv touch stat ps free uname sleep kill loop bigfile yes count crash \
                    plasma devmgr control web ftest netlog memtest vmtest thrtest \
-                   sigtest sigchild shmtest shmchild partest
+                   sigtest sigchild shmtest shmchild partest notify
 LIBC_CXX_PROGS  := hello_cpp cpptest
 # Built on libtext (see "the text stack" below).
 TEXT_PROGS      := texttest fonts

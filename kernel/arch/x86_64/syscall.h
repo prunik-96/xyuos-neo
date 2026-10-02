@@ -96,6 +96,7 @@
 //   DETACH  a2 = address          -> 0 / -1
 //   CTL     a2 = id, a3 = cmd     -> 0 / -1
 //   SIZE    a2 = id               -> bytes, or 0
+#define SYS_NOTIFY    50  // a notice on the desktop: a1 = title, a2 = text
 #define SYS_SHM       49
 #define SHMOP_GET     0
 #define SHMOP_ATTACH  1

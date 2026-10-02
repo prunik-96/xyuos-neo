@@ -139,6 +139,9 @@ int  audio_volume(int pct);          /* pct < 0 just reads it back */
 /* Say what is playing, for the desktop to show (NULL: nothing). */
 void audio_title(const char *title);
 
+/* A notice in the corner of the desktop for a few seconds. 0 or -1. */
+int notify(const char *title, const char *text);
+
 /* Run a program in a NEW desktop window, with an optional single argument.
  * Returns the child's pid, or -1.
  *
