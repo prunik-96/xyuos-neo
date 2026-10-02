@@ -4,6 +4,7 @@
 #include "smp.h"
 #include "../../kernel/process.h"
 #include "../../drivers/xhci.h"
+#include "../../wm/splash.h"
 #include "pic.h"
 #include "../../include/port_io.h"
 
@@ -80,6 +81,8 @@ static void pit_irq_handler(struct interrupt_frame *frame) {
     // Advance a PC-speaker melody, if the machine has no HDA codec and one is
     // playing. A no-op otherwise.
     audio_tick();
+    // The boot screen's running light, while it is up.
+    splash_tick();
 }
 
 void pit_init(uint32_t frequency_hz) {

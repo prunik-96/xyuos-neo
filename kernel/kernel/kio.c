@@ -1,6 +1,7 @@
 #include "kio.h"
 #include "../drivers/serial.h"
 #include "../drivers/framebuffer.h"
+#include "../wm/splash.h"
 #include <stdarg.h>
 #include <stdint.h>
 
@@ -21,6 +22,7 @@ static void out_char(char c) {
     fb_putc(c);
     klog[klog_head % KLOG_SIZE] = c;
     klog_head++;
+    splash_poll();        // a key during boot asked for this log: show it
 }
 
 static void out_str(const char *s) {

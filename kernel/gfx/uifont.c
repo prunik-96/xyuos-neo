@@ -113,6 +113,7 @@ static int build_face(struct ui_face *F, const stbtt_fontinfo *info, int px) {
 }
 
 int uifont_init(void) {
+    if (ui_fonts_ready) return 1;       // the boot screen got there first
     static const char *files[2] = {
         "/fonts/NotoSans-Regular.ttf", "/fonts/NotoSans-Bold.ttf",
     };

@@ -22,6 +22,7 @@
 #include "wall.h"
 #include "cursor.h"
 #include "glyphs.h"
+#include "splash.h"
 
 static inline uint64_t rdtsc(void) {
     uint32_t lo, hi;
@@ -4691,6 +4692,9 @@ static int windows_changed(void) {
     return 0;
 }
 
+static uint32_t *boot_px;       // the boot screen's picture, while it fades
+static void boot_fade(void);
+
 static void render_all(void) {
     uint64_t t0 = pf_on ? rdtsc() : 0, t1, t2, t3, t4;
     last_frame_ms = now_ms();
@@ -4769,6 +4773,7 @@ static void render_all(void) {
     anim_frame();         // a window on its way in or out, over the finished frame
     draw_drag_ghost();    // follows the cursor, above the windows
     draw_message_box();   // above everything: it is modal
+    boot_fade();          // the boot screen going, over the first frames
     outline_show();     // the drag outline, above the windows it will land on
     cursor_draw();      // last, so the pointer floats above everything
     t3 = pf_on ? rdtsc() : 0;
@@ -6492,6 +6497,9 @@ static void wm_benchmark(void) {
 }
 
 void wm_route_input(void) {
+    // Before the desktop is up the keys stay where they are: the boot screen
+    // looks at them (a key shows the log), and wm_start throws the rest away.
+    if (!started) return;
     struct kbd_event ev;
     while (keyboard_poll_event(&ev)) {
         // Key-up, and the modifier keys as keys, exist for programs that track
@@ -6707,7 +6715,7 @@ int wm_lang(void) { return lang; }
 // slide show.
 int wm_wants_frame(void) {
     if (!started || screen_asleep) return 0;
-    if (!anim.active && !pop_animating() && !note_animating()) return 0;
+    if (!anim.active && !pop_animating() && !note_animating() && !boot_px) return 0;
     return now_ms() - last_frame_ms >= 8;
 }
 
@@ -6761,7 +6769,9 @@ void wm_poll(void) {
     // then) holds the processor longer than the sound ring lasts.
     {
         static int greeted;
-        if (!greeted && last_frame_ms && now_ms() - last_frame_ms > 100) {
+        static uint64_t first;
+        if (!first && last_frame_ms) first = now_ms();
+        if (!greeted && first && now_ms() - first > 150) {
             greeted = 1;
             sound_play(SND_STARTUP);
         }
@@ -6853,7 +6863,31 @@ void wm_poll(void) {
     }
 }
 
+// The boot screen, faded out over the desktop's first frames.
+static uint64_t boot_t0;
+#define BOOT_FADE_MS 450
+
+static void boot_fade(void) {
+    if (!boot_px) return;
+    uint64_t now = now_ms();
+    if (!boot_t0) boot_t0 = now;
+    uint64_t el = now - boot_t0;
+    if (el >= BOOT_FADE_MS) {
+        kfree(boot_px);
+        boot_px = 0;
+        return;
+    }
+    int t = (int)(el * 256 / BOOT_FADE_MS);
+    int e = 256 - (((256 - t) * (256 - t)) >> 8);       // ease out
+    int W = (int)fb_get_width(), H = (int)fb_get_height();
+    px_mix(bb_at(0, 0), bb_stride(), boot_px, W, W, H, e);
+    fb_mark_rows(0, (uint32_t)H);
+    wp_dirty = 1;      // the back buffer is a mixture now: the next frame starts clean
+    dirty = 1;
+}
+
 void wm_start(void) {
+    boot_px = splash_end();   // the boot screen's last picture, to fade from
     keyboard_flush();
     icons_load();             // /icons.bin, if the build produced one
     // The desktop's own face, rasterised while floating point is still ours

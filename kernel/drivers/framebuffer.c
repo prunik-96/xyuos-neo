@@ -453,8 +453,12 @@ static void ansi_dispatch(char final) {
     }
 }
 
+static int console_muted;
+
+void fb_console_mute(int on) { console_muted = on; }
+
 void fb_putc(char c) {
-    if (!fb_mem) return;
+    if (!fb_mem || console_muted) return;
 
     // --- ANSI escape state machine ---
     if (ansi_state == 1) {
@@ -588,6 +592,11 @@ void fb_draw_glyph_at(uint32_t px, uint32_t py, char c, uint32_t fg, uint32_t bg
 
 void fb_console_reset(void) {
     if (!fb_mem) return;
+    if (console_muted) {                 // the boot screen is up: not over it
+        cursor_col = 0;
+        cursor_row = 0;
+        return;
+    }
     for (uint32_t y = 0; y < fb_height; y++) {
         for (uint32_t x = 0; x < fb_width; x++) {
             put_pixel(x, y, color_bg);

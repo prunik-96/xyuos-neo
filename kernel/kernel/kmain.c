@@ -25,6 +25,7 @@
 #include "../drivers/power.h"
 #include "../fs/fat32.h"
 #include "../wm/wm.h"
+#include "../wm/splash.h"
 #include "../gfx/font.h"
 #include <stdint.h>
 #include <stddef.h>
@@ -275,6 +276,8 @@ void kernel_main(uint32_t multiboot_addr) {
     __asm__ volatile ("sti");
 
     heap_init();
+    // The boot screen, as soon as there is memory to draw it in.
+    splash_start();
     gdt_init();
     syscall_init();
     paging_selftest();
@@ -330,6 +333,7 @@ void kernel_main(uint32_t multiboot_addr) {
 
     if (vfs_init(multiboot_addr)) {
         kprintf("vfs: ext2 root filesystem mounted\n");
+        splash_fonts();       // the desktop's font is on the disk
     } else {
         kprintf("vfs: mount failed (no disk and no RAM-disk module)\n");
     }

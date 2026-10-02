@@ -11,6 +11,11 @@ int  fb_available(void);
 
 // --- single-stream console (boot log + standard shell via SYS_WRITE) ---
 void fb_putc(char c);
+
+// Keep the text console off the screen (1) or let it draw again (0). While
+// it is muted the kernel's log still goes to the serial line and the log
+// ring -- it just is not painted: over the boot screen, or over the desktop.
+void fb_console_mute(int on);
 void fb_write(const char *s);
 void fb_set_color(uint32_t fg, uint32_t bg);
 void fb_console_reset(void);   // clear screen to bg and home the console cursor
