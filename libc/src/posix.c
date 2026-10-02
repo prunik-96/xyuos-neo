@@ -99,13 +99,7 @@ int ftruncate(int fd, unsigned long length) {
     return (int)xyuos_ftruncate(fd - FD_OFFSET, length);
 }
 
-/* --- process environment -------------------------------------------------
- * There is no environment on this OS, but hosted code expects the symbol to
- * exist and to be a NULL-terminated vector, so give it a real empty one
- * rather than a null pointer that callers would walk off.
- */
-static char *env_empty[1] = { NULL };
-char **environ = env_empty;
+/* The process environment (environ, getenv, setenv) lives in env.c. */
 
 /* --- assertions --------------------------------------------------------- */
 void __assert_fail(const char *expr, const char *file, int line) {

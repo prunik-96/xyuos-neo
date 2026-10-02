@@ -208,6 +208,4 @@ void qsort(void *base, size_t count, size_t size,
     }
 }
 
-// No environment on this OS; tcc calls getenv() during setup and must simply
-// get "unset" back.
-char *getenv(const char *name) { (void)name; return NULL; }
+/* getenv is in env.c: there is an environment now. */

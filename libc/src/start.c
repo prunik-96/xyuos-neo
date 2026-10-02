@@ -41,8 +41,14 @@ extern void __register_frame_info(const void *begin, void *object)
  * shipped; this is twice that, and nothing here ever looks inside it. */
 static unsigned long long eh_object[16];
 
+/* env.c: the environment, read in before main() so `environ` is right for a
+ * program that walks it without asking getenv() first. */
+void __env_init(void);
+
 void __libc_start(int argc, char **argv) __attribute__((noreturn));
 void __libc_start(int argc, char **argv) {
+    __env_init();
+
     /* Before the constructors, because a constructor may throw. */
     if (__register_frame_info && __eh_frame_start)
         __register_frame_info(__eh_frame_start, eh_object);

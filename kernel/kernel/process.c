@@ -122,6 +122,44 @@ static process_t *find_by_pid(int pid) {
 
 // --- process lifecycle -----------------------------------------------------
 
+// A new process's environment: its creator's, or -- started by the desktop
+// rather than by a program -- the one every session begins with.
+static void env_inherit(process_t *p) {
+    const char *src;
+    uint32_t len;
+    static const char base_ru[] = "HOME=/home\0PATH=/bin\0USER=user\0SHELL=/bin/sh\0"
+                                  "LANG=ru_RU.UTF-8\0TERM=xyuos\0";
+    static const char base_en[] = "HOME=/home\0PATH=/bin\0USER=user\0SHELL=/bin/sh\0"
+                                  "LANG=en_US.UTF-8\0TERM=xyuos\0";
+    if (current && current->env && current->env_len) { src = current->env; len = current->env_len; }
+    else if (wm_lang() == 1) { src = base_en; len = sizeof base_en - 1; }
+    else { src = base_ru; len = sizeof base_ru - 1; }
+    p->env = (char *)kmalloc(len + 1);
+    if (!p->env) { p->env_len = 0; return; }
+    for (uint32_t i = 0; i < len; i++) p->env[i] = src[i];
+    p->env[len] = 0;
+    p->env_len = len;
+}
+
+long process_env_get(void *buf, uint32_t room) {
+    if (!current) return -1;
+    uint32_t n = current->env_len < room ? current->env_len : room;
+    for (uint32_t i = 0; i < n; i++) ((char *)buf)[i] = current->env[i];
+    return (long)current->env_len;
+}
+
+int process_env_set(const void *block, uint32_t len) {
+    if (!current || len > 65536) return -1;
+    char *n = (char *)kmalloc(len + 1);
+    if (!n) return -1;
+    for (uint32_t i = 0; i < len; i++) n[i] = ((const char *)block)[i];
+    n[len] = 0;
+    if (current->env) kfree(current->env);
+    current->env = n;
+    current->env_len = len;
+    return 0;
+}
+
 static process_t *proc_alloc(const char *name) {
     for (int i = 0; i < MAX_PROCESSES; i++) {
         if (proc_table[i].state != PROC_UNUSED) continue;
@@ -137,8 +175,12 @@ static process_t *proc_alloc(const char *name) {
         // `stopped` was another, which would have started a program
         // suspended in the slot of one that was killed while suspended.
         // Clearing the lot makes the next field added safe by default.
+        // The last holder's environment goes here, not when it ended: every
+        // way a slot is given up passes through here before it is reused.
+        if (p->env) kfree(p->env);
         uint8_t *q = (uint8_t *)p;
         for (uint64_t k = 0; k < sizeof *p; k++) q[k] = 0;
+        env_inherit(p);
 
         p->pid = next_pid++;
         p->parent_pid = current ? current->pid : 0;

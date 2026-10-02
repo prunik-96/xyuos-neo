@@ -276,6 +276,17 @@ static uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
             }
             return (uint64_t)k;
         }
+        case SYS_ENV: {
+            if (a1 == ENVOP_GET) {
+                if (a3 && !vmm_user_range_ok(a2, a3)) return (uint64_t)-1;
+                return (uint64_t)process_env_get((void *)(uintptr_t)a2, (uint32_t)a3);
+            }
+            if (a1 == ENVOP_SET) {
+                if (a3 > 65536 || (a3 && !vmm_user_range_ok(a2, a3))) return (uint64_t)-1;
+                return process_env_set((const void *)(uintptr_t)a2, (uint32_t)a3) == 0 ? 0 : (uint64_t)-1;
+            }
+            return (uint64_t)-1;
+        }
         case SYS_CLIP: {
             if (!vmm_user_range_ok(a1, sizeof(struct clip_req))) return (uint64_t)-1;
             struct clip_req *rq = (struct clip_req *)(uintptr_t)a1;

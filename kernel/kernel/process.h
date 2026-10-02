@@ -112,6 +112,11 @@ typedef struct process {
     // Tick at which SIGALRM is due, or 0. Checked by the timer.
     uint64_t alarm_at;
 
+    // The environment: NUL-ended NAME=VALUE strings, `env_len` bytes in all,
+    // in the kernel heap. A copy of the creator's; see SYS_ENV.
+    char *env;
+    uint32_t env_len;
+
     // x87/SSE state. Userland does floating point (strtod, printf), so this
     // has to be swapped too. 16-byte aligned, as FXSAVE requires.
     uint8_t fxstate[512] __attribute__((aligned(16)));
@@ -120,6 +125,10 @@ typedef struct process {
 // Create a process from an ELF on the filesystem and put it on the run queue,
 // WITHOUT running it. Returns the pid, or -1 if it could not be loaded.
 int process_spawn(const char *path, int argc, const char *const *argv);
+
+// The calling process's environment (SYS_ENV).
+long process_env_get(void *buf, uint32_t room);
+int  process_env_set(const void *block, uint32_t len);
 
 // --- threads ---------------------------------------------------------------
 // `entry` is a user address called with `arg` in the first argument register.

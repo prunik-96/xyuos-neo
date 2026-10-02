@@ -195,7 +195,12 @@ KEYS = {' ': 'spc', '.': 'dot', '/': 'slash', '-': 'minus', '\n': 'ret',
         ':': 'shift-semicolon', '_': 'shift-minus', '=': 'equal',
         '+': 'shift-equal', '*': 'shift-8', ',': 'comma',
         '|': 'shift-backslash', '>': 'shift-dot', '<': 'shift-comma',
-        '"': 'shift-apostrophe', "'": 'apostrophe', '&': 'shift-7'}
+        '"': 'shift-apostrophe', "'": 'apostrophe', '&': 'shift-7',
+        ';': 'semicolon', '$': 'shift-4', '[': 'bracket_left', ']': 'bracket_right',
+        '(': 'shift-9', ')': 'shift-0', '!': 'shift-1', '#': 'shift-3', '%': 'shift-5',
+        '?': 'shift-slash', '~': 'shift-grave_accent', '{': 'shift-bracket_left',
+        '}': 'shift-bracket_right', '\\': 'backslash', '@': 'shift-2', '^': 'shift-6',
+        '`': 'grave_accent', '\t': 'tab'}
 
 
 def typ(t):

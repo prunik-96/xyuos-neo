@@ -174,6 +174,14 @@ struct uvol {
     int usable;                  // its files can be opened
 };
 
+
+// The process's environment: NAME=VALUE strings, a copy of its parent's.
+// a1 = ENVOP_GET (a2 buf, a3 room -> the whole length) or ENVOP_SET (a2 the
+// new block of NUL-ended strings, a3 its length -> 0).
+#define SYS_ENV       54
+#define ENVOP_GET 0
+#define ENVOP_SET 1
+
 // The clipboard, shared by every program. a1 = struct clip_req *.
 #define SYS_CLIP      53
 #define CLIPOP_SET 0             // type, buf, len

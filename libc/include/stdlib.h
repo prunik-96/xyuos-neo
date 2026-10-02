@@ -48,8 +48,14 @@ void srand(unsigned seed);
 void qsort(void *base, size_t count, size_t size,
            int (*cmp)(const void *, const void *));
 
-// Always returns NULL: this OS has no environment.
+// The environment: a copy of the parent's, NAME=VALUE strings. setenv and
+// unsetenv change this process's, and what it starts from then on gets it.
 char *getenv(const char *name);
+int   setenv(const char *name, const char *value, int overwrite);
+int   unsetenv(const char *name);
+int   putenv(char *s);
+int   clearenv(void);
+extern char **environ;
 
 #ifdef __cplusplus
 }
