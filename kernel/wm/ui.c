@@ -303,6 +303,106 @@ void ui_rrect2_line(int x, int y, int w, int h, int rt, int rb,
     rr_line(x, y, w, h, rt, rb, UI_ALL, rgb, alpha);
 }
 
+// --- glass over what is really there ---------------------------------------------
+
+static inline uint32_t grain_at(int x, int y) {
+    uint32_t n = (uint32_t)x * 73856093u ^ (uint32_t)y * 19349663u;
+    n ^= n >> 13;
+    n *= 0x5bd1e995u;
+    return (n >> 24) & 7;                      // 0..7
+}
+
+void ui_glass_live(int x, int y, int w, int h, int r, uint32_t tint, int tint_a, int blur) {
+    if (w <= 0 || h <= 0) return;
+    // Take a margin round the rectangle, so the blur at its edge sees what
+    // lies beyond it rather than a hard border.
+    int pad = blur * 2;
+    int sx = x - pad, sy = y - pad, sw = w + 2 * pad, sh = h + 2 * pad;
+    int TW = target_w(), TH = target_h();
+    if (sx < 0) { sw += sx; sx = 0; }
+    if (sy < 0) { sh += sy; sy = 0; }
+    if (sx + sw > TW) sw = TW - sx;
+    if (sy + sh > TH) sh = TH - sy;
+    if (sw <= 0 || sh <= 0) return;
+    uint32_t *tmp = (uint32_t *)kmalloc((size_t)sw * sh * 4);
+    if (!tmp) return;
+    for (int j = 0; j < sh; j++) {
+        const uint32_t *s = row_at(sy + j) + sx;
+        for (int i = 0; i < sw; i++) tmp[j * sw + i] = s[i];
+    }
+    if (blur > 0) ui_blur(tmp, sw, sh, blur);
+
+    shape s;
+    shape_init(&s, w, h, r, r, UI_ALL);
+    int vx = x, vy = y, vw = w, vh = h;
+    if (cut(&vx, &vy, &vw, &vh)) {
+        int t = tint_a + (tint_a >> 7);
+        for (int py = vy; py < vy + vh; py++) {
+            int j = py - y;
+            int band = shape_band(&s, j);
+            uint32_t *d = row_at(py);
+            const uint32_t *b = tmp + (py - sy) * sw;
+            for (int px = vx; px < vx + vw; px++) {
+                int i = px - x;
+                int cv = 255;
+                if (band && (i < band || i >= w - band)) {
+                    cv = shape_cov(&s, i, j);
+                    if (!cv) continue;
+                }
+                uint32_t c = ui_mix(b[px - sx], tint, t);
+                // Grain: a few levels of noise, so the glass reads as a
+                // material and wide flat areas do not band.
+                uint32_t g = grain_at(px, py);
+                uint32_t rr = ((c >> 16) & 255) + g, gg = ((c >> 8) & 255) + g, bb = (c & 255) + g;
+                rr = rr > 258 ? 255 : (rr < 4 ? 0 : rr - 3);
+                gg = gg > 258 ? 255 : (gg < 4 ? 0 : gg - 3);
+                bb = bb > 258 ? 255 : (bb < 4 ? 0 : bb - 3);
+                c = (rr << 16) | (gg << 8) | bb;
+                d[px] = over(d[px], c, (uint32_t)cv);
+            }
+        }
+        mark(vx, vy, vw, vh);
+    }
+    kfree(tmp);
+
+    // Light along the edge: brightest at the top, where it catches the
+    // light, fading down the sides.
+    ui_mat sheen = { UI_GRAD, 0x00FFFFFF, 0x00FFFFFF, 70, 0, y, y + (h < 60 ? h : 60) };
+    ui_rrect(x, y, w, h < 60 ? h : 60, r, UI_TOP, &sheen);
+    ui_rrect_line(x, y, w, h, r, UI_ALL, 0x00FFFFFF, 150);
+    ui_rrect_line(x + 1, y + 1, w - 2, h - 2, r > 1 ? r - 1 : 0, UI_ALL, 0x00FFFFFF, 40);
+}
+
+uint32_t ui_accent_from(const uint32_t *px, int w, int h) {
+    uint64_t sr = 0, sg = 0, sb = 0, sw = 0;
+    for (int y = 0; y < h; y += 8)
+        for (int x = 0; x < w; x += 8) {
+            uint32_t c = px[(uint64_t)y * w + x];
+            int r = (c >> 16) & 255, g = (c >> 8) & 255, b = c & 255;
+            int mx = r > g ? (r > b ? r : b) : (g > b ? g : b);
+            int mn = r < g ? (r < b ? r : b) : (g < b ? g : b);
+            int sat = mx ? (mx - mn) * 255 / mx : 0;
+            uint64_t wgt = (uint64_t)sat * sat * (uint64_t)mx / 255;   // colourful and not dark
+            sr += r * wgt; sg += g * wgt; sb += b * wgt; sw += wgt;
+        }
+    if (!sw) return 0x003C7FD8;
+    int r = (int)(sr / sw), g = (int)(sg / sw), b = (int)(sb / sw);
+    // To an accent's brightness and colourfulness: the strongest channel at
+    // 210, and the spread between strongest and weakest at least 120, so a
+    // pastel wallpaper still gives a colour that reads.
+    int mx = r > g ? (r > b ? r : b) : (g > b ? g : b);
+    if (mx < 1) mx = 1;
+    r = r * 210 / mx; g = g * 210 / mx; b = b * 210 / mx;
+    int mn = r < g ? (r < b ? r : b) : (g < b ? g : b);
+    int spread = 210 - mn;
+    if (spread > 0 && spread < 120) {
+        r = 210 - (210 - r) * 120 / spread;
+        g = 210 - (210 - g) * 120 / spread;
+        b = 210 - (210 - b) * 120 / spread;
+    }
+    return ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
+}
+
 void ui_round_fill(int x, int y, int w, int h, int r, uint32_t rgb, int alpha) {
     ui_mat m = { UI_SOLID, rgb, 0, alpha, 0, 0, 0 };
     ui_rrect(x, y, w, h, r, UI_ALL, &m);
@@ -330,6 +430,11 @@ static uint32_t isqrt32(uint32_t v) {
 void ui_shadow(int x, int y, int w, int h, int r, int size, int alpha, int dy,
                const int limit[4]) {
     if (size <= 0 || alpha <= 0 || w <= 0 || h <= 0) return;
+    // The caster stays where it is; only its shadow moves down. What the
+    // caster covers is skipped -- what the shadow covers below it is not:
+    // skipping the shadow's own middle left a strip of plain desktop between
+    // a window's bottom edge and the shadow under it.
+    int cy0 = y, cy1 = y + h;
     y += dy;
     r = clamp_r(r, w, h);
     int saved[4];
@@ -365,10 +470,10 @@ void ui_shadow(int x, int y, int w, int h, int r, int size, int alpha, int dy,
     for (int py = vy; py < vy + vh; py++) {
         uint32_t *d = row_at(py);
         int ddy = py < iy0 ? iy0 - py : (py > iy1 ? py - iy1 : 0);
-        int inside_rows = (py >= y && py < y + h);
+        int caster_rows = (py >= cy0 + r && py < cy1 - r);
         for (int px = vx; px < vx + vw; px++) {
-            // The middle is the caster's own: skip straight across it.
-            if (inside_rows && px >= x + r && px < x + w - r && py >= y + r && py < y + h - r) {
+            // The caster's own middle: skip straight across it.
+            if (caster_rows && px >= x + r && px < x + w - r) {
                 px = x + w - r - 1;
                 continue;
             }
@@ -378,11 +483,7 @@ void ui_shadow(int x, int y, int w, int h, int r, int size, int alpha, int dy,
             else if (!ddy) dist16 = ddx * 16;
             else dist16 = (int)isqrt32((uint32_t)(ddx * ddx + ddy * ddy) * 256);
             dist16 -= r * 16;
-            if (dist16 <= 0) {
-                // Inside the shape. Only the corners of the bounding box get
-                // here, and they are the caster's to cover.
-                continue;
-            }
+            if (dist16 < 0) dist16 = 0;          // inside the shadow: at its darkest
             if (dist16 >= n) continue;
             int a = alpha * prof[dist16] >> 8;
             if (a <= 0) continue;

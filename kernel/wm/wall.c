@@ -211,6 +211,113 @@ void wall_paint(uint32_t *px, int w, int h, int dark) {
     fill_all(px, &p);
 }
 
+// --- the calm wallpapers ------------------------------------------------------
+//
+// Soft light and colour and nothing sharp: a gradient sky with a few broad
+// glows laid over it, each a radial gradient that fades to nothing, so the
+// shapes have no edges at all. A little noise at the end keeps wide gentle
+// gradients from breaking into bands on an 8-bit screen.
+
+static void glow(uint32_t *px, int cxm, int cym, int rxm, int rym, uint32_t argb) {
+    rast_stop st[3];
+    st[0].offset = 0;                    st[0].color = argb;
+    st[1].offset = RAST_FRAC(45, 100);   st[1].color = (((argb >> 24) * 45 / 100) << 24) | (argb & 0xFFFFFF);
+    st[2].offset = RAST_ONE;             st[2].color = argb & 0xFFFFFF;
+    rast_paint p;
+    zero_paint(&p);
+    p.type = RAST_RADIAL;
+    // An ellipse: a unit circle stretched by the matrix.
+    rast_fx rx = PX(rxm), ry = PY(rym);
+    p.m.a = rx; p.m.b = 0; p.m.c = 0; p.m.d = ry;
+    p.m.e = PX(cxm); p.m.f = PY(cym);
+    p.cx = 0; p.cy = 0; p.fx = 0; p.fy = 0; p.r = RAST_ONE;
+    p.stops = st; p.nstops = 3;
+    fill_all(px, &p);
+}
+
+static void vgrad(uint32_t *px, uint32_t top, uint32_t bottom) {
+    rast_stop st[2] = { { 0, 0xFF000000 | top }, { RAST_ONE, 0xFF000000 | bottom } };
+    rast_paint p;
+    zero_paint(&p);
+    p.type = RAST_LINEAR;
+    p.x1 = 0; p.y1 = 0; p.x2 = 0; p.y2 = PY(1000);
+    p.stops = st; p.nstops = 2;
+    fill_all(px, &p);
+}
+
+// A hill: from the left edge to the right along a smooth curve, filled down
+// to the bottom, lighter at its top edge (where the fog is).
+static void hill(uint32_t *px, const int *pts, int n, uint32_t top, uint32_t bottom, int ytop) {
+    rast_path p;
+    rast_path_init(&p);
+    rast_move_to(&p, PX(-20), PY(1020));
+    rast_line_to(&p, PX(pts[0]), PY(pts[1]));
+    for (int i = 2; i + 3 < n * 2; i += 4)
+        rast_quad_to(&p, PX(pts[i]), PY(pts[i + 1]), PX(pts[i + 2]), PY(pts[i + 3]));
+    rast_line_to(&p, PX(1020), PY(1020));
+    rast_close(&p);
+    rast_stop st[2] = { { 0, 0xFF000000 | top }, { RAST_ONE, 0xFF000000 | bottom } };
+    rast_paint pt;
+    zero_paint(&pt);
+    pt.type = RAST_LINEAR;
+    pt.x1 = 0; pt.y1 = PY(ytop); pt.x2 = 0; pt.y2 = PY(1000);
+    pt.stops = st; pt.nstops = 2;
+    rast_target t;
+    target(&t, px);
+    rast_fill(&t, &p, 0, RAST_NONZERO, &pt);
+    rast_path_free(&p);
+}
+
+static void dither(uint32_t *px, int w, int h) {
+    uint32_t seed = 0x12345u;
+    for (int i = 0; i < w * h; i++) {
+        seed = seed * 1664525u + 1013904223u;
+        int d = (int)((seed >> 29) & 3) - 1;                 // -1..2, mostly small
+        if (d > 1) d = 0;
+        uint32_t c = px[i];
+        int r = (int)((c >> 16) & 255) + d, g = (int)((c >> 8) & 255) + d, b = (int)(c & 255) + d;
+        r = r < 0 ? 0 : r > 255 ? 255 : r;
+        g = g < 0 ? 0 : g > 255 ? 255 : g;
+        b = b < 0 ? 0 : b > 255 ? 255 : b;
+        px[i] = ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
+    }
+}
+
+void wall_soft(uint32_t *px, int w, int h, int style) {
+    W_ = w; H_ = h;
+    switch (style) {
+    case WALL_LAGOON:
+        vgrad(px, 0x0E5F73, 0x0A3346);
+        glow(px, 780, 260, 620, 520, 0xC03FB7A8);
+        glow(px, 200, 820, 560, 480, 0xB01C7FA0);
+        glow(px, 560, 520, 420, 300, 0x80A7E3D6);
+        glow(px, 120, 160, 360, 300, 0x7066C2D8);
+        glow(px, 900, 900, 380, 300, 0x900B4A63);
+        break;
+    case WALL_MIST: {
+        vgrad(px, 0xEAF0F8, 0xC4D2E8);
+        glow(px, 720, 240, 420, 300, 0x90FFF4E2);           // a pale sun behind the haze
+        static const int h1[] = { 0, 560,  180, 470, 340, 520,  520, 580, 700, 500,  860, 430, 1000, 480 };
+        static const int h2[] = { 0, 690,  160, 640, 330, 700,  520, 760, 700, 680,  860, 620, 1000, 680 };
+        static const int h3[] = { 0, 820,  200, 760, 420, 820,  600, 880, 780, 820,  900, 780, 1000, 820 };
+        hill(px, h1, 7, 0xB9C7E2, 0xA4B4D6, 430);
+        hill(px, h2, 7, 0x9AABD0, 0x8596C2, 620);
+        hill(px, h3, 7, 0x7C88B8, 0x6874A6, 760);
+        glow(px, 500, 700, 900, 160, 0x50F2F5FA);           // fog lying in the valleys
+        break;
+    }
+    default:                                                 // WALL_DAWN
+        vgrad(px, 0xF8E2D2, 0xDCCBEE);
+        glow(px, 760, 300, 520, 440, 0xC0F6AC94);
+        glow(px, 180, 740, 560, 480, 0xB0F0B6D6);
+        glow(px, 880, 880, 420, 360, 0xA0B9D3F2);
+        glow(px, 330, 180, 380, 300, 0x90FBE4AE);
+        glow(px, 560, 560, 300, 260, 0x60FFFFFF);
+        break;
+    }
+    dither(px, w, h);
+}
+
 void wall_frost(const uint32_t *src, uint32_t *dst, int w, int h, int dark) {
     for (int i = 0; i < w * h; i++) dst[i] = src[i];
     int scale = (w > h ? w : h);

@@ -96,6 +96,16 @@ void ui_shadow(int x, int y, int w, int h, int r, int size, int alpha, int dy,
  * drawing it twice changes nothing. */
 void ui_set_backdrop(const uint32_t *px, int w, int h);
 
+/* Coloured glass over whatever is already drawn under it -- windows
+ * included: that region is blurred by `blur` pixels, coloured by `tint` at
+ * `tint_a` (0..255), given a fine grain and a soft light along its edge, and
+ * laid down as a rounded rectangle of radius r. */
+void ui_glass_live(int x, int y, int w, int h, int r, uint32_t tint, int tint_a, int blur);
+
+/* A colour for the system to wear, taken from a picture: the average of its
+ * most colourful pixels, brought to a lightness that reads as an accent. */
+uint32_t ui_accent_from(const uint32_t *px, int w, int h);
+
 /* --- pictures --------------------------------------------------------------------
  *
  * 0xAARRGGBB, premultiplied, w x h, drawn at `alpha` (255: as they are). */
