@@ -202,6 +202,7 @@ struct wm_node {
     int ws;                      // workspace this window lives on
     int state;                   // WIN_NORMAL / WIN_MAX / WIN_MIN
     int pinned;                  // kept above every window that is not
+    int alpha;                   // how opaque, 77..255 -- for a pinned window only
     char path[48];               // the program it was opened with ("" a shell)
     char arg[96];                // ... and what it was given to open
 
@@ -313,6 +314,7 @@ static int alloc_node(void) {
             nodes[i].z = 0;
             nodes[i].state = WIN_NORMAL;
             nodes[i].pinned = 0;
+            nodes[i].alpha = 255;
             nodes[i].grp = ++grp_next;          // a group of its own
             nodes[i].tab_seq = ++tab_seq_next;
             nodes[i].tab_hidden = 0;
@@ -381,7 +383,14 @@ static void tab_take_place(int to, int from) {
     a->state = b->state;
     a->z = b->z;
     a->pinned = b->pinned;
+    a->alpha = b->alpha;
     a->ws = b->ws;
+}
+
+// How opaque a window is drawn: a pinned one can be seen through, so it can
+// stay over what you work on without hiding it.
+static int win_alpha(int n) {
+    return nodes[n].pinned ? nodes[n].alpha : 255;
 }
 
 // --- geometry ---
@@ -807,6 +816,7 @@ static uint32_t win_look(int n) {
         v = v * 7 + (uint32_t)m[i];
     }
     if (join_hint == n) v ^= 0x20000000u;
+    v = v * 257 + (uint32_t)win_alpha(n);
     return v;
 }
 
@@ -1129,6 +1139,8 @@ static void window_glass(int n, int focus) {
                   focus ? TH->glass : TH->glass_off, focus ? TH->glass_a : TH->glass_off_a);
 }
 
+static int u2s(char *b, unsigned v);
+
 static void paint_chrome(int n, int focus) {
     const struct wm_node *nd = &nodes[n];
     struct pane *p = &panes[nd->pane_idx];
@@ -1239,6 +1251,22 @@ static void paint_chrome(int n, int focus) {
         wglyph(GL_CLOSE, cx + 5, cy + 5, 12, 0xFF000000 | dim);
     }
 
+    // On the pin of a pinned window: the wheel sets how much shows through.
+    if (nd->pinned && cap_glow(n, WB_PIN)) {
+        char t[48];
+        int q = 0;
+        const char *a = "Колесо мыши — прозрачность · ";
+        while (*a) t[q++] = *a++;
+        q += u2s(t + q, (unsigned)(nd->alpha * 100 + 127) / 255);
+        t[q++] = '%';
+        t[q] = 0;
+        int bx, by, bw, bh;
+        cap_rect(nd, WB_PIN, &bx, &by, &bw, &bh);
+        int tw = ui_text_w(t, UI_F12);
+        ui_text(bx - 12 - tw, y + (TITLE_H - ui_line_h(UI_F12)) / 2 + 1, t, UI_F12,
+                is_light(T->glass) ? T->title_text : 0x00F2F4F7);
+    }
+
     // The buttons.
     static const int glyphs[WB_N] = { GL_PIN, GL_MIN, GL_MAX, GL_CLOSE };
     for (int b = 0; b < WB_N; b++) {
@@ -1345,20 +1373,61 @@ static void pane_painted(int n) {
     pc->look = win_look(n);
 }
 
+// What lies under a window that is seen through, while it is painted.
+static uint32_t *see_buf;
+static int see_cap;
+
+static void see_take(int x, int y, int w, int h) {
+    if (w * h > see_cap) {
+        if (see_buf) kfree(see_buf);
+        see_buf = (uint32_t *)kmalloc((size_t)w * h * 4);
+        see_cap = see_buf ? w * h : 0;
+    }
+    if (!see_buf) return;
+    volatile uint8_t *base = fb_get_base();
+    uint32_t pitch = fb_get_pitch();
+    for (int j = 0; j < h; j++) {
+        const uint32_t *s2 = (const uint32_t *)(base + (size_t)(y + j) * pitch) + x;
+        uint32_t *d = see_buf + (size_t)j * w;
+        for (int i = 0; i < w; i++) d[i] = s2[i];
+    }
+}
+
+static void see_mix(int x, int y, int w, int h, int a) {
+    if (!see_buf || w * h > see_cap) return;
+    volatile uint8_t *base = fb_get_base();
+    uint32_t pitch = fb_get_pitch();
+    for (int j = 0; j < h; j++) {
+        uint32_t *d = (uint32_t *)(base + (size_t)(y + j) * pitch) + x;
+        const uint32_t *u = see_buf + (size_t)j * w;
+        for (int i = 0; i < w; i++) d[i] = ui_mix(u[i], d[i], a);
+    }
+    fb_mark_rect((uint32_t)x, (uint32_t)y, (uint32_t)w, (uint32_t)h);
+}
+
 static void paint_window(int n) {
     int focus = (n == focused);
     struct wm_node *nd = &nodes[n];
     struct pane *p = &panes[nd->pane_idx];
     uint64_t p0 = rdtsc();
+    int alpha = win_alpha(n);
+    // The part of it on the screen, which is the part that is mixed.
+    int sx0 = (int)nd->x, sy0 = (int)nd->y, sw0 = (int)nd->w, sh0 = (int)nd->h;
+    {
+        int W = (int)fb_get_width(), H = (int)fb_get_height();
+        if (sx0 + sw0 > W) sw0 = W - sx0;
+        if (sy0 + sh0 > H) sh0 = H - sy0;
+    }
+    if (alpha < 255) see_take(sx0, sy0, sw0, sh0);
 
     // The shadow first, under everything of the window's own; then what the
     // program shows; then the glass round it, whose rounded inner edge lies
-    // over the corners of the picture.
+    // over the corners of the picture. A window seen through casts less.
     if (nd->state != WIN_MAX) {
         ui_shadow((int)nd->x, (int)nd->y, (int)nd->w, (int)nd->h, RAD_T, SHADOW,
-                  focus ? 66 : 42, SHADOW_DY, 0);
+                  (focus ? 66 : 42) * alpha / 255, SHADOW_DY, 0);
         ui_shadow((int)nd->x, (int)nd->y, (int)nd->w, (int)nd->h, RAD_T, 4,
-                  focus ? 34 : 24, 1, 0);
+                  (focus ? 34 : 24) * alpha / 255, 1, 0);
     }
     int bx, by, bw, bh;
     client_rect(n, &bx, &by, &bw, &bh);
@@ -1369,6 +1438,7 @@ static void paint_window(int n) {
     draw_content(n, cx, cy, cw, ch, focus);
     pf_content += rdtsc() - c0;
     paint_chrome(n, focus);
+    if (alpha < 255) see_mix(sx0, sy0, sw0, sh0, alpha);
     pf_paint += rdtsc() - p0;
     pf_painted++;
     pane_painted(n);
@@ -1433,7 +1503,10 @@ static void render_windows(void) {
                 if (boxes_meet(ext[j], ext[k])) { L = j; moved = 1; break; }
         if (!moved) break;
     }
-    for (int k = L; k < nv; k++) clear_ring(vis[k], ext[k]);
+    for (int k = L; k < nv; k++) {
+        if (win_alpha(vis[k]) < 255) restore_wall_d(ext[k][0], ext[k][1], ext[k][2] - ext[k][0], ext[k][3] - ext[k][1]);
+        else clear_ring(vis[k], ext[k]);
+    }
     for (int k = L; k < nv; k++) {
         int m = vis[k];
         const struct wm_node *nd = &nodes[m];
@@ -4906,6 +4979,7 @@ void wm_pane_interior(struct pane *p, int *w, int *h) {
 static int present_pane_only(int n) {
     if (n < 0 || !nodes[n].used) return 0;
     if (nodes[n].ws != cur_ws || nodes[n].state == WIN_MIN || nodes[n].tab_hidden) return 0;
+    if (win_alpha(n) < 255) return 0;     // it is mixed with what is under it
     if (popup_open() || alttab_active || monitor_on || udrag_active) return 0;
     // Animating, the window is not where it will be.
     if (anim.active) return 0;
@@ -5372,6 +5446,17 @@ static void handle_mouse(const struct mouse_event *me) {
             dirty = 1;
         }
         return;
+    }
+
+    // The wheel on the pin of a pinned window: how much of it shows.
+    if (me->wheel && drag_mode == DRAG_NONE && !on_taskbar && !popup_open()) {
+        int n = window_at(mx, my);
+        if (n >= 0 && nodes[n].pinned && hit_test(n, mx, my) == HIT_PINBTN) {
+            int a = nodes[n].alpha + (me->wheel > 0 ? 26 : -26);
+            nodes[n].alpha = a < 77 ? 77 : a > 255 ? 255 : a;
+            dirty = 1;
+            return;
+        }
     }
 
     // Pointer motion and wheel over the focused window's interior belong to
