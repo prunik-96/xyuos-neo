@@ -364,13 +364,165 @@ void ui_glass_live(int x, int y, int w, int h, int r, uint32_t tint, int tint_a,
         mark(vx, vy, vw, vh);
     }
     kfree(tmp);
+    ui_glass_rim(x, y, w, h, r);
+}
 
-    // Light along the edge: brightest at the top, where it catches the
-    // light, fading down the sides.
-    ui_mat sheen = { UI_GRAD, 0x00FFFFFF, 0x00FFFFFF, 70, 0, y, y + (h < 60 ? h : 60) };
-    ui_rrect(x, y, w, h < 60 ? h : 60, r, UI_TOP, &sheen);
-    ui_rrect_line(x, y, w, h, r, UI_ALL, 0x00FFFFFF, 150);
-    ui_rrect_line(x + 1, y + 1, w - 2, h - 2, r > 1 ? r - 1 : 0, UI_ALL, 0x00FFFFFF, 40);
+// Light along the edge: brightest at the top, where it catches the light,
+// fading down the sides.
+void ui_glass_rim(int x, int y, int w, int h, int r) {
+    int sh = h < 60 ? h : 60;
+    ui_mat sheen = { UI_GRAD, 0x00FFFFFF, 0x00FFFFFF, 60, 0, y, y + sh };
+    ui_rrect(x, y, w, sh, r, UI_TOP, &sheen);
+    ui_rrect_line(x, y, w, h, r, UI_ALL, 0x00FFFFFF, 140);
+    ui_rrect_line(x + 1, y + 1, w - 2, h - 2, r > 1 ? r - 1 : 0, UI_ALL, 0x00FFFFFF, 36);
+}
+
+// --- glass with a memory --------------------------------------------------------
+
+static int floor4(int v) { return v >= 0 ? v & ~3 : -((-v + 3) & ~3); }
+
+void ui_glass_place(ui_glass *g, int x, int y, int w, int h, int pad) {
+    int ux = floor4(x - pad), uy = floor4(y - pad);
+    int ux1 = floor4(x + w + pad + 3), uy1 = floor4(y + h + pad + 3);
+    int uw = ux1 - ux, uh = uy1 - uy;
+    if (g->have && g->ux == ux && g->uy == uy && g->uw == uw && g->uh == uh) return;
+    g->ux = ux; g->uy = uy; g->uw = uw; g->uh = uh;
+    g->sw = uw / 4; g->sh = uh / 4;
+    int need = g->sw * g->sh;
+    if (need > g->cap) {
+        if (g->small) kfree(g->small);
+        if (g->soft) kfree(g->soft);
+        g->small = (uint32_t *)kmalloc((size_t)need * 4);
+        g->soft = (uint32_t *)kmalloc((size_t)need * 4);
+        g->cap = (g->small && g->soft) ? need : 0;
+    }
+    g->have = 0;
+    g->soft_ok = 0;
+}
+
+void ui_glass_forget(ui_glass *g) { g->have = 0; g->soft_ok = 0; }
+
+void ui_glass_release(ui_glass *g) {
+    if (g->small) kfree(g->small);
+    if (g->soft) kfree(g->soft);
+    g->small = g->soft = 0;
+    g->cap = 0;
+    g->have = g->soft_ok = 0;
+}
+
+// Average the 4x4 block (bx, by) of the remembered area from the target,
+// reading the nearest on-screen pixel for any that are off it.
+static uint32_t block_avg(const ui_glass *g, int bx, int by) {
+    int TW = target_w(), TH = target_h();
+    uint32_t r = 0, gg = 0, b = 0;
+    for (int j = 0; j < 4; j++) {
+        int py = g->uy + by * 4 + j;
+        py = py < 0 ? 0 : (py >= TH ? TH - 1 : py);
+        const uint32_t *row = row_at(py);
+        for (int i = 0; i < 4; i++) {
+            int px = g->ux + bx * 4 + i;
+            px = px < 0 ? 0 : (px >= TW ? TW - 1 : px);
+            uint32_t c = row[px];
+            r += (c >> 16) & 255; gg += (c >> 8) & 255; b += c & 255;
+        }
+    }
+    return ((r >> 4) << 16) | ((gg >> 4) << 8) | (b >> 4);
+}
+
+void ui_glass_take(ui_glass *g, const int (*dmg)[4], int n) {
+    if (!g->cap) return;
+    if (!g->have) {
+        for (int by = 0; by < g->sh; by++)
+            for (int bx = 0; bx < g->sw; bx++)
+                g->small[by * g->sw + bx] = block_avg(g, bx, by);
+        g->have = 1;
+        g->soft_ok = 0;
+        return;
+    }
+    for (int k = 0; k < n; k++) {
+        int x0 = dmg[k][0] > g->ux ? dmg[k][0] : g->ux;
+        int y0 = dmg[k][1] > g->uy ? dmg[k][1] : g->uy;
+        int x1 = dmg[k][2] < g->ux + g->uw ? dmg[k][2] : g->ux + g->uw;
+        int y1 = dmg[k][3] < g->uy + g->uh ? dmg[k][3] : g->uy + g->uh;
+        if (x1 <= x0 || y1 <= y0) continue;
+        int bx0 = (x0 - g->ux) / 4, by0 = (y0 - g->uy) / 4;
+        int bx1 = (x1 - g->ux + 3) / 4, by1 = (y1 - g->uy + 3) / 4;
+        for (int by = by0; by < by1; by++)
+            for (int bx = bx0; bx < bx1; bx++)
+                g->small[by * g->sw + bx] = block_avg(g, bx, by);
+        g->soft_ok = 0;
+    }
+}
+
+static void glass_soften(ui_glass *g) {
+    if (g->soft_ok || !g->cap || !g->have) return;
+    for (int i = 0; i < g->sw * g->sh; i++) g->soft[i] = g->small[i];
+    ui_blur(g->soft, g->sw, g->sh, 3);
+    g->soft_ok = 1;
+}
+
+// What the glass shows at screen pixel (px, py): the softened copy,
+// sampled between its quarter-size pixels.
+static inline uint32_t glass_sample(const ui_glass *g, int px, int py) {
+    int fx = (px - g->ux) * 64 - 96, fy = (py - g->uy) * 64 - 96;
+    int i0 = fx >> 8, j0 = fy >> 8;
+    int ax = fx & 255, ay = fy & 255;
+    if (i0 < 0) { i0 = 0; ax = 0; }
+    if (j0 < 0) { j0 = 0; ay = 0; }
+    int i1 = i0 + 1 < g->sw ? i0 + 1 : g->sw - 1;
+    int j1 = j0 + 1 < g->sh ? j0 + 1 : g->sh - 1;
+    if (i0 >= g->sw) i0 = g->sw - 1;
+    if (j0 >= g->sh) j0 = g->sh - 1;
+    const uint32_t *r0 = g->soft + j0 * g->sw, *r1 = g->soft + j1 * g->sw;
+    uint32_t top = ui_mix(r0[i0], r0[i1], ax), bot = ui_mix(r1[i0], r1[i1], ax);
+    return ui_mix(top, bot, ay);
+}
+
+void ui_glass_draw(ui_glass *g, int x, int y, int w, int h, int r,
+                   int bx, int by, int bw, int bh, int br, int bcorners,
+                   uint32_t tint, int tint_a) {
+    if (w <= 0 || h <= 0 || !g->cap || !g->have) return;
+    glass_soften(g);
+    shape so, si;
+    shape_init(&so, w, h, r, r, UI_ALL);
+    if (bw > 0 && bh > 0) shape_init(&si, bw, bh, br, br, bcorners);
+    int vx = x, vy = y, vw = w, vh = h;
+    if (!cut(&vx, &vy, &vw, &vh)) return;
+    int t = tint_a + (tint_a >> 7);
+    for (int py = vy; py < vy + vh; py++) {
+        int j = py - y;
+        int band = shape_band(&so, j);
+        int in_body_rows = bw > 0 && py >= by && py < by + bh;
+        int ibandv = in_body_rows ? shape_band(&si, py - by) : 0;
+        uint32_t *d = row_at(py);
+        for (int px = vx; px < vx + vw; px++) {
+            int i = px - x;
+            // The body's middle is not glass: skip across it. Only its
+            // rounded corners share pixels with the frame.
+            if (in_body_rows && px >= bx + ibandv && px < bx + bw - ibandv) {
+                px = bx + bw - ibandv - 1;
+                continue;
+            }
+            int cv = 255;
+            if (band && (i < band || i >= w - band)) {
+                cv = shape_cov(&so, i, j);
+                if (!cv) continue;
+            }
+            if (in_body_rows && px >= bx && px < bx + bw) {
+                int ci = shape_cov(&si, px - bx, py - by);
+                cv = cv - ci;
+                if (cv <= 0) continue;
+            }
+            uint32_t c = ui_mix(glass_sample(g, px, py), tint, t);
+            uint32_t gr = grain_at(px, py);
+            uint32_t rr = ((c >> 16) & 255) + gr, gg = ((c >> 8) & 255) + gr, bb = (c & 255) + gr;
+            rr = rr > 258 ? 255 : (rr < 4 ? 0 : rr - 3);
+            gg = gg > 258 ? 255 : (gg < 4 ? 0 : gg - 3);
+            bb = bb > 258 ? 255 : (bb < 4 ? 0 : bb - 3);
+            d[px] = over(d[px], (rr << 16) | (gg << 8) | bb, (uint32_t)cv);
+        }
+    }
+    mark(vx, vy, vw, vh);
 }
 
 uint32_t ui_accent_from(const uint32_t *px, int w, int h) {

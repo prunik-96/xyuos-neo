@@ -20,6 +20,7 @@
 #include "ui.h"
 #include "wall.h"
 #include "cursor.h"
+#include "glyphs.h"
 
 static inline uint64_t rdtsc(void) {
     uint32_t lo, hi;
@@ -52,19 +53,21 @@ static inline uint64_t rdtsc(void) {
 #define COLOR_BAR_DIM       0x00565F89   // status bar muted text
 
 // ==========================================================================
-//  Aero themes (Windows 7-ish glass).  A tiling compositor wearing Aero
-//  chrome: glassy window title bars, a bottom taskbar with a Start orb, a
-//  live "gadget", and a flowing wallpaper. Two variants -- dark and light.
+//  The look: calm, soft, coloured glass. Windows are rounded cards whose top
+//  is a strip of tabs; the panel is an island floating above the bottom
+//  edge; the system's colour is taken from the wallpaper.
 // ==========================================================================
-#define TASKBAR_H  46      // bottom taskbar height
-#define TITLE_H    30      // per-window glass title bar
-#define FRAME      7       // the glass at a window's sides and bottom
-#define TPAD       6       // inner padding inside the content area
+#define TASKBAR_H  92      // the band the island floats in: 14 + 64 + 14
+#define ISLAND_H   64      // the island itself
+#define TITLE_H    44      // a window's strip of tabs
+#define FRAME      6       // the glass at a window's sides and bottom
+#define TPAD       8       // inner padding inside a terminal
 #define AGAP       8       // gap of wallpaper between windows
-#define RAD_T      8       // a window's corners: round at the top,
-#define RAD_B      4       // barely at the bottom, as Windows 7 had them
-#define SHADOW     22      // how far a window's shadow spreads
-#define SHADOW_DY  6       // and how far down it is pushed
+#define RAD_T      18      // a window's corners
+#define RAD_B      18
+#define BODY_R     12      // the corners of what is inside it
+#define SHADOW     30      // how far a window's shadow spreads
+#define SHADOW_DY  12      // and how far down it is pushed
 
 typedef struct {
     const char *name;
@@ -103,23 +106,25 @@ typedef struct {
     uint32_t ui_bar, ui_bar2, ui_warn, ui_good;
 } theme_t;
 
-static const theme_t THEMES[] = {
-    {   // 0: light glass over the Windows 7 sky -- the default
-        .name = "Aero Glass",
+// Not const: the accent, and everything derived from it, is the wallpaper's
+// and is filled in whenever the wallpaper is (theme_wear).
+static theme_t THEMES[] = {
+    {   // 0: light -- the default
+        .name = "Light",
         .dark = 0,
-        .glass = 0x00F2F7FC, .glass_a = 110,
-        .glass_off = 0x00EEF1F4, .glass_off_a = 175,
+        .glass = 0x00F2F7FC, .glass_a = 100,
+        .glass_off = 0x00F4F6F8, .glass_off_a = 140,
         .rim = 0x00102030, .rim_a = 120, .shine_a = 170, .sheen_a = 120,
         .title_glow = 0x00FFFFFF, .title_glow_a = 200,
         .accent = 0x003C8CE6,
         .wp_a = 0x00246FB0, .wp_b = 0x00113A63, .wp_glow = 0x0066C2E0,
         .title_a = 0x00EAF4FE, .title_b = 0x00B6D6F2, .title_hl = 0x00FFFFFF,
         .glow = 0x005AA0E0, .glow_dim = 0x008FB0D0,
-        .content_bg = 0x00101820,
+        .content_bg = 0x001C2026,
         .bar_a = 0x00CFE3F7, .bar_b = 0x007FA9D6,
         .menu_bg = 0x00DCE8F5,
         .orb = 0x003E86C8,
-        .title_text = 0x00102030, .title_text_dim = 0x00505A68,
+        .title_text = 0x001E2329, .title_text_dim = 0x006B7480,
         .bar_text = 0x00133154, .bar_dim = 0x00436486,
         .ui_win = 0x00F2F3F5, .ui_panel = 0x00FFFFFF, .ui_alt = 0x00F7F9FB,
         .ui_text = 0x001B1B1F, .ui_dim = 0x006B7280,
@@ -130,8 +135,8 @@ static const theme_t THEMES[] = {
         .ui_bar = 0x00E9ECEF, .ui_bar2 = 0x00DDE2E7,
         .ui_warn = 0x00C24A2F, .ui_good = 0x002E7D46,
     },
-    {   // 1: smoked glass over a night sky
-        .name = "Aero Glass Dark",
+    {   // 1: dark
+        .name = "Dark",
         .dark = 1,
         .glass = 0x00182030, .glass_a = 130,
         .glass_off = 0x001C2028, .glass_off_a = 190,
@@ -188,6 +193,7 @@ struct wm_node {
     int z;                       // stacking order; larger is nearer the viewer
     int ws;                      // workspace this window lives on
     int state;                   // WIN_NORMAL / WIN_MAX / WIN_MIN
+    int pinned;                  // kept above every window that is not
 
     uint32_t x, y, w, h;         // frame rectangle on screen
     uint32_t sx, sy, sw, sh;     // geometry remembered across a maximise
@@ -245,7 +251,6 @@ static void pane_push_event(struct pane *p, const struct kbd_event *ev);
 static void refresh_leaves(void);
 static int  collect_windows(int ws, int *out, int max);
 static int  topmost_window(int ws);
-static int  ws_has_windows(int ws);
 
 // --- pool allocation ---
 
@@ -289,6 +294,7 @@ static int alloc_node(void) {
             nodes[i].used = 1;
             nodes[i].z = 0;
             nodes[i].state = WIN_NORMAL;
+            nodes[i].pinned = 0;
             irq_restore(f);
             return i;
         }
@@ -337,12 +343,21 @@ static void content_rect(int n, uint32_t *cx, uint32_t *cy, uint32_t *cw, uint32
 }
 
 // The desktop rectangle windows live in: everything above the taskbar.
+static int island_edge_now(void);
+
 static void desk_area(uint32_t *x, uint32_t *y, uint32_t *w, uint32_t *h) {
     uint32_t W = fb_get_width(), H = fb_get_height();
     *x = AGAP;
     *y = AGAP;
     *w = (W > 2 * AGAP) ? W - 2 * AGAP : W;
-    *h = (H > TASKBAR_H + 2 * AGAP) ? H - TASKBAR_H - 2 * AGAP : H;
+    *h = (H > 2 * AGAP) ? H - 2 * AGAP : H;
+    // Leave the island its band, on whichever edge it floats.
+    switch (island_edge_now()) {
+    case 1: *x += TASKBAR_H - AGAP; *w -= TASKBAR_H - AGAP; break;      // left
+    case 2: *w -= TASKBAR_H - AGAP; break;                              // right
+    case 3: *y += TASKBAR_H - AGAP; *h -= TASKBAR_H - AGAP; break;      // top
+    default: *h -= TASKBAR_H - AGAP; break;                             // bottom
+    }
 }
 
 static uint32_t win_min_w(void) { return 2 * (FRAME + TPAD) + 24 * GW; }
@@ -511,10 +526,6 @@ static void draw_text_t(int x, int y, const char *s, uint32_t fg) {
 // Wallpaper cache (defined below); used to restore rounded corners.
 static uint32_t *wallpaper;
 static uint32_t  wp_w, wp_h;
-// The desktop as it shows between windows: the wallpaper with the icons
-// drawn on it. Everything that "puts the desktop back" copies from here.
-static uint32_t *desk_px;
-static void desk_rebuild(void);
 
 // Put the wallpaper back over a rectangle of the screen (clipped to it).
 static void restore_wall(int x, int y, int w, int h) {
@@ -530,7 +541,7 @@ static void restore_wall(int x, int y, int w, int h) {
     }
     volatile uint8_t *base = fb_get_base();
     uint32_t pitch = fb_get_pitch();
-    const uint32_t *src = desk_px ? desk_px : wallpaper;
+    const uint32_t *src = wallpaper;
     for (int j = 0; j < h; j++) {
         uint32_t *d = (uint32_t *)(base + (size_t)(y + j) * pitch) + x;
         const uint32_t *s = src + (size_t)(y + j) * wp_w + x;
@@ -617,31 +628,12 @@ static void invalidate_pane_cache(void) {
 
 #define GRAB   5                    // how close to an edge counts as a resize
 
-// --- the caption buttons -----------------------------------------------------
-//
-// Windows 7's, at the right: they hang from the top edge of the frame,
-// minimise and maximise sharing one plate of glass and close wider, red while
-// the window is the active one. Every place that needs to know where they are
-// -- drawing, hit-testing -- asks cap_rect, so the two cannot disagree.
-
-#define CAP_H        20
-#define CAP_W        27
-#define CAP_CLOSE_W  46
-
-static void cap_rect(const struct wm_node *nd, int which, int *bx, int *by, int *bw, int *bh) {
-    int right = (int)(nd->x + nd->w) - FRAME + 1;
-    *by = (int)nd->y + (nd->state == WIN_MAX ? 0 : 1);
-    *bh = CAP_H;
-    if (which == 2) { *bw = CAP_CLOSE_W; *bx = right - CAP_CLOSE_W; }
-    else            { *bw = CAP_W; *bx = right - CAP_CLOSE_W - (2 - which) * (CAP_W - 1); }
-}
-
 // --- what the pointer is over ----------------------------------------------
 //
-// Anything that can be pressed lights up under the pointer -- a caption
-// button, a taskbar button, the orb -- and the light fades in and out over a
-// few frames rather than switching. There is one pointer, so one thing is lit
-// and one is fading out: each named by a key.
+// Anything that can be pressed lights up under the pointer -- a window's
+// button, something on the island, a menu row -- and the light fades in and
+// out over a few frames rather than switching. There is one pointer, so one
+// thing is lit and one is fading out: each named by a key.
 #define FADE_MS 150
 #define KEY_CAP(n, b) (0x10000 | ((n) << 4) | (b))
 #define KEY_TB(i)     (0x20000 | (i))
@@ -679,132 +671,42 @@ static int hover_to(int key) {
     return 1;
 }
 
+// --- a window's top: its tab, and its buttons --------------------------------
+//
+// The top of a window is a strip of coloured glass holding its tab -- a
+// shape in the colour of what is inside the window, flowing down into it --
+// and, at the right, four round buttons: pin it above everything, minimise,
+// maximise, close. Drawing and hit-testing both ask the functions here where
+// things are, so the two cannot disagree.
+
+#define WB_PIN   0
+#define WB_MIN   1
+#define WB_MAX   2
+#define WB_CLOSE 3
+#define WB_N     4
+#define WB_TAB   4                 // the close mark on the tab, as a fifth button
+#define WBTN     28
+#define WBTN_GAP 6
+
+static void cap_rect(const struct wm_node *nd, int which, int *bx, int *by, int *bw, int *bh) {
+    int right = (int)(nd->x + nd->w) - 10;
+    *bw = WBTN;
+    *bh = WBTN;
+    *by = (int)nd->y + (TITLE_H - WBTN) / 2 + 1;
+    *bx = right - (WB_N - which) * (WBTN + WBTN_GAP) + WBTN_GAP;
+}
+
 static int cap_glow(int n, int b) { return glow_of(KEY_CAP(n, b)); }
 
 static uint32_t win_look(int n) {
     uint32_t v = 0;
-    for (int b = 0; b < 3; b++) v = v * 257 + (uint32_t)cap_glow(n, b);
-    for (int b = 0; b < 3; b++)
-        if (press_key == KEY_CAP(n, b)) v ^= 0x80000000u | (uint32_t)b << 28;
+    for (int b = 0; b <= WB_TAB; b++) v = v * 131 + (uint32_t)cap_glow(n, b);
+    for (int b = 0; b <= WB_TAB; b++)
+        if (press_key == KEY_CAP(n, b)) v ^= 0x80000000u | (uint32_t)b << 27;
     return v;
 }
 
-// One glyph stroke of librast, white, with the dark edge Windows 7 gave its
-// caption glyphs so they read on any glass.
-static void cap_x(int cx, int cy, int focus) {
-    rast_path p;
-    rast_path_init(&p);
-    rast_fx r = RAST_FRAC(9, 2);
-    rast_fx X = RAST_INT(cx) + RAST_ONE / 2, Y = RAST_INT(cy) + RAST_ONE / 2;
-    rast_move_to(&p, X - r, Y - r + RAST_ONE / 4);
-    rast_line_to(&p, X + r, Y + r - RAST_ONE / 4);
-    rast_move_to(&p, X + r, Y - r + RAST_ONE / 4);
-    rast_line_to(&p, X - r, Y + r - RAST_ONE / 4);
-    rast_stroke s;
-    rast_paint pt;
-    rast_stroke_init(&s, RAST_FRAC(19, 5));
-    rast_paint_solid(&pt, focus ? 0x90401010 : 0x60303840);
-    ui_rast_stroke(&p, &s, &pt);
-    rast_stroke_init(&s, RAST_FRAC(11, 5));
-    rast_paint_solid(&pt, 0xFFFFFFFF);
-    ui_rast_stroke(&p, &s, &pt);
-    rast_path_free(&p);
-}
-
-// A crisp glyph made of rectangles, with a one-pixel dark edge.
-static void cap_bar(int x, int y, int w, int h, uint32_t edge, int ea) {
-    ui_blend(x - 1, y - 1, w + 2, h + 2, edge, ea);
-    ui_fill(x, y, w, h, 0x00FFFFFF);
-}
-
-static void draw_caption(int n, int focus) {
-    const struct wm_node *nd = &nodes[n];
-    const theme_t *T = TH;
-    int bx[3], by[3], bw[3], bh[3];
-    for (int b = 0; b < 3; b++) cap_rect(nd, b, &bx[b], &by[b], &bw[b], &bh[b]);
-    int gx = bx[0], gy = by[0], gw = bx[2] + bw[2] - bx[0], gh = CAP_H;
-    int half = gh / 2;
-
-    // The shared plate: glossy above the middle, a little glow below it.
-    ui_round_grad(gx, gy, gw, half, 0, 0, 0x00FFFFFF, T->dark ? 60 : 150,
-                  0x00FFFFFF, T->dark ? 25 : 70);
-    ui_round_grad(gx, gy + half, gw, gh - half, 4, UI_BL | UI_BR,
-                  T->dark ? 0x00000000 : 0x00B8CCE0, T->dark ? 40 : 50,
-                  0x00FFFFFF, T->dark ? 30 : 110);
-
-    for (int b = 0; b < 3; b++) {
-        int glow = cap_glow(n, b);
-        int pressed = (press_key == KEY_CAP(n, b) && glow);
-        int corners = b == 0 ? UI_BL : (b == 2 ? UI_BR : 0);
-        if (b == 2 && focus) {
-            // Close is red while the window is active, brighter under the
-            // pointer, deep when pressed.
-            uint32_t t0 = pressed ? 0x00C86048 : ui_mix(0x00E89480, 0x00F8B8A8, glow);
-            uint32_t t1 = pressed ? 0x00981C08 : ui_mix(0x00C83A20, 0x00E8482C, glow);
-            ui_round_grad(bx[b], by[b], bw[b], half, 0, 0, t0, 235, ui_mix(t0, t1, 140), 235);
-            ui_round_grad(bx[b], by[b] + half, bw[b], gh - half, 4, corners,
-                          t1, 240, pressed ? 0x00B03018 : 0x00F06840, 240);
-        } else if (glow) {
-            int a = glow * 230 / 256;
-            if (b == 2) {
-                ui_round_grad(bx[b], by[b], bw[b], gh, 4, corners,
-                              0x00F0A090, a, 0x00D83C20, a);
-            } else {
-                uint32_t t0 = pressed ? 0x0090C0E8 : 0x00E8F6FF;
-                uint32_t t1 = pressed ? 0x002060A8 : 0x0040A0E8;
-                ui_round_grad(bx[b], by[b], bw[b], half, 0, 0, t0, a, ui_mix(t0, t1, 120), a);
-                ui_round_grad(bx[b], by[b] + half, bw[b], gh - half, 4, corners, t1, a,
-                              0x0090E0FF, a);
-            }
-        }
-    }
-
-    // Outline down the sides and along the bottom -- the top is the frame's
-    // own edge -- a highlight inside it, and the seams.
-    {
-        int saved[4];
-        ui_clip_get(saved);
-        int c[4] = { gx, gy, gx + gw, gy + gh };
-        if (c[0] < saved[0]) c[0] = saved[0];
-        if (c[1] < saved[1]) c[1] = saved[1];
-        if (c[2] > saved[2]) c[2] = saved[2];
-        if (c[3] > saved[3]) c[3] = saved[3];
-        if (c[2] > c[0] && c[3] > c[1]) {
-            ui_clip_set(c);
-            ui_rrect_line(gx, gy - 6, gw, gh + 6, 4, UI_BL | UI_BR, T->rim, focus ? 170 : 110);
-            ui_rrect_line(gx + 1, gy - 6, gw - 2, gh + 5, 3, UI_BL | UI_BR, 0x00FFFFFF,
-                          T->dark ? 50 : 120);
-        }
-        ui_clip_set(saved);
-    }
-    ui_blend(bx[1], gy, 1, gh - 1, T->rim, 110);
-    ui_blend(bx[2], gy, 1, gh - 1, T->rim, 110);
-
-    // The glyphs.
-    uint32_t edge = focus ? 0x00202830 : 0x00405060;
-    int ea = focus ? 150 : 100;
-    int cy = gy + gh / 2;
-    int c0 = bx[0] + bw[0] / 2, c1 = bx[1] + bw[1] / 2, c2 = bx[2] + bw[2] / 2;
-    cap_bar(c0 - 5, cy + 2, 10, 3, edge, ea);                      // minimise
-    if (nd->state == WIN_MAX) {                                    // restore: two boxes
-        cap_bar(c1 - 2, cy - 6, 8, 2, edge, ea);
-        cap_bar(c1 + 5, cy - 6, 1, 6, edge, ea);
-        cap_bar(c1 - 5, cy - 3, 8, 2, edge, ea);
-        cap_bar(c1 - 5, cy - 1, 1, 6, edge, ea);
-        cap_bar(c1 + 2, cy - 1, 1, 6, edge, ea);
-        cap_bar(c1 - 5, cy + 4, 8, 1, edge, ea);
-    } else {                                                       // maximise
-        cap_bar(c1 - 5, cy - 5, 11, 3, edge, ea);
-        cap_bar(c1 - 5, cy - 2, 1, 7, edge, ea);
-        cap_bar(c1 + 5, cy - 2, 1, 7, edge, ea);
-        cap_bar(c1 - 5, cy + 4, 11, 1, edge, ea);
-    }
-    cap_x(c2, cy - 1, focus);
-}
-
-// --- the window frame ----------------------------------------------------------
-
-// Inside the frame: what the program owns, with a hairline round it.
+// The rectangle inside the frame that the window's program owns.
 static void client_rect(int n, int *x, int *y, int *w, int *h) {
     const struct wm_node *nd = &nodes[n];
     *x = (int)nd->x + FRAME;
@@ -814,6 +716,126 @@ static void client_rect(int n, int *x, int *y, int *w, int *h) {
     if (*w < 0) *w = 0;
     if (*h < 0) *h = 0;
 }
+
+// The colour of what the window shows, which its tab takes so the two read
+// as one piece: the terminal's background, or the top row of a program's
+// own picture.
+static uint32_t body_colour(int n) {
+    struct pane *p = &panes[nodes[n].pane_idx];
+    if (!p->gfx_on || !p->gfx || !p->gfx_w) return TH->content_bg;
+    uint32_t r = 0, g = 0, b = 0;
+    int k = 0;
+    for (int i = 0; i < 16; i++) {
+        uint32_t c = p->gfx[(uint32_t)i * p->gfx_w / 16];
+        r += (c >> 16) & 255; g += (c >> 8) & 255; b += c & 255;
+        k++;
+    }
+    return ((r / k) << 16) | ((g / k) << 8) | (b / k);
+}
+
+static int is_light(uint32_t c) {
+    int y = (int)(((c >> 16) & 255) * 77 + ((c >> 8) & 255) * 150 + (c & 255) * 29) >> 8;
+    return y > 150;
+}
+
+// Where the tab is, and where its close mark is.
+static void tab_rect(int n, int *tx, int *ty, int *tw, int *th) {
+    const struct wm_node *nd = &nodes[n];
+    const char *t = pane_title(&panes[nd->pane_idx]);
+    int w = 38 + ui_text_w(t, UI_F13B) + 40;
+    int bx, by, bw, bh;
+    cap_rect(nd, 0, &bx, &by, &bw, &bh);
+    int room = bx - 12 - ((int)nd->x + FRAME);
+    if (w > 280) w = 280;
+    if (w > room) w = room;
+    if (w < 60) w = 60;
+    *tx = (int)nd->x + FRAME;
+    *ty = (int)nd->y + 7;
+    *tw = w;
+    *th = TITLE_H - 7;
+}
+
+static void tab_close_rect(int n, int *x, int *y, int *w, int *h) {
+    int tx, ty, tw, th;
+    tab_rect(n, &tx, &ty, &tw, &th);
+    *w = 22; *h = 22;
+    *x = tx + tw - 30;
+    *y = ty + (th - 22) / 2;
+}
+
+// --- soft glyphs: the window's buttons, and the island's ----------------------
+
+#define FXI(v) RAST_INT(v)
+
+static void g_fill(rast_path *p, uint32_t argb) {
+    rast_paint pt;
+    rast_paint_solid(&pt, argb);
+    ui_rast_fill(p, &pt);
+}
+
+static void g_stroke(rast_path *p, rast_fx wdt, uint32_t argb) {
+    rast_stroke s;
+    rast_stroke_init(&s, wdt);
+    s.cap = RAST_CAP_ROUND;
+    s.join = RAST_JOIN_ROUND;
+    rast_paint pt;
+    rast_paint_solid(&pt, argb);
+    ui_rast_stroke(p, &s, &pt);
+}
+
+#define GL_PIN   0
+#define GL_MIN   1
+#define GL_MAX   2
+#define GL_CLOSE 3
+#define GL_RESTORE 4
+
+// A glyph in a box of size s at (x, y).
+static void wglyph(int g, int x, int y, int s, uint32_t c) {
+    rast_path p;
+    rast_path_init(&p);
+    rast_fx X = FXI(x), Y = FXI(y), S = FXI(s);
+#define PT(a, b) X + (rast_fx)((int64_t)S * (a) / 100), Y + (rast_fx)((int64_t)S * (b) / 100)
+#define LEN(a) (rast_fx)((int64_t)S * (a) / 100)
+    switch (g) {
+    case GL_PIN:
+        rast_round_rect(&p, PT(30, 8), LEN(40), LEN(40), LEN(10), LEN(10));
+        rast_move_to(&p, PT(16, 52)); rast_line_to(&p, PT(84, 52));
+        rast_line_to(&p, PT(70, 38)); rast_line_to(&p, PT(30, 38)); rast_close(&p);
+        g_fill(&p, c);
+        rast_path_reset(&p);
+        rast_move_to(&p, PT(50, 52)); rast_line_to(&p, PT(50, 92));
+        g_stroke(&p, LEN(10), c);
+        break;
+    case GL_MIN:
+        rast_move_to(&p, PT(22, 52)); rast_line_to(&p, PT(78, 52));
+        g_stroke(&p, LEN(11), c);
+        break;
+    case GL_MAX:
+        rast_round_rect(&p, PT(22, 22), LEN(56), LEN(56), LEN(16), LEN(16));
+        g_stroke(&p, LEN(10), c);
+        break;
+    case GL_RESTORE:
+        rast_round_rect(&p, PT(34, 16), LEN(48), LEN(48), LEN(14), LEN(14));
+        g_stroke(&p, LEN(9), c);
+        rast_path_reset(&p);
+        rast_round_rect(&p, PT(18, 36), LEN(48), LEN(48), LEN(14), LEN(14));
+        g_fill(&p, c);
+        break;
+    default:
+        rast_move_to(&p, PT(26, 26)); rast_line_to(&p, PT(74, 74));
+        rast_move_to(&p, PT(74, 26)); rast_line_to(&p, PT(26, 74));
+        g_stroke(&p, LEN(11), c);
+        break;
+    }
+#undef PT
+#undef LEN
+    rast_path_free(&p);
+}
+
+// --- the window frame ----------------------------------------------------------
+
+// Each window's glass, with its memory of what lies under it.
+static ui_glass wglass[MAX_NODES];
 
 // Where the window and its shadow reach: x0, y0, x1, y1.
 static void window_extent(int n, int e[4]) {
@@ -833,69 +855,140 @@ static int boxes_meet(const int a[4], const int b[4]) {
     return a[0] < b[2] && b[0] < a[2] && a[1] < b[3] && b[1] < a[3];
 }
 
+// The glass of a window: a frame round its body, the strip at the top.
+static void window_glass(int n, int focus) {
+    const struct wm_node *nd = &nodes[n];
+    int x = (int)nd->x, y = (int)nd->y, w = (int)nd->w, h = (int)nd->h;
+    int maxed = nd->state == WIN_MAX;
+    int R = maxed ? 0 : RAD_T;
+    int bx, by, bw, bh;
+    client_rect(n, &bx, &by, &bw, &bh);
+    ui_glass_draw(&wglass[n], x, y, w, h, R, bx, by, bw, bh, BODY_R, UI_TR | UI_BL | UI_BR,
+                  focus ? TH->glass : TH->glass_off, focus ? TH->glass_a : TH->glass_off_a);
+}
+
 static void paint_chrome(int n, int focus) {
     const struct wm_node *nd = &nodes[n];
     struct pane *p = &panes[nd->pane_idx];
     const theme_t *T = TH;
     int x = (int)nd->x, y = (int)nd->y, w = (int)nd->w, h = (int)nd->h;
     int maxed = nd->state == WIN_MAX;
-    int rt = maxed ? 0 : RAD_T, rb = maxed ? 0 : RAD_B;
+    int R = maxed ? 0 : RAD_T;
 
+    window_glass(n, focus);
+
+    // Light on the glass: a sheen down the strip, a fine bright edge round
+    // the whole window and a faint dark one just outside it, so a pale window
+    // still has an outline against a pale wallpaper.
+    ui_mat sheen = { UI_GRAD, 0x00FFFFFF, 0x00FFFFFF, focus ? 60 : 36, 0, y, y + TITLE_H };
+    ui_rrect(x, y, w, TITLE_H, R, UI_TOP, &sheen);
     if (!maxed) {
-        // The shadow never reaches the taskbar: the bar is repainted on its
-        // own schedule, and a shadow laid over it twice would darken twice.
-        int lim[4] = { 0, 0, (int)fb_get_width(), (int)fb_get_height() - TASKBAR_H };
-        ui_shadow(x, y, w, h, RAD_T, SHADOW, focus ? 120 : 75, SHADOW_DY, lim);
-        ui_shadow(x, y, w, h, RAD_T, 3, focus ? 80 : 55, 1, lim);
+        ui_rrect_line(x, y, w, h, R, UI_ALL, 0x00FFFFFF, focus ? 150 : 110);
+        ui_rrect_line(x + 1, y + 1, w - 2, h - 2, R - 1, UI_ALL, 0x00FFFFFF, 30);
     }
 
-    // The glass: the frosted wallpaper under a milky tint.
-    ui_mat glass = { UI_GLASS, focus ? T->glass : T->glass_off, 0,
-                     focus ? T->glass_a : T->glass_off_a, 0, 0, 0 };
-    ui_rrect2(x, y, w, h, rt, rb, &glass);
-
-    // Its gloss: bright along the top edge, gone by the bottom of the title.
-    ui_mat sheen = { UI_GRAD, 0x00FFFFFF, 0x00FFFFFF, focus ? T->sheen_a : T->sheen_a / 2, 0,
-                     y, y + TITLE_H };
-    ui_rrect(x, y, w, TITLE_H, rt, UI_TOP, &sheen);
-
-    // Edges: a dark hairline outside, a light one just inside it.
-    ui_rrect2_line(x, y, w, h, rt, rb, T->rim, focus ? T->rim_a : T->rim_a * 3 / 4);
-    ui_rrect2_line(x + 1, y + 1, w - 2, h - 2, rt > 1 ? rt - 1 : 0, rb > 1 ? rb - 1 : 0,
-                   0x00FFFFFF, focus ? T->shine_a : T->shine_a / 2);
-
-    // Where the program draws, set into the glass by a hairline.
-    int cx, cy, cw, ch;
-    client_rect(n, &cx, &cy, &cw, &ch);
-    if (!p->gfx_on) ui_fill(cx, cy, cw, ch, T->content_bg);
-    ui_blend(cx - 1, cy - 1, cw + 2, 1, T->rim, 150);
-    ui_blend(cx - 1, cy + ch, cw + 2, 1, T->rim, 150);
-    ui_blend(cx - 1, cy, 1, ch, T->rim, 150);
-    ui_blend(cx + cw, cy, 1, ch, T->rim, 150);
-
-    // The title, and the program's icon before it if it has one.
-    int bx, by, bw, bh;
-    cap_rect(nd, 0, &bx, &by, &bw, &bh);
-    const char *ttl = pane_title(p);
-    int tx = x + 10;
-    if (ui_icon(x + 9, y + (TITLE_H - ICON_SMALL) / 2, ttl, ICON_SMALL))
-        tx = x + 9 + ICON_SMALL + 6;
-    int ty = y + (TITLE_H - ui_line_h(UI_F13)) / 2;
-    int room = bx - 10 - tx;
-    if (room > 0) {
+    // The tab: in the body's colour, rounded at the top, its right foot
+    // curving out into the strip so the tab and the body are one shape.
+    uint32_t bc = body_colour(n);
+    int tx, ty, tw, th;
+    tab_rect(n, &tx, &ty, &tw, &th);
+    ui_mat tabm = { UI_SOLID, bc, 0, 255, 0, 0, 0 };
+    ui_rrect(tx, ty, tw, th + 2, 12, UI_TOP, &tabm);
+    {
+        rast_path fp;
+        rast_path_init(&fp);
+        int fy = ty + th;                        // the strip's bottom = body top
+        rast_move_to(&fp, FXI(tx + tw + 10), FXI(fy));
+        rast_quad_to(&fp, FXI(tx + tw), FXI(fy), FXI(tx + tw), FXI(fy - 10));
+        rast_line_to(&fp, FXI(tx + tw), FXI(fy));
+        rast_close(&fp);
+        g_fill(&fp, 0xFF000000 | bc);
+        rast_path_free(&fp);
+    }
+    uint32_t ink = is_light(bc) ? T->title_text : 0x00F2F4F7;
+    uint32_t dim = is_light(bc) ? T->title_text_dim : 0x009AA3AE;
+    {
+        const char *ttl = pane_title(p);
+        int ix = tx + 12, iy = ty + (th - 18) / 2;
+        if (!ui_icon(ix + 1, iy + 1, ttl, ICON_SMALL)) {
+            // No drawn icon yet: a dot of the system's colour.
+            ui_round_fill(ix + 2, iy + 2, 14, 14, 7, T->accent, 255);
+        }
         int saved[4];
         ui_clip_get(saved);
-        ui_clip(tx - 6, y, room + 12, TITLE_H);
-        // Long titles fit with an ellipsis; the glow goes round what is shown.
-        if (ui_text_w(ttl, UI_F13) <= room)
-            ui_text_glow(tx, ty, ttl, UI_F13, focus ? T->title_text : T->title_text_dim,
-                         T->title_glow, focus ? T->title_glow_a : T->title_glow_a / 2);
-        else
-            ui_text_fit(tx, ty, room, ttl, UI_F13, focus ? T->title_text : T->title_text_dim);
+        ui_clip(tx, ty, tw - 36, th);
+        ui_text_fit(ix + 26, ty + (th - ui_line_h(UI_F13B)) / 2, tw - 36 - 38, ttl, UI_F13B,
+                    focus ? ink : dim);
         ui_clip_set(saved);
+        int cx, cy, cw, chh;
+        tab_close_rect(n, &cx, &cy, &cw, &chh);
+        int glow = cap_glow(n, WB_TAB);
+        if (glow) ui_round_fill(cx, cy, cw, chh, 11, is_light(bc) ? 0x00000000 : 0x00FFFFFF, glow * 30 / 256);
+        wglyph(GL_CLOSE, cx + 5, cy + 5, 12, 0xFF000000 | dim);
     }
 
-    draw_caption(n, focus);
+    // The buttons.
+    static const int glyphs[WB_N] = { GL_PIN, GL_MIN, GL_MAX, GL_CLOSE };
+    for (int b = 0; b < WB_N; b++) {
+        int bx, by, bw, bh;
+        cap_rect(nd, b, &bx, &by, &bw, &bh);
+        int glow = cap_glow(n, b);
+        int pressed = press_key == KEY_CAP(n, b) && glow;
+        uint32_t fill = 0x00FFFFFF, gc = 0xFF000000 | T->title_text;
+        int a = focus ? 110 : 70;
+        a += glow * (focus ? 120 : 140) / 256;
+        if (b == WB_CLOSE && glow) {
+            fill = ui_mix(0x00FFFFFF, 0x00E5484D, glow);
+            a = 120 + glow * 135 / 256;
+            gc = 0xFF000000 | ui_mix(T->title_text, 0x00FFFFFF, glow);
+        }
+        if (b == WB_PIN && nd->pinned) { fill = T->accent; a = 255; gc = 0xFFFFFFFF; }
+        if (pressed) a = 255, fill = ui_mix(fill, 0, 30);
+        ui_round_fill(bx, by, bw, bh, bw / 2, fill, a);
+        int g = glyphs[b];
+        if (b == WB_MAX && maxed) g = GL_RESTORE;
+        wglyph(g, bx + 7, by + 7, 14, gc);
+    }
+}
+
+// Paint the corners of a window's body again -- the frame's glass over the
+// program's picture, at the rounded edge -- after the picture alone was
+// redrawn (present_pane_only) and squared them off.
+static void repair_body_corners(int n) {
+    if (!wglass[n].have) return;
+    int bx, by, bw, bh;
+    client_rect(n, &bx, &by, &bw, &bh);
+    int saved[4];
+    ui_clip_get(saved);
+    int sq[3][2] = { { bx + bw - BODY_R, by }, { bx, by + bh - BODY_R },
+                     { bx + bw - BODY_R, by + bh - BODY_R } };
+    for (int k = 0; k < 3; k++) {
+        ui_clip(sq[k][0], sq[k][1], BODY_R, BODY_R);
+        window_glass(n, n == focused);
+    }
+    ui_clip_set(saved);
+}
+
+// --- this frame's damage --------------------------------------------------------
+//
+// Which parts of the screen were painted this frame, so each pane of glass
+// can refresh its memory of what lies under it there -- and only there.
+
+#define DMG_MAX 96
+static int dmg[DMG_MAX][4], ndmg, dmg_all;
+
+static void dmg_add(int x0, int y0, int x1, int y1) {
+    if (x1 <= x0 || y1 <= y0) return;
+    if (ndmg >= DMG_MAX) { dmg_all = 1; return; }
+    dmg[ndmg][0] = x0; dmg[ndmg][1] = y0; dmg[ndmg][2] = x1; dmg[ndmg][3] = y1;
+    ndmg++;
+}
+
+// Bring a pane of glass's memory up to date with the back buffer as it is
+// now -- which must be, where the damage is, what lies under the glass.
+static void glass_catch_up(ui_glass *g) {
+    if (dmg_all) ui_glass_forget(g);
+    ui_glass_take(g, (const int (*)[4])dmg, ndmg);
 }
 
 // Graphics-mode panes and terminals alike: the content inside the client area.
@@ -941,13 +1034,28 @@ static void pane_painted(int n) {
 
 static void paint_window(int n) {
     int focus = (n == focused);
+    struct wm_node *nd = &nodes[n];
+    struct pane *p = &panes[nd->pane_idx];
     uint64_t p0 = rdtsc();
-    paint_chrome(n, focus);
+
+    // The shadow first, under everything of the window's own; then what the
+    // program shows; then the glass round it, whose rounded inner edge lies
+    // over the corners of the picture.
+    if (nd->state != WIN_MAX) {
+        ui_shadow((int)nd->x, (int)nd->y, (int)nd->w, (int)nd->h, RAD_T, SHADOW,
+                  focus ? 66 : 42, SHADOW_DY, 0);
+        ui_shadow((int)nd->x, (int)nd->y, (int)nd->w, (int)nd->h, RAD_T, 4,
+                  focus ? 34 : 24, 1, 0);
+    }
+    int bx, by, bw, bh;
+    client_rect(n, &bx, &by, &bw, &bh);
+    if (!p->gfx_on) ui_fill(bx, by, bw, bh, TH->content_bg);
     uint32_t cx, cy, cw, ch;
     content_rect(n, &cx, &cy, &cw, &ch);
     uint64_t c0 = rdtsc();
     draw_content(n, cx, cy, cw, ch, focus);
     pf_content += rdtsc() - c0;
+    paint_chrome(n, focus);
     pf_paint += rdtsc() - p0;
     pf_painted++;
     pane_painted(n);
@@ -957,20 +1065,24 @@ static void paint_window(int n) {
 // so they are drawn over the desktop rather than over last frame's copy of
 // themselves -- a shadow laid down twice is twice as dark. The window's own
 // rectangle needs nothing: glass and content cover every pixel of it.
+static void restore_wall_d(int x, int y, int w, int h) {
+    restore_wall(x, y, w, h);
+    dmg_add(x, y, x + w, y + h);
+}
+
 static void clear_ring(int n, const int e[4]) {
     const struct wm_node *nd = &nodes[n];
     if (nd->state == WIN_MAX) return;
     int x = (int)nd->x, y = (int)nd->y, w = (int)nd->w, h = (int)nd->h;
-    int deskb = (int)fb_get_height() - TASKBAR_H;
-    int y1 = e[3] < deskb ? e[3] : deskb;
+    int y1 = e[3];
     int top = y + RAD_T, bot = y + h - RAD_B;
     if (top > y1) top = y1;
-    restore_wall(e[0], e[1], e[2] - e[0], top - e[1]);                 // above
-    if (bot < y1) restore_wall(e[0], bot, e[2] - e[0], y1 - bot);      // below
+    restore_wall_d(e[0], e[1], e[2] - e[0], top - e[1]);                 // above
+    if (bot < y1) restore_wall_d(e[0], bot, e[2] - e[0], y1 - bot);      // below
     int mid1 = bot < y1 ? bot : y1;
     if (mid1 > top) {
-        restore_wall(e[0], top, x + RAD_T - e[0], mid1 - top);        // left
-        restore_wall(x + w - RAD_T, top, e[2] - (x + w - RAD_T), mid1 - top);
+        restore_wall_d(e[0], top, x + RAD_T - e[0], mid1 - top);        // left
+        restore_wall_d(x + w - RAD_T, top, e[2] - (x + w - RAD_T), mid1 - top);
     }
 }
 
@@ -982,6 +1094,10 @@ static void clear_ring(int n, const int e[4]) {
 // there is put back first -- which erases anything ELSE that was there, so
 // every window whose own reach overlaps is repainted too, and so on down the
 // stack until nothing more is touched.
+//
+// Each window's glass catches up with what is under it just before the
+// window is painted: by then everything below it that changed this frame has
+// been painted, and nothing above it has.
 static void render_windows(void) {
     int win[MAX_NODES], vis[MAX_NODES], nv = 0;
     int n = collect_windows(cur_ws, win, MAX_NODES);
@@ -1005,7 +1121,14 @@ static void render_windows(void) {
         if (!moved) break;
     }
     for (int k = L; k < nv; k++) clear_ring(vis[k], ext[k]);
-    for (int k = L; k < nv; k++) paint_window(vis[k]);
+    for (int k = L; k < nv; k++) {
+        int m = vis[k];
+        const struct wm_node *nd = &nodes[m];
+        ui_glass_place(&wglass[m], (int)nd->x, (int)nd->y, (int)nd->w, (int)nd->h, 16);
+        glass_catch_up(&wglass[m]);
+        paint_window(m);
+        dmg_add(ext[k][0], ext[k][1], ext[k][2], ext[k][3]);
+    }
 }
 
 // Cached wall clock, refreshed once a second by wm_poll so the render path
@@ -1083,14 +1206,34 @@ static int load_wallpaper_file(const char *path, uint32_t w, uint32_t h) {
 // pane of glass costs a lookup and a blend per pixel however big it is.
 static uint32_t *wp_frost;
 
+// Which of the painted wallpapers (wall.h), when the user has not put a
+// picture of their own at /wall.ppm.
+static int wall_style = WALL_LAGOON;
+
+// The system's colour comes from the wallpaper. Everything that shows it --
+// the frame tint, a selection, a progress bar, programs through
+// wm_palette -- is worked out from that one colour here.
+static void theme_wear(uint32_t acc) {
+    for (int i = 0; i < NTHEMES; i++) {
+        theme_t *T = &THEMES[i];
+        T->accent = acc;
+        T->glow = acc;
+        T->orb = acc;
+        T->ui_accent = ui_mix(acc, 0, T->dark ? 0 : 40);       // white text reads on it
+        T->ui_accent2 = ui_mix(acc, T->dark ? 0xFFFFFF : 0, 90);
+        T->ui_sel = ui_mix(T->dark ? 0x00101418 : 0x00FFFFFF, acc, T->dark ? 90 : 60);
+        T->ui_hot = ui_mix(T->dark ? 0x00101418 : 0x00FFFFFF, acc, T->dark ? 50 : 26);
+        T->glass = ui_mix(T->dark ? 0x00141A20 : 0x00FFFFFF, acc, 34);
+        T->glass_off = ui_mix(T->dark ? 0x00141A20 : 0x00FFFFFF, acc, 14);
+    }
+}
+
 static void gen_wallpaper(uint32_t w, uint32_t h) {
     if (wallpaper) kfree(wallpaper);
     if (wp_frost) kfree(wp_frost);
-    if (desk_px) kfree(desk_px);
     ui_set_backdrop(0, 0, 0);
     wallpaper = kmalloc((size_t)w * h * 4);
     wp_frost = kmalloc((size_t)w * h * 4);
-    desk_px = kmalloc((size_t)w * h * 4);
     wp_w = wallpaper ? w : 0;
     wp_h = wallpaper ? h : 0;
     wp_theme = theme;
@@ -1102,13 +1245,13 @@ static void gen_wallpaper(uint32_t w, uint32_t h) {
     // and put SCSI traffic in every boot, which the lazy mount exists to avoid.
     if (!load_wallpaper_file("/wall.ppm", w, h) &&
         !(fat32_mounted() && load_wallpaper_file("/usb/wall.ppm", w, h)))
-        wall_paint(wallpaper, (int)w, (int)h, TH->dark);
+        wall_soft(wallpaper, (int)w, (int)h, wall_style);
+    theme_wear(ui_accent_from(wallpaper, (int)w, (int)h));
 
     if (wp_frost) {
         wall_frost(wallpaper, wp_frost, (int)w, (int)h, TH->dark);
         ui_set_backdrop(wp_frost, (int)w, (int)h);
     }
-    desk_rebuild();
 }
 
 static void draw_wallpaper(void) {
@@ -1122,9 +1265,7 @@ static void draw_wallpaper(void) {
     wp_dirty = 0;
     fb_mark_rows(0, h);
 
-    // The desktop: the wallpaper with the icons on it, when there is room
-    // for both.
-    const uint32_t *src = desk_px ? desk_px : wallpaper;
+    const uint32_t *src = wallpaper;
     volatile uint8_t *base = fb_get_base();
     uint32_t pitch = fb_get_pitch();
     uint32_t pairs = w / 2;                 // copy two pixels at a time
@@ -1263,117 +1404,169 @@ static void draw_gadget(void) {
     draw_text_t(gx + gw - 12 - q * (int)GW, yy, ut, 0x00B8C0CC);
 }
 
-// --- bottom taskbar -------------------------------------------------------
+// --- the island ---------------------------------------------------------------
 //
-// Windows 7's superbar in liquid glass: the frosted wallpaper under a smoky
-// tint, the round Start orb at the left, a glass button per window, and at
-// the right the network and the speaker, the clock over the date, and the
-// thin strip that shows the desktop.
+// The panel, floating: a rounded slab of coloured glass, clear of the screen's
+// edge, holding the launcher (the xyuOS mark), the programs -- the ones kept
+// on it and the ones running -- and a pill with the network, the sound, the
+// time and the date. It sits at the bottom by default and can be dragged to
+// the left, right or top edge, where it turns to fit.
 //
 // Where everything sits is worked out in ONE place, tb_layout(), and the
-// drawing, the hit-testing and the hover all read it -- so a button can never
-// be drawn in one place and clicked in another.
+// drawing, the hit-testing and the hover all read it.
 
-static int start_open;                 // the start menu (defined further down)
+static int start_open;                 // the launcher (defined further down)
 
-#define TB_ORB   1
-#define TB_WS    2
-#define TB_WIN   3
-#define TB_NET   4
-#define TB_VOL   5
-#define TB_CLOCK 6
-#define TB_PEEK  7
-#define TB_MAX   (MAX_WS + MAX_NODES + 8)
+#define ISL_BOTTOM 0
+#define ISL_LEFT   1
+#define ISL_RIGHT  2
+#define ISL_TOP    3
+static int island_edge = ISL_BOTTOM;
+static int island_edge_now(void) { return island_edge; }
 
-struct tb_item { int kind, x, w, arg; };
+#define TB_ORB    1                    // the launcher
+#define TB_APP    2                    // a program: kept, running, or both
+#define TB_STATUS 3                    // network, sound, time
+#define TB_MAX    (MAX_NODES + 16)
+
+#define ISL_PAD    10
+#define ISL_ICON   44
+#define ISL_SLOT   52
+#define ISL_GAP    14
+#define ISL_STAT_W 172                 // the status pill, lying down
+#define ISL_STAT_H 112                 //                  standing up
+#define ISL_R      26
+
+struct tb_item {
+    int kind, x, y, w, h;
+    int win;                           // TB_APP: its window, or -1 if not running
+    int nwin;                          // TB_APP: how many windows it has
+    char name[16];                     // TB_APP: the program's file in /bin
+};
 static struct tb_item tb_items[TB_MAX];
 static int tb_n;
+static int isl_x, isl_y, isl_w, isl_h;
 
-#define TB_BTN_W   168                 // a window's button, when there is room
-#define TB_BTN_MIN 44
+// The programs kept on the island, whether running or not.
+static const char *const isl_kept[] = { "files", "web", "sh", "note", "play", "taskmgr", "control" };
+#define ISL_KEPT (int)(sizeof isl_kept / sizeof isl_kept[0])
 
-static void tb_add(int kind, int x, int w, int arg) {
-    if (tb_n >= TB_MAX) return;
-    tb_items[tb_n].kind = kind;
-    tb_items[tb_n].x = x;
-    tb_items[tb_n].w = w;
-    tb_items[tb_n].arg = arg;
-    tb_n++;
+static int isl_vertical(void) { return island_edge == ISL_LEFT || island_edge == ISL_RIGHT; }
+
+static void str_put(char *d, const char *s, int max) {
+    int i = 0;
+    while (s && s[i] && i < max - 1) { d[i] = s[i]; i++; }
+    d[i] = 0;
+}
+
+static int str_same(const char *a, const char *b) {
+    while (*a && *a == *b) { a++; b++; }
+    return *a == *b;
 }
 
 static void tb_layout(void) {
-    int W = (int)fb_get_width();
+    int W = (int)fb_get_width(), H = (int)fb_get_height();
+    int vertical = isl_vertical();
     tb_n = 0;
-    tb_add(TB_ORB, 2, TASKBAR_H + 4, 0);
 
-    // From the right: the strip, the clock, the speaker, the network.
-    int r = W;
-    tb_add(TB_PEEK, r - 15, 15, 0);          r -= 15;
-    tb_add(TB_CLOCK, r - 84, 84, 0);         r -= 84;
-    tb_add(TB_VOL, r - 30, 30, 0);           r -= 30;
-    tb_add(TB_NET, r - 30, 30, 0);           r -= 30 + 10;
-
-    int x = 2 + TASKBAR_H + 4 + 6;
-    // Workspaces: only once there is more than one in use.
-    int used = 0;
-    for (int i = 0; i < MAX_WS; i++) if (i == cur_ws || ws_has_windows(i)) used++;
-    if (used > 1) {
-        for (int i = 0; i < MAX_WS; i++) {
-            if (i != cur_ws && !ws_has_windows(i)) continue;
-            tb_add(TB_WS, x, 24, i);
-            x += 26;
-        }
-        x += 8;
-    }
-
+    // The slots: kept programs first, then any other program with a window.
     int win[MAX_NODES];
-    int n = collect_windows(cur_ws, win, MAX_NODES);
-    if (n <= 0) return;
-    int room = r - x;
-    int bw = TB_BTN_W;
-    if (n * (bw + 4) > room) bw = room / n - 4;
-    if (bw < TB_BTN_MIN) bw = TB_BTN_MIN;
-    // Oldest first, the way they were opened -- not by stacking order, or
-    // every click would shuffle the bar.
-    int order[MAX_NODES];
-    for (int i = 0; i < n; i++) order[i] = win[i];
-    for (int i = 1; i < n; i++) {
-        int v = order[i], j = i - 1;
-        while (j >= 0 && order[j] > v) { order[j + 1] = order[j]; j--; }
-        order[j + 1] = v;
+    int nw = collect_windows(cur_ws, win, MAX_NODES);
+    struct tb_item apps[TB_MAX];
+    int na = 0;
+    for (int k = 0; k < ISL_KEPT; k++) {
+        struct tb_item *a = &apps[na++];
+        a->kind = TB_APP;
+        str_put(a->name, isl_kept[k], sizeof a->name);
+        a->win = -1;
+        a->nwin = 0;
     }
-    for (int i = 0; i < n && x + bw <= r; i++) {
-        tb_add(TB_WIN, x, bw, order[i]);
-        x += bw + 4;
+    // Oldest window first, so a program's place does not shuffle on a click.
+    for (int i = 0; i < MAX_NODES; i++) {
+        int n = -1;
+        for (int j = 0; j < nw; j++) if (win[j] == i) n = i;
+        if (n < 0) continue;
+        const char *t = pane_title(&panes[nodes[n].pane_idx]);
+        int s = -1;
+        for (int k = 0; k < na; k++) if (str_same(apps[k].name, t)) s = k;
+        if (s < 0 && na < TB_MAX - 2) {
+            s = na++;
+            apps[s].kind = TB_APP;
+            str_put(apps[s].name, t, sizeof apps[s].name);
+            apps[s].win = -1;
+            apps[s].nwin = 0;
+        }
+        if (s < 0) continue;
+        apps[s].nwin++;
+        // The one it brings forward: the focused window, else the newest.
+        if (apps[s].win < 0 || n == focused) apps[s].win = n;
     }
+
+    int along = ISL_PAD + ISL_ICON + ISL_GAP + na * ISL_SLOT + ISL_GAP +
+                (vertical ? ISL_STAT_H : ISL_STAT_W) + ISL_PAD;
+    if (vertical) {
+        isl_w = ISLAND_H;
+        isl_h = along;
+        isl_x = island_edge == ISL_LEFT ? 14 : W - 14 - ISLAND_H;
+        isl_y = (H - along) / 2;
+    } else {
+        isl_w = along;
+        isl_h = ISLAND_H;
+        isl_x = (W - along) / 2;
+        isl_y = island_edge == ISL_TOP ? 14 : H - 14 - ISLAND_H;
+    }
+
+    // Lay them along it.
+    int at = ISL_PAD;
+    struct tb_item *o = &tb_items[tb_n++];
+    o->kind = TB_ORB; o->win = -1; o->nwin = 0; o->name[0] = 0;
+    if (vertical) { o->x = isl_x + (ISLAND_H - ISL_ICON) / 2; o->y = isl_y + at; }
+    else          { o->x = isl_x + at; o->y = isl_y + (ISLAND_H - ISL_ICON) / 2; }
+    o->w = o->h = ISL_ICON;
+    at += ISL_ICON + ISL_GAP;
+    for (int k = 0; k < na; k++) {
+        struct tb_item *it = &tb_items[tb_n++];
+        *it = apps[k];
+        if (vertical) { it->x = isl_x + (ISLAND_H - ISL_SLOT) / 2; it->y = isl_y + at; }
+        else          { it->x = isl_x + at; it->y = isl_y + (ISLAND_H - ISL_SLOT) / 2; }
+        it->w = it->h = ISL_SLOT;
+        at += ISL_SLOT;
+    }
+    at += ISL_GAP;
+    struct tb_item *s = &tb_items[tb_n++];
+    s->kind = TB_STATUS; s->win = -1; s->nwin = 0; s->name[0] = 0;
+    if (vertical) { s->x = isl_x + 8; s->y = isl_y + at; s->w = ISLAND_H - 16; s->h = ISL_STAT_H; }
+    else          { s->x = isl_x + at; s->y = isl_y + 10; s->w = ISL_STAT_W; s->h = ISLAND_H - 20; }
 }
 
-static int tb_item_at(int mx) {
+static int tb_item_at(int mx, int my) {
     for (int i = 0; i < tb_n; i++)
-        if (mx >= tb_items[i].x && mx < tb_items[i].x + tb_items[i].w) return i;
+        if (mx >= tb_items[i].x && mx < tb_items[i].x + tb_items[i].w &&
+            my >= tb_items[i].y && my < tb_items[i].y + tb_items[i].h) return i;
     return -1;
 }
 
-// Everything the taskbar shows, folded into one value. It only really changes
-// once a minute (the clock), so this keeps an otherwise idle desktop from
-// repainting -- and therefore from pushing anything to the screen at all.
+static int on_island(int mx, int my) {
+    return mx >= isl_x && mx < isl_x + isl_w && my >= isl_y && my < isl_y + isl_h;
+}
+
+// Everything the island shows, folded into one value: unchanged, it is not
+// drawn again.
 static uint64_t taskbar_fingerprint(void) {
     uint64_t hsh = 14695981039346656037ULL;
-    hsh = (hsh ^ (uint64_t)theme)  * FNV_P;
-    hsh = (hsh ^ (uint64_t)cur_ws) * FNV_P;
+    hsh = (hsh ^ (uint64_t)theme) * FNV_P;
+    hsh = (hsh ^ (uint64_t)island_edge) * FNV_P;
     hsh = (hsh ^ (uint64_t)focused) * FNV_P;
     hsh = (hsh ^ (uint64_t)start_open) * FNV_P;
     hsh = (hsh ^ (uint64_t)(press_key + 7)) * FNV_P;
+    hsh = (hsh ^ (uint64_t)TH->accent) * FNV_P;
     for (int i = 0; i < tb_n; i++) {
         const struct tb_item *it = &tb_items[i];
-        hsh = (hsh ^ (uint64_t)(it->kind * 131 + it->x * 7 + it->w)) * FNV_P;
-        hsh = (hsh ^ (uint64_t)it->arg) * FNV_P;
+        hsh = (hsh ^ (uint64_t)(it->kind * 131 + it->x * 7 + it->y * 3 + it->w)) * FNV_P;
+        hsh = (hsh ^ ((uint64_t)(it->win + 1) * 17 + (uint64_t)it->nwin)) * FNV_P;
         hsh = (hsh ^ (uint64_t)glow_of(KEY_TB(i))) * FNV_P;
-        if (it->kind == TB_WIN) {
-            const char *t = pane_title(&panes[nodes[it->arg].pane_idx]);
-            for (int k = 0; t[k] && k < 24; k++) hsh = (hsh ^ (uint8_t)t[k]) * FNV_P;
-            hsh = (hsh ^ (uint64_t)nodes[it->arg].state) * FNV_P;
-        }
+        for (int k = 0; it->name[k]; k++) hsh = (hsh ^ (uint8_t)it->name[k]) * FNV_P;
+        if (it->win >= 0) hsh = (hsh ^ (uint64_t)nodes[it->win].state) * FNV_P;
     }
     hsh = (hsh ^ (uint64_t)net_is_up()) * FNV_P;
     hsh = (hsh ^ (uint64_t)audio_ready()) * FNV_P;
@@ -1387,270 +1580,249 @@ static uint64_t taskbar_fingerprint(void) {
 static uint64_t tb_fp;
 static int      tb_valid = 0;
 
-// The taskbar's glass.
-static uint32_t tb_tint(void)  { return TH->dark ? 0x00060A10 : 0x000E2440; }
-static int      tb_tint_a(void) { return TH->dark ? 180 : 155; }
+// --- keeping what is under a floating thing ------------------------------------
+//
+// The island, a menu, a notice: each floats over the windows, and its shadow
+// and rounded corners are blended with whatever is under it. Drawn again in
+// place it would blend with its own last copy and darken a little more each
+// time. So each keeps the exact pixels under it -- refreshed only where
+// something under it was painted this frame -- and puts them back before it
+// is drawn again.
+typedef struct { int x, y, w, h, cap, have; uint32_t *px; } ukeep;
 
-// The Start orb: a sphere of dark blue glass, lit from below, a gloss across
-// its top, a white four-pointed spark in the middle. It glows under the
-// pointer and while the menu is open.
-static void draw_start_orb(int cx, int cy, int r, int glow, int pressed) {
-    rast_fx X = RAST_INT(cx), Y = RAST_INT(cy), R = RAST_INT(r);
-    rast_path p;
-    rast_path_init(&p);
-    rast_paint pt;
-
-    // A halo, under the pointer.
-    if (glow > 0) {
-        static rast_stop halo[3];
-        halo[0].offset = 0;                 halo[0].color = 0x00000000;
-        halo[1].offset = RAST_FRAC(55, 100); halo[1].color = ((uint32_t)(glow * 150 / 256) << 24) | 0x60D0FF;
-        halo[2].offset = RAST_ONE;          halo[2].color = 0x0060D0FF;
-        rast_ellipse(&p, X, Y, R + RAST_INT(6), R + RAST_INT(6));
-        for (unsigned i = 0; i < sizeof pt; i++) ((volatile uint8_t *)&pt)[i] = 0;
-        pt.type = RAST_RADIAL; pt.m = rast_identity();
-        pt.cx = X; pt.cy = Y; pt.fx = X; pt.fy = Y; pt.r = R + RAST_INT(6);
-        pt.stops = halo; pt.nstops = 3; pt.opacity = 255;
-        ui_rast_fill(&p, &pt);
-        rast_path_reset(&p);
-    }
-
-    // The sphere.
-    static rast_stop body[4];
-    uint32_t lift = pressed ? 0 : (uint32_t)glow;
-    body[0].offset = 0;                  body[0].color = 0xFF000000 | ui_mix(0x0060C8FF, 0x00A8F0FF, (int)lift);
-    body[1].offset = RAST_FRAC(45, 100); body[1].color = 0xFF000000 | ui_mix(0x00207AD8, 0x003C98EC, (int)lift);
-    body[2].offset = RAST_FRAC(85, 100); body[2].color = pressed ? 0xFF062454 : 0xFF0C3C88;
-    body[3].offset = RAST_ONE;           body[3].color = 0xFF061E48;
-    rast_ellipse(&p, X, Y, R, R);
-    for (unsigned i = 0; i < sizeof pt; i++) ((volatile uint8_t *)&pt)[i] = 0;
-    pt.type = RAST_RADIAL; pt.m = rast_identity();
-    pt.cx = X; pt.cy = Y + R * 6 / 10; pt.fx = pt.cx; pt.fy = pt.cy; pt.r = R * 14 / 10;
-    pt.stops = body; pt.nstops = 4; pt.opacity = 255;
-    ui_rast_fill(&p, &pt);
-
-    // Its rim.
-    rast_stroke s;
-    rast_stroke_init(&s, RAST_ONE);
-    rast_paint_solid(&pt, 0xC0041430);
-    ui_rast_stroke(&p, &s, &pt);
-    rast_path_reset(&p);
-    rast_ellipse(&p, X, Y, R - RAST_ONE, R - RAST_ONE);
-    rast_paint_solid(&pt, 0x5090D8FF);
-    ui_rast_stroke(&p, &s, &pt);
-    rast_path_reset(&p);
-
-    // The gloss: an ellipse across the top half, white fading downward.
-    static rast_stop gloss[2];
-    gloss[0].offset = 0;        gloss[0].color = pressed ? 0x80FFFFFF : 0xC8FFFFFF;
-    gloss[1].offset = RAST_ONE; gloss[1].color = 0x10FFFFFF;
-    rast_ellipse(&p, X, Y - R * 42 / 100, R * 76 / 100, R * 48 / 100);
-    for (unsigned i = 0; i < sizeof pt; i++) ((volatile uint8_t *)&pt)[i] = 0;
-    pt.type = RAST_LINEAR; pt.m = rast_identity();
-    pt.x1 = X; pt.y1 = Y - R * 90 / 100; pt.x2 = X; pt.y2 = Y;
-    pt.stops = gloss; pt.nstops = 2; pt.opacity = 255;
-    ui_rast_fill(&p, &pt);
-    rast_path_reset(&p);
-
-    // The spark: four points joined by inward curves.
-    rast_fx S = R * 48 / 100, k = R * 7 / 100;
-    rast_fx sy = Y + RAST_ONE / 2;
-    rast_move_to(&p, X, sy - S);
-    rast_quad_to(&p, X + k, sy - k, X + S, sy);
-    rast_quad_to(&p, X + k, sy + k, X, sy + S);
-    rast_quad_to(&p, X - k, sy + k, X - S, sy);
-    rast_quad_to(&p, X - k, sy - k, X, sy - S);
-    rast_close(&p);
-    rast_paint_solid(&pt, 0x60002050);
-    rast_stroke_init(&s, RAST_FRAC(5, 2));
-    ui_rast_stroke(&p, &s, &pt);
-    rast_paint_solid(&pt, 0xFFFFFFFF);
-    ui_rast_fill(&p, &pt);
-    rast_path_free(&p);
-}
-
-// A button on the bar: a pane of lighter glass, brighter for the active
-// window, lit from below under the pointer.
-static void tb_button(int x, int y, int w, int h, int active, int glow, int pressed) {
-    int a0 = active ? 120 : 52, a1 = active ? 50 : 14;
-    if (pressed) { a0 = 40; a1 = 80; }
-    ui_round_grad(x, y, w, h, 3, UI_ALL, 0x00FFFFFF, a0, 0x00FFFFFF, a1);
-    if (glow > 0) {
-        ui_round_grad(x, y + h / 3, w, h - h / 3, 3, UI_BL | UI_BR, 0x0080D8FF, 0,
-                      0x0080D8FF, glow * 150 / 256);
-        ui_round_grad(x, y, w, h / 2, 3, UI_TL | UI_TR, 0x00FFFFFF, glow * 70 / 256,
-                      0x00FFFFFF, 0);
-    }
-    ui_rrect_line(x, y, w, h, 3, UI_ALL, 0x00000000, active ? 150 : 110);
-    ui_rrect_line(x + 1, y + 1, w - 2, h - 2, 2, UI_ALL, 0x00FFFFFF,
-                  active ? 120 : 60 + glow * 60 / 256);
-}
-
-// Signal bars: lit when the network is up.
-static void draw_net_glyph(int cx, int cy, int up) {
-    for (int b = 0; b < 4; b++) {
-        int bh = 4 + b * 3, bx = cx - 8 + b * 5;
-        int lit = up || b == 0;
-        ui_blend(bx - 1, cy + 7 - bh - 1, 5, bh + 2, 0x00000000, 110);
-        ui_fill(bx, cy + 7 - bh, 3, bh, lit ? 0x00FFFFFF : 0x00708090);
-    }
-    if (!up) {
-        rast_path p;
-        rast_path_init(&p);
-        rast_fx X = RAST_INT(cx + 6), Y = RAST_INT(cy - 5);
-        rast_move_to(&p, X - RAST_INT(3), Y - RAST_INT(3));
-        rast_line_to(&p, X + RAST_INT(3), Y + RAST_INT(3));
-        rast_move_to(&p, X + RAST_INT(3), Y - RAST_INT(3));
-        rast_line_to(&p, X - RAST_INT(3), Y + RAST_INT(3));
-        rast_stroke s;
-        rast_paint pt;
-        rast_stroke_init(&s, RAST_INT(2));
-        rast_paint_solid(&pt, 0xFFE04030);
-        ui_rast_stroke(&p, &s, &pt);
-        rast_path_free(&p);
+static void uk_place(ukeep *k, int x, int y, int w, int h) {
+    int W = (int)fb_get_width(), H = (int)fb_get_height();
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x + w > W) w = W - x;
+    if (y + h > H) h = H - y;
+    if (w < 0) w = 0;
+    if (h < 0) h = 0;
+    if (k->have && k->x == x && k->y == y && k->w == w && k->h == h) return;
+    k->x = x; k->y = y; k->w = w; k->h = h;
+    k->have = 0;
+    if (w * h > k->cap) {
+        if (k->px) kfree(k->px);
+        k->px = (uint32_t *)kmalloc((size_t)w * h * 4);
+        k->cap = k->px ? w * h : 0;
     }
 }
 
-// A speaker and the waves coming off it, as many as the volume deserves.
-static void draw_vol_glyph(int cx, int cy, int on, int vol) {
-    rast_path p;
-    rast_path_init(&p);
-    rast_fx X = RAST_INT(cx - 4), Y = RAST_INT(cy) + RAST_ONE / 2;
-    rast_move_to(&p, X - RAST_INT(5), Y - RAST_INT(3));
-    rast_line_to(&p, X - RAST_INT(2), Y - RAST_INT(3));
-    rast_line_to(&p, X + RAST_INT(3), Y - RAST_INT(7));
-    rast_line_to(&p, X + RAST_INT(3), Y + RAST_INT(7));
-    rast_line_to(&p, X - RAST_INT(2), Y + RAST_INT(3));
-    rast_line_to(&p, X - RAST_INT(5), Y + RAST_INT(3));
-    rast_close(&p);
-    rast_stroke s;
-    rast_paint pt;
-    rast_stroke_init(&s, RAST_INT(2));
-    rast_paint_solid(&pt, 0x70000000);
-    ui_rast_stroke(&p, &s, &pt);
-    rast_paint_solid(&pt, on ? 0xFFFFFFFF : 0xFF708090);
-    ui_rast_fill(&p, &pt);
-    rast_path_reset(&p);
-    if (on) {
-        int waves = vol <= 0 ? 0 : vol < 34 ? 1 : vol < 67 ? 2 : 3;
-        for (int k = 0; k < waves; k++) {
-            p.open = 0;                       // each wave its own subpath
-            rast_arc(&p, X + RAST_INT(3), Y, RAST_INT(4 + k * 3), RAST_INT(-45), RAST_INT(45));
-        }
-        if (waves) {
-            rast_stroke_init(&s, RAST_FRAC(8, 5));
-            s.cap = RAST_CAP_ROUND;
-            rast_paint_solid(&pt, 0xFFFFFFFF);
-            ui_rast_stroke(&p, &s, &pt);
-        }
-    } else {
-        rast_fx Q = X + RAST_INT(8);
-        rast_move_to(&p, Q - RAST_INT(3), Y - RAST_INT(3));
-        rast_line_to(&p, Q + RAST_INT(3), Y + RAST_INT(3));
-        rast_move_to(&p, Q + RAST_INT(3), Y - RAST_INT(3));
-        rast_line_to(&p, Q - RAST_INT(3), Y + RAST_INT(3));
-        rast_stroke_init(&s, RAST_INT(2));
-        rast_paint_solid(&pt, 0xFFE04030);
-        ui_rast_stroke(&p, &s, &pt);
+static void uk_copy_in(ukeep *k, int x0, int y0, int x1, int y1) {
+    if (x0 < k->x) x0 = k->x;
+    if (y0 < k->y) y0 = k->y;
+    if (x1 > k->x + k->w) x1 = k->x + k->w;
+    if (y1 > k->y + k->h) y1 = k->y + k->h;
+    volatile uint8_t *base = fb_get_base();
+    uint32_t pitch = fb_get_pitch();
+    for (int y = y0; y < y1; y++) {
+        const uint32_t *s = (const uint32_t *)(base + (size_t)y * pitch);
+        uint32_t *d = k->px + (size_t)(y - k->y) * k->w - k->x;
+        for (int x = x0; x < x1; x++) d[x] = s[x];
     }
-    rast_path_free(&p);
+}
+
+// Take in what is under, wherever this frame painted it.
+static void uk_take(ukeep *k) {
+    if (!k->cap) return;
+    if (!k->have || dmg_all) {
+        uk_copy_in(k, k->x, k->y, k->x + k->w, k->y + k->h);
+        k->have = 1;
+        return;
+    }
+    for (int i = 0; i < ndmg; i++) uk_copy_in(k, dmg[i][0], dmg[i][1], dmg[i][2], dmg[i][3]);
+}
+
+static void uk_restore(ukeep *k) {
+    if (!k->cap || !k->have) return;
+    volatile uint8_t *base = fb_get_base();
+    uint32_t pitch = fb_get_pitch();
+    for (int y = 0; y < k->h; y++) {
+        uint32_t *d = (uint32_t *)(base + (size_t)(k->y + y) * pitch) + k->x;
+        const uint32_t *s = k->px + (size_t)y * k->w;
+        for (int x = 0; x < k->w; x++) d[x] = s[x];
+    }
+    fb_mark_rect((uint32_t)k->x, (uint32_t)k->y, (uint32_t)k->w, (uint32_t)k->h);
+}
+
+// Whether anything this frame painted inside (x, y, w, h).
+static int dmg_meets(int x, int y, int w, int h) {
+    if (dmg_all) return 1;
+    int r[4] = { x, y, x + w, y + h };
+    for (int i = 0; i < ndmg; i++) if (boxes_meet(dmg[i], r)) return 1;
+    return 0;
+}
+
+static ukeep isl_keep;
+static ui_glass isl_glass;
+
+// The keeper's reach: the island, its shadow, and room on the inner side for
+// the name that appears over a program under the pointer.
+static void island_reach(int *x, int *y, int *w, int *h) {
+    int m = 40, tip = 46;
+    *x = isl_x - m; *y = isl_y - m; *w = isl_w + 2 * m; *h = isl_h + 2 * m;
+    switch (island_edge) {
+    case ISL_BOTTOM: *y -= tip; *h += tip; break;
+    case ISL_TOP:    *h += tip; break;
+    case ISL_LEFT:   *w += 160; break;
+    default:         *x -= 160; *w += 160; break;
+    }
 }
 
 static void two_digits(char *b, int v) { b[0] = (char)('0' + (v / 10) % 10); b[1] = (char)('0' + v % 10); }
 
-static void draw_taskbar(void) {
+static const char *const wdays_ru[7] = { "Вс", "Пн", "Вт", "Ср", "Чт", "Пт", "Сб" };
+static const char *const months_ru[12] = { "янв", "фев", "мар", "апр", "мая", "июн",
+                                           "июл", "авг", "сен", "окт", "ноя", "дек" };
+
+static int dow(int y, int m, int d) {          // 0 = Sunday
+    static const int t[] = { 0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4 };
+    if (m < 3) y--;
+    return (y + y / 4 - y / 100 + y / 400 + t[(m - 1) % 12] + d) % 7;
+}
+
+// A program's name as a person reads it, for the name over its icon.
+static const char *program_label(const char *file) {
+    static const struct { const char *f, *n; } names[] = {
+        { "files", "Файлы" }, { "web", "Браузер" }, { "sh", "Терминал" },
+        { "note", "Блокнот" }, { "play", "Музыка" }, { "taskmgr", "Диспетчер задач" },
+        { "control", "Настройки" }, { "devmgr", "Устройства" }, { "view", "Просмотр" },
+        { "netsurf", "NetSurf" }, { "doom", "DOOM" }, { "python", "Python" },
+        { "cc", "Компилятор C" }, { "edit", "Редактор" }, { "fm", "Файлы (текст)" },
+    };
+    for (unsigned i = 0; i < sizeof names / sizeof names[0]; i++)
+        if (str_same(names[i].f, file)) return names[i].n;
+    return file;
+}
+
+static void draw_island_now(void) {
     const theme_t *T = TH;
-    int W = (int)fb_get_width(), H = (int)fb_get_height();
-    int by = H - TASKBAR_H;
+    int vertical = isl_vertical();
+    int x = isl_x, y = isl_y, w = isl_w, h = isl_h;
 
-    tb_layout();
-    uint64_t fp = taskbar_fingerprint();
-    if (tb_valid && tb_fp == fp) return;      // identical to what is on screen
-    tb_fp = fp; tb_valid = 1;
+    ui_shadow(x, y, w, h, ISL_R, 30, 70, 10, 0);
+    ui_shadow(x, y, w, h, ISL_R, 4, 34, 1, 0);
+    ui_glass_place(&isl_glass, x, y, w, h, 16);
+    ui_glass_forget(&isl_glass);
+    ui_glass_take(&isl_glass, 0, 0);
+    ui_glass_draw(&isl_glass, x, y, w, h, ISL_R, 0, 0, 0, 0, 0, 0,
+                  ui_mix(0x00FFFFFF, T->accent, 60), 120);
+    ui_glass_rim(x, y, w, h, ISL_R);
 
-    ui_noclip();
-    // The glass, its gloss, and a bright edge along the top.
-    ui_mat glass = { UI_GLASS, tb_tint(), 0, tb_tint_a(), 0, 0, 0 };
-    ui_rrect(0, by, W, TASKBAR_H, 0, 0, &glass);
-    ui_round_grad(0, by, W, TASKBAR_H / 2, 0, 0, 0x00FFFFFF, T->dark ? 30 : 46, 0x00FFFFFF, 8);
-    ui_blend(0, by, W, 1, 0x00000000, 120);
-    ui_blend(0, by + 1, W, 1, 0x00FFFFFF, T->dark ? 50 : 90);
-
-    int ty1 = by + 6, th = TASKBAR_H - 10;
+    int hot = -1;
     for (int i = 0; i < tb_n; i++) {
         const struct tb_item *it = &tb_items[i];
         int glow = glow_of(KEY_TB(i));
-        int pressed = press_key == KEY_TB(i);
+        int pressed = press_key == KEY_TB(i) && glow;
+        if (glow > 128) hot = i;
         switch (it->kind) {
-        case TB_ORB:
-            draw_start_orb(it->x + it->w / 2, by + TASKBAR_H / 2, TASKBAR_H / 2 - 4,
-                           start_open ? 256 : glow, pressed);
-            break;
-        case TB_WS: {
-            int here = it->arg == cur_ws;
-            tb_button(it->x, by + 11, it->w, TASKBAR_H - 22, here, glow, pressed);
-            char lbl[2] = { (char)('1' + it->arg), 0 };
-            int tw = ui_text_w(lbl, UI_F12);
-            ui_text_glow(it->x + (it->w - tw) / 2, by + (TASKBAR_H - ui_line_h(UI_F12)) / 2,
-                         lbl, UI_F12, here ? 0x00FFFFFF : 0x00C8D8E8, 0x00000000, 120);
+        case TB_ORB: {
+            int R = ISL_ICON / 2;
+            if (start_open || glow)
+                ui_round_fill(it->x - 3, it->y - 3, ISL_ICON + 6, ISL_ICON + 6, R + 3, 0x00FFFFFF,
+                              start_open ? 200 : glow * 160 / 256);
+            glyph_logo(it->x + R, it->y + R + (pressed ? 1 : 0), R - (pressed ? 1 : 0), T->accent);
             break;
         }
-        case TB_WIN: {
-            int n = it->arg;
-            struct pane *p = &panes[nodes[n].pane_idx];
-            int active = (n == focused && nodes[n].state != WIN_MIN);
-            tb_button(it->x, ty1, it->w, th, active, glow, pressed);
-            const char *t = pane_title(p);
-            int tx = it->x + 10;
-            if (ui_icon(it->x + 8, ty1 + (th - ICON_SMALL) / 2, t, ICON_SMALL))
-                tx = it->x + 8 + ICON_SMALL + 6;
-            int room = it->x + it->w - 8 - tx;
-            if (room > 8) {
-                int saved[4];
-                ui_clip_get(saved);
-                ui_clip(it->x + 2, ty1, it->w - 4, th);
-                int ty = ty1 + (th - ui_line_h(UI_F12)) / 2;
-                if (ui_text_w(t, UI_F12) <= room)
-                    ui_text_glow(tx, ty, t, UI_F12, 0x00FFFFFF, 0x00000000, 130);
-                else
-                    ui_text_fit(tx, ty, room, t, UI_F12, 0x00FFFFFF);
-                ui_clip_set(saved);
+        case TB_APP: {
+            int active = it->win >= 0 && it->win == focused && nodes[it->win].state != WIN_MIN;
+            if (active || glow) {
+                int a = active ? 150 : 0;
+                a += glow * 90 / 256;
+                if (a > 230) a = 230;
+                ui_round_fill(it->x + 1, it->y + 1, ISL_SLOT - 2, ISL_SLOT - 2, 16, 0x00FFFFFF, a);
+            }
+            int ix = it->x + (ISL_SLOT - ISL_ICON) / 2, iy = it->y + (ISL_SLOT - ISL_ICON) / 2;
+            if (pressed) iy++;
+            if (!ui_icon(ix + (ISL_ICON - ICON_BIG) / 2, iy + (ISL_ICON - ICON_BIG) / 2, it->name, ICON_BIG)) {
+                int g;
+                uint32_t col;
+                glyph_for_program(it->name, &g, &col);
+                glyph_app(ix, iy, ISL_ICON, col, g);
+            }
+            // Running: a dot by it -- a longer one for the window in front.
+            if (it->nwin) {
+                int len = active ? 14 : 5;
+                uint32_t c = active ? T->accent : 0x00505A68;
+                switch (island_edge) {
+                case ISL_BOTTOM: ui_round_fill(it->x + ISL_SLOT / 2 - len / 2, y + h - 7, len, 4, 2, c, 255); break;
+                case ISL_TOP:    ui_round_fill(it->x + ISL_SLOT / 2 - len / 2, y + 3, len, 4, 2, c, 255); break;
+                case ISL_LEFT:   ui_round_fill(x + 3, it->y + ISL_SLOT / 2 - len / 2, 4, len, 2, c, 255); break;
+                default:         ui_round_fill(x + w - 7, it->y + ISL_SLOT / 2 - len / 2, 4, len, 2, c, 255); break;
+                }
             }
             break;
         }
-        case TB_NET:
-            if (glow) tb_button(it->x, ty1, it->w, th, 0, glow, pressed);
-            draw_net_glyph(it->x + it->w / 2, by + TASKBAR_H / 2, net_is_up());
-            break;
-        case TB_VOL:
-            if (glow) tb_button(it->x, ty1, it->w, th, 0, glow, pressed);
-            draw_vol_glyph(it->x + it->w / 2, by + TASKBAR_H / 2, audio_ready() > 0,
-                           audio_volume());
-            break;
-        case TB_CLOCK: {
-            if (glow) tb_button(it->x, ty1, it->w, th, 0, glow, pressed);
-            char tm[6], dt[11];
+        case TB_STATUS: {
+            ui_round_fill(it->x, it->y, it->w, it->h, vertical ? 22 : it->h / 2, 0x00FFFFFF,
+                          110 + glow * 100 / 256);
+            uint32_t ink = T->title_text, dim = T->title_text_dim;
+            int up = net_is_up(), snd = audio_ready() > 0;
+            char tm[6];
             two_digits(tm, wm_clock.hour); tm[2] = ':'; two_digits(tm + 3, wm_clock.min); tm[5] = 0;
-            two_digits(dt, wm_clock.day); dt[2] = '.'; two_digits(dt + 3, wm_clock.mon); dt[5] = '.';
-            two_digits(dt + 6, wm_clock.year / 100); two_digits(dt + 8, wm_clock.year % 100); dt[10] = 0;
-            int lh = ui_line_h(UI_F12);
-            int y0 = by + (TASKBAR_H - 2 * lh + 2) / 2;
-            int cx = it->x + it->w / 2;
-            ui_text_glow(cx - ui_text_w(tm, UI_F12) / 2, y0, tm, UI_F12, 0x00FFFFFF, 0, 130);
-            ui_text_glow(cx - ui_text_w(dt, UI_F12) / 2, y0 + lh - 2, dt, UI_F12, 0x00FFFFFF, 0, 130);
+            if (!vertical) {
+                glyph_draw(G_WIFI, it->x + 14, it->y + 13, 18, 0xFF000000 | (up ? ink : dim), 0);
+                glyph_draw(G_VOL, it->x + 42, it->y + 13, 18, 0xFF000000 | (snd ? ink : dim), 0);
+                char dt[24];
+                int q = 0;
+                const char *wd = wdays_ru[dow(wm_clock.year, wm_clock.mon, wm_clock.day)];
+                while (*wd) dt[q++] = *wd++;
+                dt[q++] = ','; dt[q++] = ' ';
+                if (wm_clock.day >= 10) dt[q++] = (char)('0' + wm_clock.day / 10);
+                dt[q++] = (char)('0' + wm_clock.day % 10);
+                dt[q++] = ' ';
+                const char *mo = months_ru[(wm_clock.mon + 11) % 12];
+                while (*mo) dt[q++] = *mo++;
+                dt[q] = 0;
+                ui_text(it->x + 76, it->y + 3, tm, UI_F15B, ink);
+                ui_text(it->x + 76, it->y + 23, dt, UI_F11, dim);
+            } else {
+                int cx = it->x + it->w / 2;
+                glyph_draw(G_WIFI, cx - 10, it->y + 10, 20, 0xFF000000 | (up ? ink : dim), 0);
+                glyph_draw(G_VOL, cx - 10, it->y + 38, 20, 0xFF000000 | (snd ? ink : dim), 0);
+                char hh[3] = { tm[0], tm[1], 0 }, mm[3] = { tm[3], tm[4], 0 };
+                ui_text(cx - ui_text_w(hh, UI_F15B) / 2, it->y + 64, hh, UI_F15B, ink);
+                ui_text(cx - ui_text_w(mm, UI_F15B) / 2, it->y + 84, mm, UI_F15B, ink);
+            }
             break;
         }
-        case TB_PEEK:
-            ui_blend(it->x, by + 2, 1, TASKBAR_H - 2, 0x00000000, 110);
-            ui_blend(it->x + 1, by + 2, 1, TASKBAR_H - 2, 0x00FFFFFF, 70);
-            if (glow) ui_round_grad(it->x + 2, by + 2, it->w - 2, TASKBAR_H - 2, 0, 0,
-                                    0x00FFFFFF, glow * 110 / 256, 0x00FFFFFF, glow * 50 / 256);
-            break;
         }
     }
 
-    // The whole bar, because the whole bar was just repainted.
-    fb_mark_rows((uint32_t)by, TASKBAR_H);
+    // The name of the program under the pointer, beside the island.
+    if (hot >= 0 && tb_items[hot].kind == TB_APP) {
+        const struct tb_item *it = &tb_items[hot];
+        const char *label = program_label(it->name);
+        int tw = ui_text_w(label, UI_F13) + 24, th = 30;
+        int lx, ly;
+        switch (island_edge) {
+        case ISL_BOTTOM: lx = it->x + ISL_SLOT / 2 - tw / 2; ly = y - th - 10; break;
+        case ISL_TOP:    lx = it->x + ISL_SLOT / 2 - tw / 2; ly = y + h + 10; break;
+        case ISL_LEFT:   lx = x + w + 10; ly = it->y + ISL_SLOT / 2 - th / 2; break;
+        default:         lx = x - tw - 10; ly = it->y + ISL_SLOT / 2 - th / 2; break;
+        }
+        ui_shadow(lx, ly, tw, th, 15, 10, 50, 3, 0);
+        ui_round_fill(lx, ly, tw, th, 15, 0x00FFFFFF, 240);
+        ui_text(lx + 12, ly + (th - ui_line_h(UI_F13)) / 2, label, UI_F13, T->title_text);
+    }
+}
+
+// Draw the island if anything about it, or anything under it, changed.
+static void draw_taskbar(void) {
+    tb_layout();
+    uint64_t fp = taskbar_fingerprint();
+    int rx, ry, rw, rh;
+    island_reach(&rx, &ry, &rw, &rh);
+    int under = dmg_meets(rx, ry, rw, rh);
+    if (tb_valid && tb_fp == fp && !under) return;     // identical to what is on screen
+    tb_fp = fp;
+    tb_valid = 1;
+
+    uk_place(&isl_keep, rx, ry, rw, rh);
+    uk_take(&isl_keep);
+    uk_restore(&isl_keep);
+    draw_island_now();
+    dmg_add(rx, ry, rx + rw, ry + rh);
 }
 
 // Refresh the clock + CPU/memory history, at most once a second. Called from
@@ -2854,306 +3026,6 @@ static void sm_restore_under(void) {
     fb_mark_rect((uint32_t)sm_ux, (uint32_t)sm_uy, (uint32_t)sm_uw, (uint32_t)sm_uh);
 }
 
-// --- icons on the desktop ---------------------------------------------------
-//
-// A column of them down the left, as on Windows 7: the computer, documents,
-// pictures, the browser, a terminal, music. One click picks, two open.
-//
-// They live IN the desktop picture (desk_px), not over it: everything that
-// puts the desktop back behind a window copies from there, and would wipe
-// out icons drawn anywhere else. An icon that changes -- picked, under the
-// pointer -- is redrawn into that picture, and onto the screen only if no
-// window is in the way; otherwise the next full frame shows it.
-
-#define DI_W 84
-#define DI_H 90
-
-static int  new_window_run(const char *path, const char *arg);
-static void new_window(void);
-static void cursor_restore(void);
-
-static const struct {
-    const char *name, *path, *arg, *icon;
-    int glyph;
-} desk_items[] = {
-    { "Computer",  "/bin/files", "/",      "computer",   0 },
-    { "Documents", "/bin/files", "/home",  "folder",     1 },
-    { "Pictures",  "/bin/files", "/pics",  "place-pics", 2 },
-    { "Browser",   "/bin/web",   0,        "web",        3 },
-    { "Terminal",  0,            0,        "sh",         4 },
-    { "Music",     "/bin/play",  0,        "play",       5 },
-};
-#define DESK_N (int)(sizeof desk_items / sizeof desk_items[0])
-
-static int desk_sel = -1, desk_hot = -1;
-static uint64_t desk_click_ms;
-static int desk_click_i = -1;
-
-static void desk_cell(int i, int *x, int *y) {
-    int per = ((int)fb_get_height() - TASKBAR_H - 16) / DI_H;
-    if (per < 1) per = 1;
-    *x = 8 + (i / per) * (DI_W + 4);
-    *y = 8 + (i % per) * DI_H;
-}
-
-static int desk_item_at(int mx, int my) {
-    for (int i = 0; i < DESK_N; i++) {
-        int x, y;
-        desk_cell(i, &x, &y);
-        if (mx >= x && mx < x + DI_W && my >= y && my < y + DI_H) return i;
-    }
-    return -1;
-}
-
-// A two-stop linear gradient paint, top to bottom between y0 and y1.
-static void vgrad_paint(rast_paint *pt, rast_stop st[2], int y0, int y1,
-                        uint32_t c0, uint32_t c1) {
-    for (unsigned i = 0; i < sizeof *pt; i++) ((volatile uint8_t *)pt)[i] = 0;
-    st[0].offset = 0;        st[0].color = c0;
-    st[1].offset = RAST_ONE; st[1].color = c1;
-    pt->type = RAST_LINEAR;
-    pt->m = rast_identity();
-    pt->x1 = 0; pt->y1 = RAST_INT(y0);
-    pt->x2 = 0; pt->y2 = RAST_INT(y1);
-    pt->stops = st;
-    pt->nstops = 2;
-    pt->spread = RAST_PAD;
-    pt->opacity = 255;
-}
-
-// The pictures an icon falls back on until a drawn one exists: 48 pixels,
-// glossy, in the manner of Windows 7's.
-static void desk_glyph(int kind, int x, int y) {
-    rast_path p;
-    rast_path_init(&p);
-    rast_paint pt;
-    rast_stop st[2];
-    rast_stroke s;
-    switch (kind) {
-    case 0:                                     // a monitor
-        rast_round_rect(&p, FX(x + 3), FX(y + 6), FX(42), FX(30), FX(3), FX(3));
-        vgrad_paint(&pt, st, y + 6, y + 36, 0xFF48525E, 0xFF1A2028);
-        ui_rast_fill(&p, &pt);
-        rast_path_reset(&p);
-        rast_rect(&p, FX(x + 6), FX(y + 9), FX(36), FX(23));
-        vgrad_paint(&pt, st, y + 9, y + 32, 0xFF7CCBFF, 0xFF1C6BC8);
-        ui_rast_fill(&p, &pt);
-        rast_path_reset(&p);
-        rast_move_to(&p, FX(x + 6), FX(y + 9));
-        rast_line_to(&p, FX(x + 42), FX(y + 9));
-        rast_line_to(&p, FX(x + 6), FX(y + 26));
-        rast_close(&p);
-        rast_paint_solid(&pt, 0x30FFFFFF);
-        ui_rast_fill(&p, &pt);
-        rast_path_reset(&p);
-        rast_move_to(&p, FX(x + 18), FX(y + 36));
-        rast_line_to(&p, FX(x + 30), FX(y + 36));
-        rast_line_to(&p, FX(x + 33), FX(y + 43));
-        rast_line_to(&p, FX(x + 15), FX(y + 43));
-        rast_close(&p);
-        vgrad_paint(&pt, st, y + 36, y + 43, 0xFF606A76, 0xFF2A3038);
-        ui_rast_fill(&p, &pt);
-        break;
-    case 1:                                     // a folder
-    case 2:                                     // a folder of pictures
-        rast_move_to(&p, FX(x + 4), FX(y + 10));
-        rast_line_to(&p, FX(x + 18), FX(y + 10));
-        rast_line_to(&p, FX(x + 22), FX(y + 14));
-        rast_line_to(&p, FX(x + 44), FX(y + 14));
-        rast_line_to(&p, FX(x + 44), FX(y + 40));
-        rast_line_to(&p, FX(x + 4), FX(y + 40));
-        rast_close(&p);
-        vgrad_paint(&pt, st, y + 10, y + 40, 0xFFE8B850, 0xFFC08A20);
-        ui_rast_fill(&p, &pt);
-        rast_path_reset(&p);
-        if (kind == 2) {                         // a photograph tucked in it
-            rast_rect(&p, FX(x + 12), FX(y + 6), FX(26), FX(20));
-            rast_paint_solid(&pt, 0xFFFFFFFF);
-            ui_rast_fill(&p, &pt);
-            rast_path_reset(&p);
-            rast_rect(&p, FX(x + 14), FX(y + 8), FX(22), FX(16));
-            vgrad_paint(&pt, st, y + 8, y + 24, 0xFF6CC0F8, 0xFF5AA040);
-            ui_rast_fill(&p, &pt);
-            rast_path_reset(&p);
-        }
-        rast_move_to(&p, FX(x + 2), FX(y + 19));
-        rast_line_to(&p, FX(x + 46), FX(y + 19));
-        rast_line_to(&p, FX(x + 43), FX(y + 41));
-        rast_line_to(&p, FX(x + 5), FX(y + 41));
-        rast_close(&p);
-        vgrad_paint(&pt, st, y + 19, y + 41, 0xFFFFE08A, 0xFFE8A838);
-        ui_rast_fill(&p, &pt);
-        rast_stroke_init(&s, RAST_ONE);
-        rast_paint_solid(&pt, 0x80805010);
-        ui_rast_stroke(&p, &s, &pt);
-        rast_path_reset(&p);
-        rast_move_to(&p, FX(x + 3), FX(y + 20) + RAST_ONE / 2);
-        rast_line_to(&p, FX(x + 45), FX(y + 20) + RAST_ONE / 2);
-        rast_paint_solid(&pt, 0xA0FFFFFF);
-        ui_rast_stroke(&p, &s, &pt);
-        break;
-    case 3:                                     // a globe
-        rast_ellipse(&p, FX(x + 24), FX(y + 24), FX(19), FX(19));
-        vgrad_paint(&pt, st, y + 5, y + 43, 0xFF70C8FF, 0xFF1458B8);
-        ui_rast_fill(&p, &pt);
-        rast_stroke_init(&s, RAST_FRAC(3, 2));
-        rast_paint_solid(&pt, 0xC0FFFFFF);
-        rast_path_reset(&p);
-        rast_ellipse(&p, FX(x + 24), FX(y + 24), FX(8), FX(19));
-        rast_move_to(&p, FX(x + 5), FX(y + 24));
-        rast_line_to(&p, FX(x + 43), FX(y + 24));
-        rast_move_to(&p, FX(x + 9), FX(y + 14));
-        rast_line_to(&p, FX(x + 39), FX(y + 14));
-        rast_move_to(&p, FX(x + 9), FX(y + 34));
-        rast_line_to(&p, FX(x + 39), FX(y + 34));
-        rast_move_to(&p, FX(x + 24), FX(y + 5));
-        rast_line_to(&p, FX(x + 24), FX(y + 43));
-        ui_rast_stroke(&p, &s, &pt);
-        rast_path_reset(&p);
-        rast_ellipse(&p, FX(x + 18), FX(y + 15), FX(10), FX(6));
-        rast_paint_solid(&pt, 0x50FFFFFF);
-        ui_rast_fill(&p, &pt);
-        break;
-    case 4:                                     // a terminal
-        rast_round_rect(&p, FX(x + 4), FX(y + 7), FX(40), FX(34), FX(3), FX(3));
-        vgrad_paint(&pt, st, y + 7, y + 41, 0xFF3A424C, 0xFF14181E);
-        ui_rast_fill(&p, &pt);
-        rast_path_reset(&p);
-        rast_rect(&p, FX(x + 4), FX(y + 7), FX(40), FX(6));
-        vgrad_paint(&pt, st, y + 7, y + 13, 0xFFB8C8D8, 0xFF8090A0);
-        ui_rast_fill(&p, &pt);
-        rast_path_reset(&p);
-        rast_move_to(&p, FX(x + 10), FX(y + 19));
-        rast_line_to(&p, FX(x + 16), FX(y + 24));
-        rast_line_to(&p, FX(x + 10), FX(y + 29));
-        rast_move_to(&p, FX(x + 19), FX(y + 31));
-        rast_line_to(&p, FX(x + 28), FX(y + 31));
-        rast_stroke_init(&s, FX(2));
-        s.cap = RAST_CAP_ROUND;
-        rast_paint_solid(&pt, 0xFF8EE070);
-        ui_rast_stroke(&p, &s, &pt);
-        break;
-    default:                                    // music
-        rast_ellipse(&p, FX(x + 24), FX(y + 24), FX(19), FX(19));
-        vgrad_paint(&pt, st, y + 5, y + 43, 0xFFFFA060, 0xFFD04818);
-        ui_rast_fill(&p, &pt);
-        rast_path_reset(&p);
-        rast_ellipse(&p, FX(x + 20), FX(y + 14), FX(12), FX(7));
-        rast_paint_solid(&pt, 0x40FFFFFF);
-        ui_rast_fill(&p, &pt);
-        glyph_note(x + 19, y + 24, 6, 0xFFFFFFFF);
-        break;
-    }
-    rast_path_free(&p);
-}
-
-// Draw icon i into the current target.
-static void desk_draw_item(int i) {
-    int x, y;
-    desk_cell(i, &x, &y);
-    int sel = (i == desk_sel), hot = (i == desk_hot);
-    if (sel || hot) {
-        // Windows 7's: a pale blue glass box round the picked icon, a fainter
-        // one round the one under the pointer.
-        uint32_t c = sel ? 0x0080C0FF : 0x00FFFFFF;
-        ui_round_grad(x + 2, y + 2, DI_W - 4, DI_H - 4, 4, UI_ALL, c, sel ? 110 : 50, c,
-                      sel ? 60 : 24);
-        ui_rrect_line(x + 2, y + 2, DI_W - 4, DI_H - 4, 4, UI_ALL, sel ? 0x00A8D8FF : 0x00FFFFFF,
-                      sel ? 200 : 110);
-    }
-    int ix = x + (DI_W - 48) / 2, iy = y + 6;
-    if (!ui_icon(ix, iy, desk_items[i].icon, 48) &&
-        !ui_icon(ix + 8, iy + 8, desk_items[i].icon, ICON_BIG))
-        desk_glyph(desk_items[i].glyph, ix, iy);
-    const char *t = desk_items[i].name;
-    int tw = ui_text_w(t, UI_F12);
-    if (tw > DI_W - 8) tw = DI_W - 8;
-    int tx = x + (DI_W - tw) / 2, ty = y + 58;
-    if (ui_text_w(t, UI_F12) <= DI_W - 8)
-        ui_text_glow(tx, ty, t, UI_F12, 0x00FFFFFF, 0x00000000, 170);
-    else
-        ui_text_fit(tx, ty, DI_W - 8, t, UI_F12, 0x00FFFFFF);
-}
-
-// The desktop picture: the wallpaper, every icon on it.
-static void desk_rebuild(void) {
-    if (!desk_px || !wallpaper) return;
-    uint32_t n = wp_w * wp_h;
-    for (uint32_t i = 0; i < n; i++) desk_px[i] = wallpaper[i];
-    ui_target(desk_px, (int)wp_w, (int)wp_h);
-    for (int i = 0; i < DESK_N; i++) desk_draw_item(i);
-    ui_target_screen();
-}
-
-// One icon changed: redraw its cell into the desktop picture, and onto the
-// screen if nothing covers it.
-static void desk_refresh(int i) {
-    if (i < 0 || i >= DESK_N || !desk_px || !wallpaper) return;
-    int x, y;
-    desk_cell(i, &x, &y);
-    for (int j = 0; j < DI_H; j++) {
-        if ((uint32_t)(y + j) >= wp_h) break;
-        for (int k = 0; k < DI_W; k++) {
-            if ((uint32_t)(x + k) >= wp_w) break;
-            size_t o = (size_t)(y + j) * wp_w + (size_t)(x + k);
-            desk_px[o] = wallpaper[o];
-        }
-    }
-    ui_target(desk_px, (int)wp_w, (int)wp_h);
-    ui_clip(x, y, DI_W, DI_H);
-    desk_draw_item(i);
-    ui_target_screen();
-
-    int cell[4] = { x, y, x + DI_W, y + DI_H };
-    int covered = start_open || wm_message_pending();
-    for (int k = 0; k < MAX_NODES && !covered; k++) {
-        if (!nodes[k].used || nodes[k].ws != cur_ws || nodes[k].state == WIN_MIN) continue;
-        int e[4];
-        window_extent(k, e);
-        if (boxes_meet(e, cell)) covered = 1;
-    }
-    if (covered) { wp_dirty = 1; dirty = 1; return; }
-    // The pointer is very likely standing on this very cell, holding a copy
-    // of what was under it. Lift it first: otherwise the next frame puts that
-    // stale copy back over the fresh cell -- the 32-pixel squares of old
-    // highlight that were left beside the icons.
-    cursor_restore();
-    restore_wall(x, y, DI_W, DI_H);
-    dirty = 1;
-}
-
-static void desk_hover(int i) {
-    if (i == desk_hot) return;
-    int old = desk_hot;
-    desk_hot = i;
-    desk_refresh(old);
-    desk_refresh(i);
-}
-
-static void desk_open(int i) {
-    if (i < 0 || i >= DESK_N) return;
-    if (desk_items[i].path) new_window_run(desk_items[i].path, desk_items[i].arg);
-    else new_window();
-    refresh_leaves();
-    dirty = 1;
-}
-
-// A press on the bare desktop: pick the icon under it, open it on a second
-// press soon enough after the first, or let go of the pick on empty space.
-static void desk_press(int mx, int my) {
-    int i = desk_item_at(mx, my);
-    uint64_t now = now_ms();
-    int old = desk_sel;
-    desk_sel = i;
-    if (old != i) { desk_refresh(old); desk_refresh(i); }
-    if (i >= 0 && i == desk_click_i && now - desk_click_ms < (uint64_t)dblclick_ms) {
-        desk_click_i = -1;
-        desk_open(i);
-        return;
-    }
-    desk_click_i = i;
-    desk_click_ms = now;
-}
 
 static void draw_alttab(void) {
     if (!alttab_active) return;
@@ -3437,44 +3309,6 @@ void wm_profile(int on) {
 
 static void pf_report(void);
 
-// --- Aero Peek ----------------------------------------------------------------
-//
-// Rest the pointer on the strip at the right end of the taskbar and every
-// window turns into a sheet of clear glass -- only its outline left -- to show
-// the desktop behind; move away and they come back. A click on the strip
-// clears the desktop for real (show_desktop).
-
-#define PEEK_DELAY_MS 450
-static int peek_on;
-
-static int peek_wanted(void) {
-    if (hov_key < 0 || (hov_key & 0xFFFF0000) != 0x20000) return 0;
-    int i = hov_key & 0xFFFF;
-    if (i >= tb_n || tb_items[i].kind != TB_PEEK) return 0;
-    return now_ms() - hov_ms >= PEEK_DELAY_MS;
-}
-
-// Every window as an outline of glass. Drawn on a full frame only: the
-// windows' own pixels are not on the screen while peeking.
-static void peek_outlines(void) {
-    const theme_t *T = TH;
-    int win[MAX_NODES];
-    int n = collect_windows(cur_ws, win, MAX_NODES);
-    for (int i = 0; i < n; i++) {
-        const struct wm_node *nd = &nodes[win[i]];
-        if (nd->state == WIN_MIN) continue;
-        int x = (int)nd->x, y = (int)nd->y, w = (int)nd->w, h = (int)nd->h;
-        int rt = nd->state == WIN_MAX ? 0 : RAD_T, rb = nd->state == WIN_MAX ? 0 : RAD_B;
-        ui_mat sheet = { UI_SOLID, 0x00FFFFFF, 0, T->dark ? 18 : 30, 0, 0, 0 };
-        ui_rrect2(x, y, w, h, rt, rb, &sheet);
-        ui_rrect2_line(x, y, w, h, rt, rb, T->rim, 150);
-        ui_rrect2_line(x + 1, y + 1, w - 2, h - 2, rt > 1 ? rt - 1 : 0, rb > 1 ? rb - 1 : 0,
-                       0x00FFFFFF, 150);
-        ui_rrect2_line(x + FRAME - 1, y + TITLE_H - 1, w - 2 * FRAME + 2, h - TITLE_H - FRAME + 2,
-                       0, 0, 0x00FFFFFF, 70);
-    }
-}
-
 // --- Aero Shake -----------------------------------------------------------------
 //
 // Grab a window by its title and shake it: every other window is minimised.
@@ -3585,11 +3419,13 @@ static void grab(uint32_t *dst) {
 // Where window n's button on the taskbar is, for minimising into it.
 static void tb_button_center(int n, int *x, int *y) {
     tb_layout();
-    *x = 30;
-    *y = (int)fb_get_height() - TASKBAR_H / 2;
+    *x = isl_x + isl_w / 2;
+    *y = isl_y + isl_h / 2;
+    const char *t = pane_title(&panes[nodes[n].pane_idx]);
     for (int i = 0; i < tb_n; i++)
-        if (tb_items[i].kind == TB_WIN && tb_items[i].arg == n) {
+        if (tb_items[i].kind == TB_APP && str_same(tb_items[i].name, t)) {
             *x = tb_items[i].x + tb_items[i].w / 2;
+            *y = tb_items[i].y + tb_items[i].h / 2;
             return;
         }
 }
@@ -3613,9 +3449,10 @@ static int anim_setup(int kind, int n) {
     anim.ty = anim.wy + anim.wh / 2;
     if (kind == AN_MIN || kind == AN_RESTORE) {
         tb_button_center(n, &anim.tx, &anim.ty);
-        if (anim.tx < e[0]) e[0] = anim.tx - 30;
-        if (anim.tx > e[2]) e[2] = anim.tx + 30;
-        e[3] = (int)fb_get_height();
+        if (anim.tx - 30 < e[0]) e[0] = anim.tx - 30;
+        if (anim.tx + 30 > e[2]) e[2] = anim.tx + 30;
+        if (anim.ty - 30 < e[1]) e[1] = anim.ty - 30;
+        if (anim.ty + 30 > e[3]) e[3] = anim.ty + 30;
     }
     if (e[0] < 0) e[0] = 0;
     if (e[1] < 0) e[1] = 0;
@@ -3758,12 +3595,11 @@ static void render_all(void) {
     if (start_open) wp_dirty = 1;
     if (wp_dirty) { invalidate_pane_cache(); tb_valid = 0; }
     int full = wp_dirty;
+    ndmg = 0;                 // nothing painted yet this frame
+    dmg_all = full;           // ...or everything is about to be
     draw_wallpaper();
     t1 = pf_on ? rdtsc() : 0;
-    // Peeking, the windows are outlines, and those only change on a full
-    // frame; the windows themselves are not drawn at all.
-    if (peek_on) { if (full) peek_outlines(); }
-    else render_windows();
+    render_windows();
     t2 = pf_on ? rdtsc() : 0;
     if (monitor_on) draw_gadget();
     draw_snap_preview();
@@ -3873,15 +3709,22 @@ static void refresh_leaves(void) {
 
 // --- leaf collection / focus navigation ---
 
-// Windows of a workspace, back to front (ascending z). Minimised windows are
-// included -- the taskbar still lists them -- so drawing callers skip WIN_MIN.
+// Windows of a workspace, back to front. Pinned windows come after all the
+// others whatever their z -- above everything -- and by z among themselves.
+// Minimised windows are included -- the island still lists them -- so
+// drawing callers skip WIN_MIN.
+static int stack_above(int a, int b) {
+    if (nodes[a].pinned != nodes[b].pinned) return nodes[a].pinned > nodes[b].pinned;
+    return nodes[a].z > nodes[b].z;
+}
+
 static int collect_windows(int ws, int *out, int max) {
     int n = 0;
     for (int i = 0; i < MAX_NODES && n < max; i++)
         if (nodes[i].used && nodes[i].ws == ws) out[n++] = i;
     for (int i = 1; i < n; i++) {            // insertion sort; n is tiny
         int v = out[i], j = i - 1;
-        while (j >= 0 && nodes[out[j]].z > nodes[v].z) { out[j + 1] = out[j]; j--; }
+        while (j >= 0 && stack_above(out[j], v)) { out[j + 1] = out[j]; j--; }
         out[j + 1] = v;
     }
     return n;
@@ -3892,15 +3735,9 @@ static int topmost_window(int ws) {
     for (int i = 0; i < MAX_NODES; i++) {
         if (!nodes[i].used || nodes[i].ws != ws) continue;
         if (nodes[i].state == WIN_MIN) continue;
-        if (best < 0 || nodes[i].z > nodes[best].z) best = i;
+        if (best < 0 || stack_above(i, best)) best = i;
     }
     return best;
-}
-
-static int ws_has_windows(int ws) {
-    for (int i = 0; i < MAX_NODES; i++)
-        if (nodes[i].used && nodes[i].ws == ws) return 1;
-    return 0;
 }
 
 static void center_of(int n, int *cx, int *cy) {
@@ -4007,9 +3844,8 @@ static int new_window_run(const char *path, const char *arg) {
     nd->state    = WIN_NORMAL;
     nd->w = dw * 62 / 100;
     nd->h = dh * 58 / 100;
-    // Clear of the column of icons down the left of the desktop.
-    nd->x = dx + DI_W + 24 + offs;
-    nd->y = dy + 16 + offs;
+    nd->x = dx + 80 + offs;
+    nd->y = dy + 30 + offs;
     nd->z = ++z_top;
 
     focused = n;
@@ -4191,10 +4027,24 @@ static void toggle_maximize(void) {
 #define HIT_CLOSE  3
 #define HIT_MAXBTN 4
 #define HIT_MINBTN 5
+#define HIT_PINBTN 6
+#define HIT_TABX   7       // the close mark on the window's tab
 #define HIT_L      0x10
 #define HIT_R      0x20
 #define HIT_T      0x40
 #define HIT_B      0x80
+
+// The button a hit is, as WB_* (the tab's close mark is WB_TAB), or -1.
+static int hit_button(int hit) {
+    switch (hit) {
+    case HIT_PINBTN: return WB_PIN;
+    case HIT_MINBTN: return WB_MIN;
+    case HIT_MAXBTN: return WB_MAX;
+    case HIT_CLOSE:  return WB_CLOSE;
+    case HIT_TABX:   return WB_TAB;
+    default:         return -1;
+    }
+}
 
 static int hit_test(int n, int mx, int my) {
     const struct wm_node *nd = &nodes[n];
@@ -4202,13 +4052,18 @@ static int hit_test(int n, int mx, int my) {
     int x1 = x0 + (int)nd->w, y1 = y0 + (int)nd->h;
     if (mx < x0 || my < y0 || mx >= x1 || my >= y1) return HIT_NONE;
 
-    // The caption buttons first: they hang from the very top edge, where a
-    // resize handle would otherwise claim them.
-    for (int b = 0; b < 3; b++) {
+    // The buttons first: they sit close to the top edge, where a resize
+    // handle would otherwise claim them.
+    static const int hits[WB_N] = { HIT_PINBTN, HIT_MINBTN, HIT_MAXBTN, HIT_CLOSE };
+    for (int b = 0; b < WB_N; b++) {
         int bx, by, bw, bh;
         cap_rect(nd, b, &bx, &by, &bw, &bh);
-        if (mx >= bx && mx < bx + bw && my >= y0 && my < by + bh)
-            return b == 0 ? HIT_MINBTN : (b == 1 ? HIT_MAXBTN : HIT_CLOSE);
+        if (mx >= bx - 2 && mx < bx + bw + 2 && my >= by - 2 && my < by + bh + 2) return hits[b];
+    }
+    {
+        int cx, cy, cw, ch;
+        tab_close_rect(n, &cx, &cy, &cw, &ch);
+        if (mx >= cx && mx < cx + cw && my >= cy && my < cy + ch) return HIT_TABX;
     }
 
     if (nd->state != WIN_MAX) {              // resize handles: the glass edges
@@ -4262,8 +4117,7 @@ static int edge_cursor(int edge) {
 static int cursor_pick(int mx, int my) {
     if (busy_active()) return CUR_APPSTART;
     if (drag_mode == DRAG_RESIZE) return edge_cursor(drag_edge);
-    if (drag_mode != DRAG_NONE || start_open || wm_message_pending() || udrag_active ||
-        peek_on)
+    if (drag_mode != DRAG_NONE || start_open || wm_message_pending() || udrag_active)
         return CUR_ARROW;
     if (my >= (int)fb_get_height() - TASKBAR_H) return CUR_ARROW;
     int n = window_at(mx, my);
@@ -4421,9 +4275,8 @@ static int present_pane_only(int n) {
     if (n < 0 || !nodes[n].used) return 0;
     if (nodes[n].ws != cur_ws || nodes[n].state == WIN_MIN) return 0;
     if (start_open || alttab_active || monitor_on || udrag_active) return 0;
-    // Peeking the window is not on the screen; animating, it is not where
-    // it will be.
-    if (peek_on || anim.active) return 0;
+    // Animating, the window is not where it will be.
+    if (anim.active) return 0;
     // A program painting its own window would erase the strips without
     // restoring what they saved, and the save would then be garbage.
     if (ol_active) return 0;
@@ -4440,7 +4293,7 @@ static int present_pane_only(int n) {
     for (int i = 0; i < MAX_NODES; i++) {
         if (i == n || !nodes[i].used) continue;
         if (nodes[i].ws != cur_ws || nodes[i].state == WIN_MIN) continue;
-        if (nodes[i].z <= nodes[n].z) continue;
+        if (!stack_above(i, n)) continue;
         int e[4];
         window_extent(i, e);
         if (boxes_meet(e, cbox)) return 0;   // something is stacked over it
@@ -4448,6 +4301,7 @@ static int present_pane_only(int n) {
 
     cursor_restore();
     draw_content(n, cx, cy, cw, ch, n == focused);
+    repair_body_corners(n);           // the picture squared them off
     cursor_draw();
     fb_present();
     // This frame is on the screen now; the full path need not paint it again.
@@ -4700,35 +4554,67 @@ static void start_click(int key) {
 }
 
 // A click on the taskbar: whatever tb_layout() put under the pointer.
+// The path of a program in /bin.
+static void bin_path(char *out, int max, const char *file) {
+    str_put(out, "/bin/", max);
+    int n = 5, k = 0;
+    while (file[k] && n < max - 1) out[n++] = file[k++];
+    out[n] = 0;
+}
+
+// A click on the island: whatever tb_layout() put under the pointer.
 static void taskbar_click(int mx, int my) {
-    (void)my;
     tb_layout();
-    int i = tb_item_at(mx);
+    int i = tb_item_at(mx, my);
     if (i < 0) return;
     const struct tb_item *it = &tb_items[i];
-    if (it->kind != TB_ORB) start_close();   // anything else on the bar closes it
+    if (it->kind != TB_ORB) start_close();   // anything else on the island closes it
     switch (it->kind) {
     case TB_ORB:
         start_toggle();
         break;
-    case TB_WS:
-        switch_ws(it->arg);
-        break;
-    case TB_WIN: {
-        // Clicking the active window's button minimises it, as on Windows.
-        int n = it->arg;
-        if (!nodes[n].used) break;
-        if (n == focused && nodes[n].state != WIN_MIN) minimize_focused();
-        else restore_window(n);
+    case TB_APP: {
+        int n = it->win;
+        if (n >= 0 && nodes[n].used) {
+            // Its window in front: tuck it away. Otherwise bring it forward.
+            if (n == focused && nodes[n].state != WIN_MIN) minimize_focused();
+            else restore_window(n);
+        } else if (str_same(it->name, "sh")) {
+            new_window();
+        } else {
+            char path[48];
+            bin_path(path, sizeof path, it->name);
+            new_window_run(path, 0);
+        }
         refresh_leaves();
+        dirty = 1;
         break;
     }
-    case TB_PEEK:
-        show_desktop();
-        refresh_leaves();
-        break;
     default:
         break;
+    }
+}
+
+// Dragging the island by its glass: let go near an edge and it moves there.
+static int isl_drag = 0, isl_drag_x, isl_drag_y;
+
+static void island_drop(int mx, int my) {
+    int W = (int)fb_get_width(), H = (int)fb_get_height();
+    int edge = island_edge;
+    // Whichever edge the pointer is nearest, by the proportion of the
+    // screen, so a short tug does not move it.
+    int dl = mx, dr = W - mx, dt = my, db = H - my;
+    int best = db, e = ISL_BOTTOM;
+    if (dl * H < best * W) { best = dl * H / W; e = ISL_LEFT; }
+    if (dr * H < best * W) { best = dr * H / W; e = ISL_RIGHT; }
+    if (dt < best) { e = ISL_TOP; }
+    if (e != edge) {
+        island_edge = e;
+        isl_keep.have = 0;
+        relayout();
+        refresh_leaves();
+        wp_dirty = 1;
+        dirty = 1;
     }
 }
 
@@ -4737,7 +4623,9 @@ static void taskbar_click(int mx, int my) {
 static void handle_mouse(const struct mouse_event *me) {
     int mx = me->x, my = me->y;
     uint32_t H = fb_get_height();
-    int on_taskbar = (my >= (int)H - TASKBAR_H);
+    (void)H;
+    tb_layout();
+    int on_taskbar = on_island(mx, my);
 
     // A drag in flight takes precedence over everything: no window may be
     // moved, focused or clicked while one is crossing the screen.
@@ -4772,8 +4660,7 @@ static void handle_mouse(const struct mouse_event *me) {
     if (drag_mode == DRAG_NONE && !wm_message_pending()) {
         int key = -1;
         if (on_taskbar) {
-            tb_layout();
-            int i = tb_item_at(mx);
+            int i = tb_item_at(mx, my);
             if (i >= 0) key = KEY_TB(i);
         } else if (start_open) {
             key = sm_key_at(mx, my);
@@ -4781,14 +4668,11 @@ static void handle_mouse(const struct mouse_event *me) {
         } else {
             int n = window_at(mx, my);
             if (n >= 0) {
-                int ht = hit_test(n, mx, my);
-                int b = ht == HIT_MINBTN ? 0 : ht == HIT_MAXBTN ? 1 : ht == HIT_CLOSE ? 2 : -1;
+                int b = hit_button(hit_test(n, mx, my));
                 if (b >= 0) key = KEY_CAP(n, b);
             }
         }
         if (hover_to(key)) { dirty = 1; menu_dirty = 1; }
-        // An icon on the desktop lights up when nothing is in front of it.
-        desk_hover(!on_taskbar && !start_open && window_at(mx, my) < 0 ? desk_item_at(mx, my) : -1);
     }
 
     // The wheel scrolls the menu's list, three rows a notch.
@@ -4892,19 +4776,21 @@ static void handle_mouse(const struct mouse_event *me) {
 
         if (on_taskbar) {
             press_hit = HIT_CLIENT; press_win = -2;
-            tb_layout();
-            int i = tb_item_at(mx);
+            int i = tb_item_at(mx, my);
             press_key = i >= 0 ? KEY_TB(i) : -1;
+            // A press on the glass itself, between things: the island is
+            // being picked up, to be put down at another edge.
+            if (i < 0) { isl_drag = 1; isl_drag_x = mx; isl_drag_y = my; }
             return;
         }
 
         int n = window_at(mx, my);
-        if (n < 0) { desk_press(mx, my); return; }   // the bare desktop: its icons
+        if (n < 0) return;                       // press on the bare desktop
         restore_window(n);                       // focus + raise, like Windows
         int hit = hit_test(n, mx, my);
         press_hit = hit; press_win = n;
-        if (hit == HIT_MINBTN || hit == HIT_MAXBTN || hit == HIT_CLOSE) {
-            press_key = KEY_CAP(n, hit == HIT_MINBTN ? 0 : hit == HIT_MAXBTN ? 1 : 2);
+        if (hit_button(hit) >= 0) {
+            press_key = KEY_CAP(n, hit_button(hit));
             return;
         }
 
@@ -4983,9 +4869,17 @@ static void handle_mouse(const struct mouse_event *me) {
             return;
         }
         if (press_win == -2) {
+            if (isl_drag) {
+                // Put down far enough from where it was picked up: it moves.
+                int dx = mx - isl_drag_x, dy = my - isl_drag_y;
+                isl_drag = 0;
+                if (dx * dx + dy * dy > 80 * 80) island_drop(mx, my);
+                press_win = -1;
+                return;
+            }
             // Only if it comes up over what it went down on.
             tb_layout();
-            int i = on_taskbar ? tb_item_at(mx) : -1;
+            int i = on_taskbar ? tb_item_at(mx, my) : -1;
             if (i >= 0 && KEY_TB(i) == was_key) taskbar_click(mx, my);
             press_win = -1;
             return;
@@ -5006,9 +4900,15 @@ static void handle_mouse(const struct mouse_event *me) {
                 last_click_win = press_win;
             }
             switch (press_hit) {
-                case HIT_CLOSE:  close_focused(); break;
+                case HIT_CLOSE:
+                case HIT_TABX:   close_focused(); break;
                 case HIT_MAXBTN: toggle_maximize(); break;
                 case HIT_MINBTN: minimize_focused(); break;
+                case HIT_PINBTN:
+                    // Pinned: above everything else, until unpinned.
+                    nodes[press_win].pinned = !nodes[press_win].pinned;
+                    wp_dirty = 1;
+                    break;
                 default: break;
             }
         }
@@ -5389,11 +5289,6 @@ void wm_poll(void) {
             if (now >= busy_until) { busy_until = 0; busy_pane = -1; pointer_moved = 1; }
             else if (now - cur_anim_ms >= 60) { cur_anim_ms = now; pointer_moved = 1; }
         }
-    }
-    // Aero Peek comes on after the pointer has rested on the strip a moment.
-    {
-        int want = peek_wanted();
-        if (want != peek_on) { peek_on = want; wp_dirty = 1; dirty = 1; }
     }
 
     if (dirty) {

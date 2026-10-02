@@ -102,6 +102,41 @@ void ui_set_backdrop(const uint32_t *px, int w, int h);
  * laid down as a rounded rectangle of radius r. */
 void ui_glass_live(int x, int y, int w, int h, int r, uint32_t tint, int tint_a, int blur);
 
+/* --- glass that remembers what is under it -----------------------------------
+ *
+ * Glass shows what is behind it, blurred -- and on a screen that is only ever
+ * partly repainted, "behind" is not what the back buffer holds where the
+ * glass is: that is last frame's glass. So each pane of glass keeps its own
+ * copy of what lies under it, a quarter the size each way (it is going to be
+ * blurred, detail is wasted), and refreshes it only where something under it
+ * was actually repainted this frame -- taken from the back buffer at the
+ * moment that is still the truth, before the glass goes on top. */
+typedef struct {
+    int ux, uy, uw, uh;        /* the screen area remembered, 4-aligned     */
+    int sw, sh;                /* the same, in quarter pixels               */
+    uint32_t *small;           /* what is under, each 4x4 averaged          */
+    uint32_t *soft;            /* the same, blurred                         */
+    int cap;                   /* pixels allocated in each                  */
+    int have, soft_ok;
+} ui_glass;
+
+/* The glass will cover (x, y, w, h); its blur reaches `pad` beyond that.
+ * Moving it forgets what it knew. */
+void ui_glass_place(ui_glass *g, int x, int y, int w, int h, int pad);
+void ui_glass_forget(ui_glass *g);
+void ui_glass_release(ui_glass *g);
+/* Refresh from the current target what lies inside any of the n damaged
+ * rectangles (x0, y0, x1, y1) -- or all of it, if it knows nothing yet. */
+void ui_glass_take(ui_glass *g, const int (*dmg)[4], int n);
+/* Glass in the shape of a rounded rectangle, or of one with a rounded
+ * rectangle cut out of it (a window's frame round its body: bw = 0 for
+ * none). Tinted `tint` at `tint_a`. */
+void ui_glass_draw(ui_glass *g, int x, int y, int w, int h, int r,
+                   int bx, int by, int bw, int bh, int br, int bcorners,
+                   uint32_t tint, int tint_a);
+/* The light along glass's edge: a sheen down from the top, a fine line. */
+void ui_glass_rim(int x, int y, int w, int h, int r);
+
 /* A colour for the system to wear, taken from a picture: the average of its
  * most colourful pixels, brought to a lightness that reads as an accent. */
 uint32_t ui_accent_from(const uint32_t *px, int w, int h);
