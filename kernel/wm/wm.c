@@ -205,6 +205,11 @@ struct wm_node {
     char path[48];               // the program it was opened with ("" a shell)
     char arg[96];                // ... and what it was given to open
 
+    // Tabs. Windows gathered into one frame share `grp`; `tab_seq` orders
+    // their tabs; all but the one in front are `tab_hidden` -- alive, running,
+    // but not drawn, not hit and not focused until their tab is picked.
+    int grp, tab_seq, tab_hidden;
+
     uint32_t x, y, w, h;         // frame rectangle on screen
     uint32_t sx, sy, sw, sh;     // geometry remembered across a maximise
 };
@@ -260,6 +265,7 @@ static void spawn_prog_in(int pane_idx, const char *path, const char *arg);
 static void pane_push_event(struct pane *p, const struct kbd_event *ev);
 static void refresh_leaves(void);
 static int  collect_windows(int ws, int *out, int max);
+static int  collect_windows_ex(int ws, int *out, int max, int all);
 static int  topmost_window(int ws);
 
 // --- pool allocation ---
@@ -297,6 +303,8 @@ static int alloc_pane(void) {
     return -1;
 }
 
+static int grp_next, tab_seq_next;     // numbers handed out, never reused
+
 static int alloc_node(void) {
     uint64_t f = irq_save();
     for (int i = 0; i < MAX_NODES; i++) {
@@ -305,6 +313,9 @@ static int alloc_node(void) {
             nodes[i].z = 0;
             nodes[i].state = WIN_NORMAL;
             nodes[i].pinned = 0;
+            nodes[i].grp = ++grp_next;          // a group of its own
+            nodes[i].tab_seq = ++tab_seq_next;
+            nodes[i].tab_hidden = 0;
             irq_restore(f);
             return i;
         }
@@ -313,8 +324,64 @@ static int alloc_node(void) {
     return -1;
 }
 
+static void tab_leave(int n);
+
 static void free_node(int n) {
-    if (n >= 0) nodes[n].used = 0;
+    if (n < 0) return;
+    if (nodes[n].used) tab_leave(n);           // a tab beside it takes its place
+    nodes[n].used = 0;
+}
+
+// --- tabs: windows sharing one frame ---------------------------------------------
+//
+// Windows can be gathered into one frame, a tab each, the way a browser keeps
+// its pages. Each member stays a whole window -- its own pane, its own
+// program -- and the group is only a number they share. The member in front
+// IS the window as far as everything else is concerned; the others wait,
+// hidden, and take its place, geometry and all, when their tab is picked.
+#define TAB_MAX 8
+
+// The members of n's group in the order their tabs stand. Returns how many.
+static int tab_members(int n, int *out) {
+    int k = 0;
+    for (int i = 0; i < MAX_NODES && k < TAB_MAX; i++)
+        if (nodes[i].used && nodes[i].grp == nodes[n].grp) out[k++] = i;
+    for (int i = 1; i < k; i++) {
+        int v = out[i], j = i - 1;
+        while (j >= 0 && nodes[out[j]].tab_seq > nodes[v].tab_seq) { out[j + 1] = out[j]; j--; }
+        out[j + 1] = v;
+    }
+    return k;
+}
+
+static int tab_count(int n) {
+    int m[TAB_MAX];
+    return tab_members(n, m);
+}
+
+// Where n's tab stands among its group's.
+static int tab_index(int n) {
+    int m[TAB_MAX], k = tab_members(n, m);
+    for (int i = 0; i < k; i++) if (m[i] == n) return i;
+    return 0;
+}
+
+static int tab_front_of(int grp) {
+    for (int i = 0; i < MAX_NODES; i++)
+        if (nodes[i].used && nodes[i].grp == grp && !nodes[i].tab_hidden) return i;
+    return -1;
+}
+
+// Put `to` where `from` is, the way it is: same place, size, state, stack.
+static void tab_take_place(int to, int from) {
+    struct wm_node *a = &nodes[to];
+    const struct wm_node *b = &nodes[from];
+    a->x = b->x; a->y = b->y; a->w = b->w; a->h = b->h;
+    a->sx = b->sx; a->sy = b->sy; a->sw = b->sw; a->sh = b->sh;
+    a->state = b->state;
+    a->z = b->z;
+    a->pinned = b->pinned;
+    a->ws = b->ws;
 }
 
 // --- geometry ---
@@ -404,6 +471,14 @@ static void layout_window(int n) {
 
 static void relayout(void) {
     wp_dirty = 1;              // window geometry moved: the desktop shows through
+    // A hidden tab keeps up with its frame, so its program is sized right
+    // and its tab can come forward without a jump.
+    for (int i = 0; i < MAX_NODES; i++) {
+        if (!nodes[i].used || !nodes[i].tab_hidden) continue;
+        int f = tab_front_of(nodes[i].grp);
+        if (f >= 0) tab_take_place(i, f);
+        else nodes[i].tab_hidden = 0;           // a group with nobody in front
+    }
     for (int i = 0; i < MAX_NODES; i++)
         if (nodes[i].used && nodes[i].ws == cur_ws && nodes[i].state != WIN_MIN)
             layout_window(i);
@@ -647,6 +722,7 @@ static void invalidate_pane_cache(void) {
 #define FADE_MS 150
 #define KEY_CAP(n, b) (0x10000 | ((n) << 4) | (b))
 #define KEY_TB(i)     (0x20000 | (i))
+#define KEY_TAB(n, i, part) (0x50000 | ((n) << 6) | ((i) << 2) | (part))   // part 1: its close mark
 static int hov_key = -1, hov_old = -1;
 static uint64_t hov_ms, hov_old_ms;
 static int press_key = -1;                  // what a press armed, until release
@@ -695,6 +771,7 @@ static int hover_to(int key) {
 #define WB_CLOSE 3
 #define WB_N     4
 #define WB_TAB   4                 // the close mark on the tab, as a fifth button
+#define WB_PLUS  5                 // the "+" after the tabs: a new terminal tab
 #define WBTN     28
 #define WBTN_GAP 6
 
@@ -708,11 +785,28 @@ static void cap_rect(const struct wm_node *nd, int which, int *bx, int *by, int 
 
 static int cap_glow(int n, int b) { return glow_of(KEY_CAP(n, b)); }
 
+static int join_hint = -1;          // the window a dragged tab would join
+
+static const char *pane_title(struct pane *p);
+
+// Everything about a frame's top that can change without the window moving:
+// what is lit, what is held, the other tabs and their names.
 static uint32_t win_look(int n) {
     uint32_t v = 0;
-    for (int b = 0; b <= WB_TAB; b++) v = v * 131 + (uint32_t)cap_glow(n, b);
-    for (int b = 0; b <= WB_TAB; b++)
+    for (int b = 0; b <= WB_PLUS; b++) v = v * 131 + (uint32_t)cap_glow(n, b);
+    for (int b = 0; b <= WB_PLUS; b++)
         if (press_key == KEY_CAP(n, b)) v ^= 0x80000000u | (uint32_t)b << 27;
+    int m[TAB_MAX], k = tab_members(n, m);
+    for (int i = 0; i < k; i++) {
+        for (int part = 0; part < 2; part++) {
+            v = v * 131 + (uint32_t)glow_of(KEY_TAB(n, i, part));
+            if (press_key == KEY_TAB(n, i, part)) v ^= 0x40000000u | (uint32_t)(i * 2 + part) << 20;
+        }
+        for (const char *t = pane_title(&panes[nodes[m[i]].pane_idx]); *t; t++)
+            v = v * 33 + (uint8_t)*t;
+        v = v * 7 + (uint32_t)m[i];
+    }
+    if (join_hint == n) v ^= 0x20000000u;
     return v;
 }
 
@@ -748,29 +842,102 @@ static int is_light(uint32_t c) {
     return y > 150;
 }
 
-// Where the tab is, and where its close mark is.
-static void tab_rect(int n, int *tx, int *ty, int *tw, int *th) {
+// Where the tabs are. They stand in a row from the left of the strip, each
+// as wide as its name wants, all narrower when they would not fit; then the
+// "+", then room up to the buttons. n is the window in front.
+#define TAB_GAP 6
+#define PLUS_S  28
+
+static void tab_rect_i(int n, int i, int *tx, int *ty, int *tw, int *th) {
     const struct wm_node *nd = &nodes[n];
-    const char *t = pane_title(&panes[nd->pane_idx]);
-    int w = 38 + ui_text_w(t, UI_F13B) + 40;
+    int m[TAB_MAX], k = tab_members(n, m);
     int bx, by, bw, bh;
     cap_rect(nd, 0, &bx, &by, &bw, &bh);
-    int room = bx - 12 - ((int)nd->x + FRAME);
-    if (w > 280) w = 280;
-    if (w > room) w = room;
-    if (w < 60) w = 60;
-    *tx = (int)nd->x + FRAME;
+    int left = (int)nd->x + FRAME;
+    int room = bx - 12 - PLUS_S - TAB_GAP - left;
+    int w[TAB_MAX], total = 0;
+    for (int j = 0; j < k; j++) {
+        int ww = 38 + ui_text_w(pane_title(&panes[nodes[m[j]].pane_idx]), UI_F13B) + 40;
+        if (ww > 240) ww = 240;
+        if (ww < 60) ww = 60;
+        w[j] = ww;
+        total += ww + (j ? TAB_GAP : 0);
+    }
+    if (total > room && k) {
+        int each = (room - (k - 1) * TAB_GAP) / k;
+        if (each < 44) each = 44;
+        for (int j = 0; j < k; j++) if (w[j] > each) w[j] = each;
+    }
+    int x = left;
+    for (int j = 0; j < i && j < k; j++) x += w[j] + TAB_GAP;
+    *tx = x;
     *ty = (int)nd->y + 7;
-    *tw = w;
+    *tw = i < k ? w[i] : 0;
     *th = TITLE_H - 7;
 }
 
-static void tab_close_rect(int n, int *x, int *y, int *w, int *h) {
+// The tab of the window itself.
+static void tab_rect(int n, int *tx, int *ty, int *tw, int *th) {
+    tab_rect_i(n, tab_index(n), tx, ty, tw, th);
+}
+
+static void tab_close_rect_i(int n, int i, int *x, int *y, int *w, int *h) {
     int tx, ty, tw, th;
-    tab_rect(n, &tx, &ty, &tw, &th);
+    tab_rect_i(n, i, &tx, &ty, &tw, &th);
     *w = 22; *h = 22;
     *x = tx + tw - 30;
     *y = ty + (th - 22) / 2;
+}
+
+static void tab_close_rect(int n, int *x, int *y, int *w, int *h) {
+    tab_close_rect_i(n, tab_index(n), x, y, w, h);
+}
+
+// A tab behind shows its close mark only when it is wide enough to spare it.
+static int tab_has_close(int n, int i) {
+    if (i == tab_index(n)) return 1;
+    int tx, ty, tw, th;
+    tab_rect_i(n, i, &tx, &ty, &tw, &th);
+    return tw >= 90;
+}
+
+static void plus_rect(int n, int *x, int *y, int *w, int *h) {
+    int k = tab_count(n);
+    int tx, ty, tw, th;
+    tab_rect_i(n, k - 1, &tx, &ty, &tw, &th);
+    *x = tx + tw + TAB_GAP;
+    *y = (int)nodes[n].y + (TITLE_H - PLUS_S) / 2 + 1;
+    *w = PLUS_S;
+    *h = PLUS_S;
+}
+
+// What of the row of tabs is at (mx, my), and which tab.
+#define TABH_NONE  0
+#define TABH_TAB   1
+#define TABH_CLOSE 2
+#define TABH_PLUS  3
+
+static int tab_hit(int n, int mx, int my, int *idx) {
+    const struct wm_node *nd = &nodes[n];
+    *idx = -1;
+    if (my < (int)nd->y + 5 || my >= (int)nd->y + TITLE_H) return TABH_NONE;
+    int px, py, pw, ph;
+    plus_rect(n, &px, &py, &pw, &ph);
+    if (mx >= px && mx < px + pw && my >= py - 2 && my < py + ph + 2) return TABH_PLUS;
+    int k = tab_count(n);
+    for (int i = 0; i < k; i++) {
+        int tx, ty, tw, th;
+        tab_rect_i(n, i, &tx, &ty, &tw, &th);
+        if (mx < tx || mx >= tx + tw) continue;
+        *idx = i;
+        if (tab_has_close(n, i)) {
+            int cx, cy, cw, ch;
+            tab_close_rect_i(n, i, &cx, &cy, &cw, &ch);
+            if (mx >= cx && mx < cx + cw && my >= cy && my < cy + ch) return TABH_CLOSE;
+        }
+        return TABH_TAB;
+    }
+    return TABH_NONE;
 }
 
 // --- soft glyphs: the window's buttons, and the island's ----------------------
@@ -798,6 +965,7 @@ static void g_stroke(rast_path *p, rast_fx wdt, uint32_t argb) {
 #define GL_MAX   2
 #define GL_CLOSE 3
 #define GL_RESTORE 4
+#define GL_PLUS  5
 
 // A glyph in a box of size s at (x, y).
 static void wglyph(int g, int x, int y, int s, uint32_t c) {
@@ -824,6 +992,11 @@ static void wglyph(int g, int x, int y, int s, uint32_t c) {
         rast_round_rect(&p, PT(22, 22), LEN(56), LEN(56), LEN(16), LEN(16));
         g_stroke(&p, LEN(10), c);
         break;
+    case GL_PLUS:
+        rast_move_to(&p, PT(50, 20)); rast_line_to(&p, PT(50, 80));
+        rast_move_to(&p, PT(20, 50)); rast_line_to(&p, PT(80, 50));
+        g_stroke(&p, LEN(11), c);
+        break;
     case GL_RESTORE:
         rast_round_rect(&p, PT(34, 16), LEN(48), LEN(48), LEN(14), LEN(14));
         g_stroke(&p, LEN(9), c);
@@ -847,6 +1020,79 @@ static void wglyph(int g, int x, int y, int s, uint32_t c) {
 // Each window's glass, with its memory of what lies under it.
 static ui_glass wglass[MAX_NODES];
 
+// Bring a hidden tab to the front of its frame, in the place of the one there.
+static void tab_show(int n) {
+    if (!nodes[n].used || !nodes[n].tab_hidden) return;
+    int f = tab_front_of(nodes[n].grp);
+    if (f >= 0) {
+        tab_take_place(n, f);
+        nodes[f].tab_hidden = 1;
+        if (focused == f) focused = n;
+    }
+    nodes[n].tab_hidden = 0;
+    ui_glass_forget(&wglass[n]);           // its memory of the desktop is old
+    wp_dirty = 1;
+    dirty = 1;
+}
+
+// Take n out of its group into one of its own. If it was in front, the tab
+// beside it comes forward in its place, so the frame stays where it was.
+static void tab_leave(int n) {
+    int m[TAB_MAX], k = tab_members(n, m);
+    if (k > 1 && !nodes[n].tab_hidden) {
+        int at = 0;
+        for (int i = 0; i < k; i++) if (m[i] == n) at = i;
+        int nb = at + 1 < k ? m[at + 1] : m[at - 1];
+        tab_take_place(nb, n);
+        nodes[nb].tab_hidden = 0;
+        ui_glass_forget(&wglass[nb]);
+        if (focused == n) focused = nb;
+    }
+    nodes[n].grp = ++grp_next;
+    nodes[n].tab_hidden = 0;
+    wp_dirty = 1;
+}
+
+// Make n the newest tab of target's frame, in front. 0 if the frame is full.
+static int tab_join(int n, int target) {
+    if (nodes[n].grp == nodes[target].grp) return 1;
+    int f = tab_front_of(nodes[target].grp);
+    if (f < 0 || tab_count(f) >= TAB_MAX) return 0;
+    tab_leave(n);
+    nodes[n].grp = nodes[f].grp;
+    nodes[n].tab_seq = ++tab_seq_next;
+    tab_take_place(n, f);
+    nodes[f].tab_hidden = 1;
+    nodes[n].tab_hidden = 0;
+    ui_glass_forget(&wglass[n]);
+    focused = n;
+    wp_dirty = 1;
+    dirty = 1;
+    return 1;
+}
+
+// A whole frame of tabs let go on another: all of them move over, in their
+// order, and the one that was in front stays in front.
+static void group_join(int n, int target) {
+    int m[TAB_MAX], k = tab_members(n, m);
+    if (tab_count(target) + k > TAB_MAX) return;
+    for (int i = 0; i < k; i++) if (m[i] != n) tab_join(m[i], target);
+    tab_join(n, target);
+}
+
+// Put n's tab at place `to` in its row.
+static void tab_move_to(int n, int to) {
+    int m[TAB_MAX], k = tab_members(n, m), o[TAB_MAX], q = 0;
+    for (int i = 0; i < k; i++) if (m[i] != n) o[q++] = m[i];
+    if (to > q) to = q;
+    if (to < 0) to = 0;
+    for (int i = q; i > to; i--) o[i] = o[i - 1];
+    o[to] = n;
+    for (int i = 0; i <= q; i++) nodes[o[i]].tab_seq = ++tab_seq_next;
+    wp_dirty = 1;
+    dirty = 1;
+}
+
 // Where the window and its shadow reach: x0, y0, x1, y1.
 static void window_extent(int n, int e[4]) {
     const struct wm_node *nd = &nodes[n];
@@ -865,6 +1111,12 @@ static int boxes_meet(const int a[4], const int b[4]) {
     return a[0] < b[2] && b[0] < a[2] && a[1] < b[3] && b[1] < a[3];
 }
 
+// The body's rounded corners. The top left is square when the tab in front
+// is the first one, standing right over it and flowing down into it.
+static int body_corners(int n) {
+    return tab_index(n) == 0 ? (UI_TR | UI_BL | UI_BR) : UI_ALL;
+}
+
 // The glass of a window: a frame round its body, the strip at the top.
 static void window_glass(int n, int focus) {
     const struct wm_node *nd = &nodes[n];
@@ -873,7 +1125,7 @@ static void window_glass(int n, int focus) {
     int R = maxed ? 0 : RAD_T;
     int bx, by, bw, bh;
     client_rect(n, &bx, &by, &bw, &bh);
-    ui_glass_draw(&wglass[n], x, y, w, h, R, bx, by, bw, bh, BODY_R, UI_TR | UI_BL | UI_BR,
+    ui_glass_draw(&wglass[n], x, y, w, h, R, bx, by, bw, bh, BODY_R, body_corners(n),
                   focus ? TH->glass : TH->glass_off, focus ? TH->glass_a : TH->glass_off_a);
 }
 
@@ -898,7 +1150,50 @@ static void paint_chrome(int n, int focus) {
         ui_rrect_line(x + 1, y + 1, w - 2, h - 2, R - 1, UI_ALL, 0x00FFFFFF, 30);
     }
 
-    // The tab: in the body's colour, rounded at the top, its right foot
+    // The tabs behind: soft plates on the glass, a name on each.
+    int fi = tab_index(n);
+    {
+        int m[TAB_MAX], k = tab_members(n, m);
+        int saved[4];
+        for (int i = 0; i < k; i++) {
+            if (i == fi) continue;
+            int qx, qy, qw, qh;
+            tab_rect_i(n, i, &qx, &qy, &qw, &qh);
+            int glow = glow_of(KEY_TAB(n, i, 0));
+            ui_round_fill(qx, qy + 3, qw, qh - 9, 12, T->plate,
+                          (focus ? 120 : 80) + glow * 90 / 256);
+            const char *nm = pane_title(&panes[nodes[m[i]].pane_idx]);
+            int ix = qx + 10, iy = qy + 3 + (qh - 9 - 16) / 2;
+            if (!ui_icon(ix, iy, nm, ICON_SMALL))
+                ui_round_fill(ix + 2, iy + 2, 12, 12, 6, T->title_text_dim, 200);
+            int cl = tab_has_close(n, i);
+            ui_clip_get(saved);
+            ui_clip(qx, qy, qw - (cl ? 32 : 8), qh);
+            ui_text_fit(ix + 24, qy + 3 + (qh - 9 - ui_line_h(UI_F13)) / 2, qw - 34 - (cl ? 30 : 4), nm,
+                        UI_F13, glow > 128 ? T->title_text : T->title_text_dim);
+            ui_clip_set(saved);
+            if (cl) {
+                int cx, cy, cw, chh;
+                tab_close_rect_i(n, i, &cx, &cy, &cw, &chh);
+                int cg = glow_of(KEY_TAB(n, i, 1));
+                if (cg) ui_round_fill(cx, cy, cw, chh, 11, T->dark ? 0x00FFFFFF : 0x00000000, cg * 30 / 256);
+                if (glow || cg) wglyph(GL_CLOSE, cx + 5, cy + 5, 12, 0xFF000000 | T->title_text_dim);
+            }
+        }
+        // The "+": another terminal, as a tab of this window. Where a dragged
+        // tab would land, a plate in the accent shows the place.
+        int px, py, pw, ph;
+        plus_rect(n, &px, &py, &pw, &ph);
+        if (join_hint == n) {
+            ui_round_fill(px, py, 120, ph, 12, T->accent, 120);
+        } else {
+            int pg = glow_of(KEY_CAP(n, WB_PLUS));
+            ui_round_fill(px, py, pw, ph, ph / 2, T->plate, (focus ? 80 : 50) + pg * 140 / 256);
+            wglyph(GL_PLUS, px + 8, py + 8, 12, 0xFF000000 | (pg > 128 ? T->title_text : T->title_text_dim));
+        }
+    }
+
+    // The tab in front: in the body's colour, rounded at the top, its feet
     // curving out into the strip so the tab and the body are one shape.
     uint32_t bc = body_colour(n);
     int tx, ty, tw, th;
@@ -913,6 +1208,12 @@ static void paint_chrome(int n, int focus) {
         rast_quad_to(&fp, FXI(tx + tw), FXI(fy), FXI(tx + tw), FXI(fy - 10));
         rast_line_to(&fp, FXI(tx + tw), FXI(fy));
         rast_close(&fp);
+        if (fi > 0) {                            // and on the left, not first
+            rast_move_to(&fp, FXI(tx - 10), FXI(fy));
+            rast_quad_to(&fp, FXI(tx), FXI(fy), FXI(tx), FXI(fy - 10));
+            rast_line_to(&fp, FXI(tx), FXI(fy));
+            rast_close(&fp);
+        }
         g_fill(&fp, 0xFF000000 | bc);
         rast_path_free(&fp);
     }
@@ -933,7 +1234,7 @@ static void paint_chrome(int n, int focus) {
         ui_clip_set(saved);
         int cx, cy, cw, chh;
         tab_close_rect(n, &cx, &cy, &cw, &chh);
-        int glow = cap_glow(n, WB_TAB);
+        int glow = glow_of(KEY_TAB(n, fi, 1));
         if (glow) ui_round_fill(cx, cy, cw, chh, 11, is_light(bc) ? 0x00000000 : 0x00FFFFFF, glow * 30 / 256);
         wglyph(GL_CLOSE, cx + 5, cy + 5, 12, 0xFF000000 | dim);
     }
@@ -971,9 +1272,10 @@ static void repair_body_corners(int n) {
     client_rect(n, &bx, &by, &bw, &bh);
     int saved[4];
     ui_clip_get(saved);
-    int sq[3][2] = { { bx + bw - BODY_R, by }, { bx, by + bh - BODY_R },
-                     { bx + bw - BODY_R, by + bh - BODY_R } };
-    for (int k = 0; k < 3; k++) {
+    int sq[4][2] = { { bx + bw - BODY_R, by }, { bx, by + bh - BODY_R },
+                     { bx + bw - BODY_R, by + bh - BODY_R }, { bx, by } };
+    int nsq = (body_corners(n) & UI_TL) ? 4 : 3;
+    for (int k = 0; k < nsq; k++) {
         ui_clip(sq[k][0], sq[k][1], BODY_R, BODY_R);
         window_glass(n, n == focused);
     }
@@ -1483,7 +1785,7 @@ static void tb_layout(void) {
 
     // The slots: kept programs first, then any other program with a window.
     int win[MAX_NODES];
-    int nw = collect_windows(cur_ws, win, MAX_NODES);
+    int nw = collect_windows_ex(cur_ws, win, MAX_NODES, 1);
     struct tb_item apps[TB_MAX];
     int na = 0;
     for (int k = 0; k < ISL_KEPT; k++) {
@@ -3128,22 +3430,28 @@ static int layout_save(void) {
     static char buf[4096];
     int n = 0;
     int win[MAX_NODES];
-    int nw = collect_windows(cur_ws, win, MAX_NODES);
+    int nw = collect_windows_ex(cur_ws, win, MAX_NODES, 1);
+    // In tab order, so a frame's tabs come back in theirs.
+    for (int i = 1; i < nw; i++) {
+        int v = win[i], j = i - 1;
+        while (j >= 0 && nodes[win[j]].tab_seq > nodes[v].tab_seq) { win[j + 1] = win[j]; j--; }
+        win[j + 1] = v;
+    }
     for (int i = 0; i < nw && n < (int)sizeof buf - 300; i++) {
         const struct wm_node *nd = &nodes[win[i]];
         if (nd->state == WIN_MIN) continue;
-        // path|arg|x|y|w|h|maximised
+        // path|arg|x|y|w|h|maximised|group|in front
         const char *p = nd->path[0] ? nd->path : "-";
         for (int k = 0; p[k]; k++) buf[n++] = p[k];
         buf[n++] = '|';
         for (int k = 0; nd->arg[k] && k < 95; k++) buf[n++] = nd->arg[k];
         buf[n++] = '|';
-        uint32_t v[5] = { nd->state == WIN_MAX ? nd->sx : nd->x, nd->state == WIN_MAX ? nd->sy : nd->y,
+        uint32_t v[7] = { nd->state == WIN_MAX ? nd->sx : nd->x, nd->state == WIN_MAX ? nd->sy : nd->y,
                           nd->state == WIN_MAX ? nd->sw : nd->w, nd->state == WIN_MAX ? nd->sh : nd->h,
-                          nd->state == WIN_MAX };
-        for (int k = 0; k < 5; k++) {
+                          nd->state == WIN_MAX, (uint32_t)nd->grp, (uint32_t)!nd->tab_hidden };
+        for (int k = 0; k < 7; k++) {
             n += u2s(buf + n, v[k]);
-            buf[n++] = k < 4 ? '|' : '\n';
+            buf[n++] = k < 6 ? '|' : '\n';
         }
     }
     vfs_unlink(LAYOUT_FILE);
@@ -3155,6 +3463,7 @@ static int layout_save(void) {
     return ok;
 }
 
+static int quiet_open;          // open without the window's arrival animation
 static int new_window_run(const char *path, const char *arg);
 static void toggle_maximize(void);
 static void restore_window(int n);
@@ -3169,20 +3478,23 @@ static int layout_restore(void) {
     vfs_close(fd);
     if (n <= 0) return 0;
     buf[n] = 0;
+    // Saved group -> the first window opened again for it; and who was in front.
+    int sg[16], sn[16], ns = 0, fronts[16], nf = 0;
+    quiet_open = 1;
     char *line = buf;
     while (*line) {
         char *end = line;
         while (*end && *end != '\n') end++;
         char save = *end;
         *end = 0;
-        // Split on '|' into seven fields.
-        char *f[7];
+        // Split on '|' into seven fields, or nine with the tabs.
+        char *f[9];
         int k = 0;
         f[k++] = line;
-        for (char *c = line; *c && k < 7; c++) if (*c == '|') { *c = 0; f[k++] = c + 1; }
-        if (k == 7) {
-            uint32_t v[5];
-            for (int j = 0; j < 5; j++) {
+        for (char *c = line; *c && k < 9; c++) if (*c == '|') { *c = 0; f[k++] = c + 1; }
+        if (k >= 7) {
+            uint32_t v[7] = { 0, 0, 0, 0, 0, 0, 1 };
+            for (int j = 0; j < k - 2; j++) {
                 v[j] = 0;
                 for (char *c = f[2 + j]; *c >= '0' && *c <= '9'; c++) v[j] = v[j] * 10 + (uint32_t)(*c - '0');
             }
@@ -3193,11 +3505,20 @@ static int layout_restore(void) {
                 nd->x = v[0]; nd->y = v[1]; nd->w = v[2]; nd->h = v[3];
                 if (v[4]) toggle_maximize();
                 layout_window(focused);
+                if (k == 9) {
+                    int me = focused, at = -1;
+                    for (int q = 0; q < ns; q++) if (sg[q] == (int)v[5]) at = q;
+                    if (at >= 0 && nodes[sn[at]].used) tab_join(me, tab_front_of(nodes[sn[at]].grp));
+                    else if (ns < 16) { sg[ns] = (int)v[5]; sn[ns] = me; ns++; }
+                    if (v[6] && nf < 16) fronts[nf++] = me;
+                }
             }
         }
         *end = save;
         line = *end ? end + 1 : end;
     }
+    quiet_open = 0;
+    for (int i = 0; i < nf; i++) if (nodes[fronts[i]].used) restore_window(fronts[i]);
     relayout();
     return opened;
 }
@@ -3960,10 +4281,12 @@ static int stack_above(int a, int b) {
     return nodes[a].z > nodes[b].z;
 }
 
-static int collect_windows(int ws, int *out, int max) {
+// With `all`, the hidden tabs too: the island lists them, and a saved layout
+// keeps them.
+static int collect_windows_ex(int ws, int *out, int max, int all) {
     int n = 0;
     for (int i = 0; i < MAX_NODES && n < max; i++)
-        if (nodes[i].used && nodes[i].ws == ws) out[n++] = i;
+        if (nodes[i].used && nodes[i].ws == ws && (all || !nodes[i].tab_hidden)) out[n++] = i;
     for (int i = 1; i < n; i++) {            // insertion sort; n is tiny
         int v = out[i], j = i - 1;
         while (j >= 0 && stack_above(out[j], v)) { out[j + 1] = out[j]; j--; }
@@ -3972,11 +4295,15 @@ static int collect_windows(int ws, int *out, int max) {
     return n;
 }
 
+static int collect_windows(int ws, int *out, int max) {
+    return collect_windows_ex(ws, out, max, 0);
+}
+
 static int topmost_window(int ws) {
     int best = -1;
     for (int i = 0; i < MAX_NODES; i++) {
         if (!nodes[i].used || nodes[i].ws != ws) continue;
-        if (nodes[i].state == WIN_MIN) continue;
+        if (nodes[i].state == WIN_MIN || nodes[i].tab_hidden) continue;
         if (best < 0 || stack_above(i, best)) best = i;
     }
     return best;
@@ -4104,11 +4431,22 @@ static int new_window_run(const char *path, const char *arg) {
         recent_note(path, arg);
     }
     else      { panes[pi].app_pane = 0; spawn_shell_in(pi); }
-    anim_appear(AN_OPEN, n);
+    if (!quiet_open) anim_appear(AN_OPEN, n);
     return panes[pi].owner_pid;
 }
 
 static void new_window(void) { new_window_run(0, 0); }
+
+// The "+" on a frame: a new terminal, as a tab of it.
+static void new_tab_in(int n) {
+    quiet_open = 1;
+    int pid = new_window_run(0, 0);
+    quiet_open = 0;
+    if (pid < 0 || focused < 0 || focused == n) return;
+    tab_join(focused, n);
+    relayout();
+    refresh_leaves();
+}
 
 // Open a window for a program on someone else's behalf.
 //
@@ -4159,9 +4497,9 @@ int wm_spawn_window(const char *path, const char *arg) {
 // closed outright. Without that distinction a full-screen program started
 // from a prompt has no way out at all, because refusing to close the last
 // window refuses to close the program too.
-static void close_focused(void) {
-    if (focused < 0) return;
-    int pi = nodes[focused].pane_idx;
+static void close_window(int n) {
+    if (n < 0 || !nodes[n].used) return;
+    int pi = nodes[n].pane_idx;
     int owner = panes[pi].owner_pid;
 
     if (owner > 0) {
@@ -4175,18 +4513,25 @@ static void close_focused(void) {
     // The window really is going -- the last one too: an empty desktop is
     // allowed. Kill what it was running, or the process
     // survives with nowhere left to draw: an orphan that keeps being
-    // scheduled and that only the task manager can even see.
-    anim_vanish(AN_CLOSE, focused);
+    // scheduled and that only the task manager can even see. A tab among
+    // others goes without the animation: its frame stays.
+    if (!nodes[n].tab_hidden && tab_count(n) == 1) anim_vanish(AN_CLOSE, n);
     if (owner > 0) process_kill(owner);
     panes[pi].alive = 0;
     if (panes[pi].gfx) { kfree(panes[pi].gfx); panes[pi].gfx = 0; }
     panes[pi].gfx_on = 0;
     panes[pi].gfx_w = panes[pi].gfx_h = 0;
     panes[pi].gfx_pid = 0;
-    free_node(focused);
-    focused = topmost_window(cur_ws);
+    int was_focused = focused == n;
+    free_node(n);                        // a tab beside it comes forward
+    if (was_focused || (focused >= 0 && !nodes[focused].used)) {
+        // The tab that took its place, or else the window behind.
+        focused = topmost_window(cur_ws);
+    }
     relayout();
 }
+
+static void close_focused(void) { close_window(focused); }
 
 // Snap the focused window to half the desktop, the way dragging a window to a
 // screen edge does on Windows.
@@ -4217,6 +4562,7 @@ static void minimize_focused(void) {
 
 static void restore_window(int n) {
     if (n < 0 || !nodes[n].used) return;
+    if (nodes[n].tab_hidden) tab_show(n);   // its tab comes forward
     int was_min = nodes[n].state == WIN_MIN;
     if (was_min) nodes[n].state = WIN_NORMAL;
     raise_window(n);
@@ -4277,7 +4623,9 @@ static void toggle_maximize(void) {
 #define HIT_MAXBTN 4
 #define HIT_MINBTN 5
 #define HIT_PINBTN 6
-#define HIT_TABX   7       // the close mark on the window's tab
+#define HIT_TABX   7       // the close mark on one of the window's tabs
+#define HIT_TAB    8       // a tab itself: pick it, or take hold of it
+#define HIT_PLUS   9       // the "+" after the tabs
 #define HIT_L      0x10
 #define HIT_R      0x20
 #define HIT_T      0x40
@@ -4291,6 +4639,7 @@ static int hit_button(int hit) {
     case HIT_MAXBTN: return WB_MAX;
     case HIT_CLOSE:  return WB_CLOSE;
     case HIT_TABX:   return WB_TAB;
+    case HIT_PLUS:   return WB_PLUS;
     default:         return -1;
     }
 }
@@ -4310,9 +4659,10 @@ static int hit_test(int n, int mx, int my) {
         if (mx >= bx - 2 && mx < bx + bw + 2 && my >= by - 2 && my < by + bh + 2) return hits[b];
     }
     {
-        int cx, cy, cw, ch;
-        tab_close_rect(n, &cx, &cy, &cw, &ch);
-        if (mx >= cx && mx < cx + cw && my >= cy && my < cy + ch) return HIT_TABX;
+        int ti, t = tab_hit(n, mx, my, &ti);
+        if (t == TABH_CLOSE) return HIT_TABX;
+        if (t == TABH_PLUS) return HIT_PLUS;
+        if (t == TABH_TAB) return HIT_TAB;
     }
 
     if (nd->state != WIN_MAX) {              // resize handles: the glass edges
@@ -4331,6 +4681,37 @@ static int hit_test(int n, int mx, int my) {
 
     if (my < y0 + TITLE_H) return HIT_TITLE;
     return HIT_CLIENT;
+}
+
+// What on a window's top the pointer is over, as the key it lights up by:
+// a button, the "+", a tab behind, a tab's close mark. -1 for none.
+static int chrome_key(int n, int mx, int my) {
+    int ti, t = tab_hit(n, mx, my, &ti);
+    if (t == TABH_CLOSE) return KEY_TAB(n, ti, 1);
+    if (t == TABH_PLUS) return KEY_CAP(n, WB_PLUS);
+    if (t == TABH_TAB) return ti == tab_index(n) ? -1 : KEY_TAB(n, ti, 0);
+    int b = hit_button(hit_test(n, mx, my));
+    return b >= 0 && b != WB_TAB ? KEY_CAP(n, b) : -1;
+}
+
+// The window whose row of tabs is under the pointer, for a tab let go there:
+// not one of the group being dragged, and not one with no room for more.
+static int strip_target(int mx, int my, int grp) {
+    int win[MAX_NODES];
+    int c = collect_windows(cur_ws, win, MAX_NODES);
+    for (int i = c - 1; i >= 0; i--) {
+        const struct wm_node *nd = &nodes[win[i]];
+        if (nd->state == WIN_MIN) continue;
+        if (mx < (int)nd->x || my < (int)nd->y || mx >= (int)(nd->x + nd->w) ||
+            my >= (int)(nd->y + nd->h)) continue;
+        if (nd->grp == grp) {                  // the dragged frame itself:
+            if (my < (int)nd->y + TITLE_H) return -1;   // its own tabs
+            continue;
+        }
+        if (my >= (int)nd->y + TITLE_H) return -1;   // its body, not its tabs
+        return tab_count(win[i]) < TAB_MAX ? win[i] : -1;
+    }
+    return -1;
 }
 
 // Topmost window under the pointer, or -1.
@@ -4353,6 +4734,8 @@ static int drag_win = -1, drag_edge = 0;
 static int drag_gx, drag_gy;                 // where the grab started
 static uint32_t drag_ox, drag_oy, drag_ow, drag_oh;   // geometry at grab time
 static int press_hit = HIT_NONE, press_win = -1;      // for click-on-release
+static int press_tab = -1;                   // the tab whose close mark was pressed
+static int drag_tab = 0;                     // the drag is a tab out of a frame of several
 
 // The pointer for a resize handle: which way the edge or corner moves.
 static int edge_cursor(int edge) {
@@ -4522,7 +4905,7 @@ void wm_pane_interior(struct pane *p, int *w, int *h) {
 // window stacked above this one.
 static int present_pane_only(int n) {
     if (n < 0 || !nodes[n].used) return 0;
-    if (nodes[n].ws != cur_ws || nodes[n].state == WIN_MIN) return 0;
+    if (nodes[n].ws != cur_ws || nodes[n].state == WIN_MIN || nodes[n].tab_hidden) return 0;
     if (popup_open() || alttab_active || monitor_on || udrag_active) return 0;
     // Animating, the window is not where it will be.
     if (anim.active) return 0;
@@ -4540,7 +4923,7 @@ static int present_pane_only(int n) {
     // its shadow -- would be painted over by the shortcut.
     int cbox[4] = { (int)cx, (int)cy, (int)(cx + cw), (int)(cy + ch) };
     for (int i = 0; i < MAX_NODES; i++) {
-        if (i == n || !nodes[i].used) continue;
+        if (i == n || !nodes[i].used || nodes[i].tab_hidden) continue;
         if (nodes[i].ws != cur_ws || nodes[i].state == WIN_MIN) continue;
         if (!stack_above(i, n)) continue;
         int e[4];
@@ -4591,7 +4974,13 @@ int wm_pane_blit(struct pane *p, const uint32_t *src, int w, int h) {
         process_t *me = process_current();
         p->gfx_pid = me ? me->pid : 0;
     }
-    if (!present_pane_only(node_for_pane(p))) wm_refresh();
+    {
+        // A tab behind keeps its picture for when it is picked; nothing of
+        // it is on the screen to refresh.
+        int nn = node_for_pane(p);
+        if (nn >= 0 && nodes[nn].tab_hidden) return 0;
+        if (!present_pane_only(nn)) wm_refresh();
+    }
     return 0;
 }
 
@@ -4681,10 +5070,13 @@ void wm_notify_exit(int pid) {
         panes[i].app_pane = 0;
         for (int k = 0; k < MAX_NODES; k++) {
             if (!nodes[k].used || nodes[k].pane_idx != i) continue;
-            if (nodes[k].ws == cur_ws && nodes[k].state != WIN_MIN)
+            if (nodes[k].ws == cur_ws && nodes[k].state != WIN_MIN &&
+                !nodes[k].tab_hidden && tab_count(k) == 1)
                 anim_vanish(AN_CLOSE, k);
+            int was_focused = focused == k;
             free_node(k);
-            if (focused == k) focused = topmost_window(cur_ws);
+            if (was_focused || (focused >= 0 && !nodes[focused].used))
+                focused = topmost_window(cur_ws);
             relayout();
             break;
         }
@@ -4945,10 +5337,7 @@ static void handle_mouse(const struct mouse_event *me) {
             if (key == KEY_CC(CCK_INSIDE, 0)) key = -1;
         } else {
             int n = window_at(mx, my);
-            if (n >= 0) {
-                int b = hit_button(hit_test(n, mx, my));
-                if (b >= 0) key = KEY_CAP(n, b);
-            }
+            if (n >= 0) key = chrome_key(n, mx, my);
         }
         if (hover_to(key)) { dirty = 1; menu_dirty = 1; }
     }
@@ -5003,6 +5392,8 @@ static void handle_mouse(const struct mouse_event *me) {
             outline_off();
             drag_mode = DRAG_NONE;
             drag_win = -1;
+            drag_tab = 0;
+            join_hint = -1;
             return;
         }
         int dx = mx - drag_gx, dy = my - drag_gy;
@@ -5010,8 +5401,11 @@ static void handle_mouse(const struct mouse_event *me) {
         if (drag_mode == DRAG_MOVE) {
             nx = (int)drag_ox + dx; ny = (int)drag_oy + dy;
             nw = (int)drag_ow;      nh = (int)drag_oh;
-            shake_track(mx, drag_win);
-            int hint = snap_from_pointer(mx, my);
+            if (!drag_tab) shake_track(mx, drag_win);
+            // Over another frame's tabs: it would join them -- show where.
+            int jt = (dx || dy) ? strip_target(mx, my, nodes[drag_win].grp) : -1;
+            if (jt != join_hint) { join_hint = jt; dirty = 1; }
+            int hint = jt >= 0 ? SNAP_NONE : snap_from_pointer(mx, my);
             // The snap preview is desktop-wide, so it does need a real frame.
             if (hint != snap_hint) { snap_hint = hint; wp_dirty = 1; dirty = 1; }
         } else {
@@ -5099,20 +5493,55 @@ static void handle_mouse(const struct mouse_event *me) {
         restore_window(n);                       // focus + raise, like Windows
         int hit = hit_test(n, mx, my);
         press_hit = hit; press_win = n;
+        press_tab = -1;
+        if (hit == HIT_TABX) {
+            // Which tab's close mark: it fires on release over the same one.
+            int ti;
+            tab_hit(n, mx, my, &ti);
+            int m[TAB_MAX];
+            tab_members(n, m);
+            press_tab = m[ti];
+            press_key = KEY_TAB(n, ti, 1);
+            return;
+        }
         if (hit_button(hit) >= 0) {
             press_key = KEY_CAP(n, hit_button(hit));
             return;
         }
+        drag_tab = 0;
+        if (hit == HIT_TAB) {
+            // A tab: picked at once, and a handle too -- to drag the window
+            // by, or, among others, to pull it out on its own.
+            int ti;
+            tab_hit(n, mx, my, &ti);
+            int m[TAB_MAX], k = tab_members(n, m);
+            if (m[ti] != n) {
+                tab_show(m[ti]);
+                n = m[ti];
+                focused = n;
+                relayout();
+                refresh_leaves();
+                press_win = n;
+            }
+            drag_tab = k > 1;
+        }
 
         if (hit == HIT_CLIENT) { pane_push_mouse(n, me); return; }
 
-        if (hit == HIT_TITLE || (hit & 0xF0)) {
+        if (hit == HIT_TITLE || hit == HIT_TAB || (hit & 0xF0)) {
             struct wm_node *nd = &nodes[n];
             drag_win = n;
             drag_gx = mx; drag_gy = my;
             drag_ox = nd->x; drag_oy = nd->y; drag_ow = nd->w; drag_oh = nd->h;
-            if (hit == HIT_TITLE) {
-                if (nd->state == WIN_MAX) return;   // a maximised window stays put
+            if (drag_tab && nd->state == WIN_MAX) {
+                // Pulled out of a full-screen frame, a tab comes out at the
+                // size the frame had before it filled the screen.
+                drag_ow = nd->sw; drag_oh = nd->sh;
+                drag_ox = (uint32_t)(mx > 120 ? mx - 120 : 0);
+                drag_oy = (uint32_t)(my > 20 ? my - 20 : 0);
+            }
+            if (hit == HIT_TITLE || hit == HIT_TAB) {
+                if (nd->state == WIN_MAX && !drag_tab) return;   // a maximised window stays put
                 drag_mode = DRAG_MOVE;
                 shake_reset(mx);
             } else {
@@ -5138,6 +5567,31 @@ static void handle_mouse(const struct mouse_event *me) {
             outline_off();          // clean desktop before the window moves
             struct wm_node *nd = (drag_win >= 0 && nodes[drag_win].used)
                                ? &nodes[drag_win] : 0;
+            if (moved && nd && drag_mode == DRAG_MOVE) {
+                int tgt = strip_target(mx, my, nd->grp);
+                int own = my >= (int)nd->y && my < (int)nd->y + TITLE_H &&
+                          mx >= (int)nd->x && mx < (int)(nd->x + nd->w);
+                if (tgt >= 0) {
+                    // Let go on another frame's tabs: it joins them.
+                    if (drag_tab) tab_join(drag_win, tgt);
+                    else group_join(drag_win, tgt);
+                    relayout();
+                    refresh_leaves();
+                    nd = 0;
+                } else if (drag_tab && own) {
+                    // Along its own row: the tab moves to where it was let go.
+                    int ti, t = tab_hit(drag_win, mx, my, &ti);
+                    if (t == TABH_TAB || t == TABH_CLOSE) tab_move_to(drag_win, ti);
+                    nd = 0;
+                } else if (drag_tab) {
+                    // Anywhere else: out of its frame, a window of its own,
+                    // which the outline then places like any other.
+                    tab_leave(drag_win);
+                    nd->state = WIN_NORMAL;
+                    raise_window(drag_win);
+                    focused = drag_win;
+                }
+            }
             if (moved && nd) {
                 if (drag_mode == DRAG_MOVE && snap_hint != SNAP_NONE) {
                     // Remember where the window was BEFORE the drag, so
@@ -5161,6 +5615,8 @@ static void handle_mouse(const struct mouse_event *me) {
             snap_hint = SNAP_NONE;
             drag_mode = DRAG_NONE;
             drag_win = -1;
+            drag_tab = 0;
+            join_hint = -1;
             wp_dirty = 1;
             dirty = 1;
             if (moved) return;
@@ -5203,7 +5659,7 @@ static void handle_mouse(const struct mouse_event *me) {
         if (press_win >= 0 && nodes[press_win].used &&
             hit_test(press_win, mx, my) == press_hit) {
             focused = press_win;
-            if (press_hit == HIT_TITLE) {
+            if (press_hit == HIT_TITLE || press_hit == HIT_TAB) {
                 uint64_t now = pit_get_ticks() * 10;
                 if (last_click_win == press_win && now - last_click_ms < (uint64_t)dblclick_ms) {
                     toggle_maximize();
@@ -5216,8 +5672,12 @@ static void handle_mouse(const struct mouse_event *me) {
                 last_click_win = press_win;
             }
             switch (press_hit) {
-                case HIT_CLOSE:
-                case HIT_TABX:   close_focused(); break;
+                case HIT_CLOSE:  close_focused(); break;
+                case HIT_TABX:
+                    // Only if it comes up over the same tab's mark.
+                    if (chrome_key(press_win, mx, my) == was_key) close_window(press_tab);
+                    break;
+                case HIT_PLUS:   new_tab_in(press_win); break;
                 case HIT_MAXBTN: toggle_maximize(); break;
                 case HIT_MINBTN: minimize_focused(); break;
                 case HIT_PINBTN:
