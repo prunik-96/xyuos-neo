@@ -22,6 +22,7 @@
 #include "../drivers/ps2mouse.h"
 #include "../drivers/audio.h"
 #include "../drivers/xhci.h"
+#include "../drivers/virtio_gpu.h"
 #include "../drivers/power.h"
 #include "../fs/fat32.h"
 #include "../wm/wm.h"
@@ -49,8 +50,22 @@ static uint64_t fb_high_pdpt[512] __attribute__((aligned(4096)));
 // fast AND coherent. We flip the PAT bit (and clear PCD) on whichever existing
 // page(s) already cover the FB range -- 2 MiB pages under 4 GiB, 1 GiB pages
 // above -- then flush caches so no stale Write-Back lines linger.
+// Under a hypervisor (CPUID.1:ECX bit 31) the framebuffer is not a device at
+// all: it is the host's own RAM, read by the emulator's display. Write-
+// combining it buys nothing and, measured under KVM, made every frame's copy
+// to the screen several times slower than plain write-back.
+static int under_hypervisor(void) {
+    uint32_t a = 1, b, c, d;
+    __asm__ volatile ("cpuid" : "+a"(a), "=b"(b), "=c"(c), "=d"(d));
+    return (c >> 31) & 1;
+}
+
 static void fb_map_wc(uint64_t phys, uint64_t size) {
     if (size < 0x1000) size = 0x1000;
+    if (under_hypervisor()) {
+        kprintf("fb: in a virtual machine: framebuffer stays write-back\n");
+        return;
+    }
     uint64_t end = phys + size;
     for (uint64_t a = phys & ~0x1FFFFFULL; a < end && a < 0x100000000ULL; a += 0x200000ULL)
         p2_table[a >> 21] = (p2_table[a >> 21] & ~0x10ULL) | 0x1000ULL;  // clear PCD, set PAT
@@ -342,6 +357,9 @@ void kernel_main(uint32_t multiboot_addr) {
     // speaker, and a machine that can report its own errors out loud is worth
     // more than one that stays silent because the codec did not answer.
     audio_init();
+    // A virtio GPU, in a virtual machine that offers one: the desktop's frames
+    // then go to the screen as rectangles named, not pixels copied.
+    vgpu_init();
     if (rndis_present()) {
         const uint8_t *m = rndis_mac();
         kprintf("rndis: USB NIC ready, mac %x:%x:%x:%x:%x:%x\n",

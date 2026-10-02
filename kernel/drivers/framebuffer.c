@@ -1,4 +1,5 @@
 #include "../arch/x86_64/smp.h"
+#include "virtio_gpu.h"
 #include "framebuffer.h"
 #include "font8x8_basic.h"
 #include "../mm/heap.h"
@@ -207,6 +208,10 @@ void fb_enable_backbuffer(void) {
         // be considered "already on screen" and never pushed.
         for (uint64_t i = 0; i < need; i++) fb_shadow[i] = 0xAA;
     }
+
+    // A virtio GPU shows the back buffer itself: from here frames are not
+    // copied anywhere, only announced (see fb_present).
+    vgpu_take_screen(fb_back, fb_pitch, fb_width, fb_height);
 }
 
 // 1 if double buffering is active (drawing off-screen). For boot diagnostics.
@@ -261,6 +266,78 @@ static uint32_t present_row(uint32_t y, uint32_t x0, uint32_t x1) {
 struct present_job { struct fb_dmg r[FB_DMG_MAX]; int n; uint32_t bytes[MAX_CPUS], rows[MAX_CPUS]; };
 static struct present_job pjob;
 
+// With a virtio GPU nothing is copied: each share finds, against the shadow,
+// how much of its rows of each rectangle really changed, and the box round
+// that is what the host is told to take.
+static uint32_t vbox[MAX_CPUS][FB_DMG_MAX][4];
+
+static void vgpu_share(int share, int nsh, void *arg) {
+    struct present_job *j = (struct present_job *)arg;
+    uint32_t bytes = 0, rows = 0;
+    for (int i = 0; i < j->n; i++) {
+        uint32_t *b4 = vbox[share][i];
+        b4[0] = b4[1] = 0xFFFFFFFF; b4[2] = b4[3] = 0;
+        uint32_t x0 = j->r[i].x0, x1 = j->r[i].x1;
+        uint32_t h = j->r[i].y1 - j->r[i].y0;
+        uint32_t a = j->r[i].y0 + (uint32_t)((uint64_t)h * share / nsh);
+        uint32_t e = j->r[i].y0 + (uint32_t)((uint64_t)h * (share + 1) / nsh);
+        for (uint32_t y = a; y < e; y++) {
+            size_t off = (size_t)y * fb_pitch + (size_t)x0 * 4;
+            const uint32_t *bk = (const uint32_t *)(fb_back + off);
+            uint32_t lo = 0, hi = x1 - x0;
+            if (fb_shadow) {
+                uint32_t *sh = (uint32_t *)(fb_shadow + off);
+                while (lo < hi && bk[lo] == sh[lo]) lo++;
+                while (hi > lo && bk[hi - 1] == sh[hi - 1]) hi--;
+                if (lo == hi) continue;
+                for (uint32_t k = lo; k < hi; k++) sh[k] = bk[k];
+            }
+            rows++;
+            bytes += (hi - lo) * 4;
+            if (x0 + lo < b4[0]) b4[0] = x0 + lo;
+            if (y < b4[1]) b4[1] = y;
+            if (x0 + hi > b4[2]) b4[2] = x0 + hi;
+            if (y + 1 > b4[3]) b4[3] = y + 1;
+        }
+    }
+    j->bytes[share] = bytes;
+    j->rows[share] = rows;
+}
+
+static void present_vgpu(int n) {
+    pjob.n = n;
+    for (int i = 0; i < n; i++) pjob.r[i] = dmg[i];
+    for (int i = 0; i < MAX_CPUS; i++) {
+        pjob.bytes[i] = pjob.rows[i] = 0;
+        for (int k = 0; k < n; k++) { vbox[i][k][0] = 0xFFFFFFFF; vbox[i][k][2] = 0; }
+    }
+    smp_run(vgpu_share, &pjob);
+    uint32_t boxes[FB_DMG_MAX][4];
+    int m = 0;
+    for (int k = 0; k < n; k++) {
+        uint32_t b[4] = { 0xFFFFFFFF, 0xFFFFFFFF, 0, 0 };
+        for (int i = 0; i < MAX_CPUS; i++) {
+            if (vbox[i][k][2] <= vbox[i][k][0]) continue;     // nothing in this share
+            if (vbox[i][k][0] < b[0]) b[0] = vbox[i][k][0];
+            if (vbox[i][k][1] < b[1]) b[1] = vbox[i][k][1];
+            if (vbox[i][k][2] > b[2]) b[2] = vbox[i][k][2];
+            if (vbox[i][k][3] > b[3]) b[3] = vbox[i][k][3];
+        }
+        if (b[2] > b[0] && b[3] > b[1]) {
+            boxes[m][0] = b[0]; boxes[m][1] = b[1]; boxes[m][2] = b[2]; boxes[m][3] = b[3];
+            m++;
+        }
+    }
+    for (int i = 0; i < MAX_CPUS; i++) {
+        present_bytes += pjob.bytes[i];
+        present_rows += pjob.rows[i];
+    }
+    if (m) {
+        vgpu_update((const uint32_t (*)[4])boxes, m);
+        present_frames++;
+    }
+}
+
 static void present_share(int share, int nsh, void *arg) {
     struct present_job *j = (struct present_job *)arg;
     uint32_t bytes = 0, rows = 0;
@@ -286,6 +363,8 @@ void fb_present(void) {
     present_rows = 0;
     present_rects = (uint32_t)n;
     if (!n) return;                          // nothing was drawn this frame
+
+    if (vgpu_active()) { present_vgpu(n); return; }
 
     uint64_t area = 0;
     for (int i = 0; i < n; i++)

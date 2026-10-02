@@ -77,6 +77,8 @@ NET = (["-nic", "none", "-netdev", "user,id=n0",
         "-device", "usb-net,bus=xhci.0,netdev=n0"]
        if os.environ.get("SEQRUN_USBNET") == "1" else [])
 FIRMWARE = ["-bios", "/usr/share/qemu/OVMF.fd"] if UEFI else []
+# SEQRUN_VGA=virtio gives the machine the virtio GPU instead of the standard VGA.
+VGA = ["-vga", os.environ["SEQRUN_VGA"]] if os.environ.get("SEQRUN_VGA") else []
 AUDIO_OUT = os.environ.get("SEQRUN_AUDIO")
 AUDIO = (["-audiodev", "wav,id=snd0,path=" + AUDIO_OUT,
           "-device", "intel-hda", "-device", "hda-output,audiodev=snd0"]
@@ -89,7 +91,7 @@ proc = subprocess.Popen(
     ["-device", "qemu-xhci,id=xhci"] +
     (["-device", "usb-storage,bus=xhci.0,drive=stick,bootindex=0"] if STICK else []) +
     ["-device", "usb-kbd,bus=xhci.0", "-device", "usb-mouse,bus=xhci.0",
-     "-monitor", "unix:%s,server,nowait" % MON] + NET + AUDIO,
+     "-monitor", "unix:%s,server,nowait" % MON] + NET + AUDIO + VGA,
     stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
 
 

@@ -571,6 +571,12 @@ QEMU_DISK := -drive file=disk.img,if=none,id=disk0,format=raw -device virtio-blk
 #     sudo usermod -aG kvm $$USER
 # and start a new shell.
 QEMU_ACCEL := $(shell [ -r /dev/kvm ] && [ -w /dev/kvm ] && echo -enable-kvm -cpu host)
+# Every core the machine has, up to eight: the desktop draws on all of them.
+QEMU_SMP := -smp $(shell n=$$(nproc); [ $$n -gt 8 ] && n=8; echo $$n)
+# The virtio GPU: frames reach the window as named rectangles. With the
+# default VGA every pixel is written into emulated video memory, which under
+# KVM in WSL runs at about 90 MB/s -- a large animation becomes a slide show.
+QEMU_VGA := -vga virtio
 
 # A network card. Without one the whole IP stack is dead code: nic_init()
 # probes, finds nothing, and net_up() fails before it can send a single frame.
@@ -597,7 +603,7 @@ QEMU_USB := -device qemu-xhci,id=xhci -device usb-kbd,bus=xhci.0 \
 
 run: $(ISO) disk.img
 	@[ -n "$(QEMU_ACCEL)" ] || echo "note: running without KVM (slow). sudo usermod -aG kvm $$USER, then a new shell."
-	qemu-system-x86_64 $(QEMU_ACCEL) -cdrom $(ISO) -serial stdio -m 512M $(QEMU_DISK) $(QEMU_USB) $(QEMU_NET)
+	qemu-system-x86_64 $(QEMU_ACCEL) $(QEMU_SMP) $(QEMU_VGA) -cdrom $(ISO) -serial stdio -m 2G $(QEMU_DISK) $(QEMU_USB) $(QEMU_NET)
 
 run-nographic: $(ISO) disk.img
 	qemu-system-x86_64 $(QEMU_ACCEL) -cdrom $(ISO) -serial stdio -m 512M -display none $(QEMU_DISK) $(QEMU_USB) $(QEMU_NET)

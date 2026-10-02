@@ -1461,6 +1461,29 @@ static int pane_changed(int n) {
            pc->look != win_look(n);
 }
 
+// What changed about a window since it was painted: nothing (0), only its
+// top -- a button lit, a tab's name -- (1), only what its program shows (2),
+// or more than that (3).
+#define CH_NONE    0
+#define CH_CHROME  1
+#define CH_CONTENT 2
+#define CH_ALL     3
+static int win_alpha(int n);
+
+static int change_kind(int n) {
+    struct wm_node *nd = &nodes[n];
+    struct pane *p = &panes[nd->pane_idx];
+    struct pane_cache *pc = &pcache[nd->pane_idx];
+    if (!pc->valid || pc->gfx != p->gfx_on) return CH_ALL;
+    if (pc->x != nd->x || pc->y != nd->y || pc->w != nd->w || pc->h != nd->h ||
+        pc->focus != (n == focused) || pc->theme != theme) return CH_ALL;
+    if (win_alpha(n) < 255) return pane_changed(n) ? CH_ALL : CH_NONE;
+    int content = p->gfx_on ? pc->gen != gfx_gen[nd->pane_idx] : pc->fp != pane_fingerprint(p);
+    int look = pc->look != win_look(n);
+    if (content && look) return CH_ALL;
+    return look ? CH_CHROME : content ? CH_CONTENT : CH_NONE;
+}
+
 static void busy_end(int pane);
 
 static void pane_painted(int n) {
@@ -1542,6 +1565,32 @@ static void paint_window(int n) {
     pane_painted(n);
 }
 
+// Only the top of a window again: its strip, between the rounded corners.
+// The glass there is drawn whole from its memory and everything else on it
+// over that, so nothing old shows through.
+static void paint_strip_only(int n) {
+    const struct wm_node *nd = &nodes[n];
+    int R = nd->state == WIN_MAX ? 0 : RAD_T;
+    int sx = (int)nd->x + R, sw = (int)nd->w - 2 * R, sy = (int)nd->y;
+    int saved[4];
+    ui_clip_get(saved);
+    ui_clip(sx, sy, sw, TITLE_H);
+    paint_chrome(n, n == focused);
+    ui_clip_set(saved);
+    pane_painted(n);
+    dmg_add(sx, sy, sx + sw, sy + TITLE_H);
+}
+
+// Only what the program shows, and the frame's glass over the body's corners.
+static void paint_content_only(int n) {
+    uint32_t cx, cy, cw, ch;
+    content_rect(n, &cx, &cy, &cw, &ch);
+    draw_content(n, cx, cy, cw, ch, n == focused);
+    repair_body_corners(n);
+    pane_painted(n);
+    dmg_add((int)cx, (int)cy, (int)(cx + cw), (int)(cy + ch));
+}
+
 // Put the wallpaper back where a window's shadow and rounded corners fall,
 // so they are drawn over the desktop rather than over last frame's copy of
 // themselves -- a shadow laid down twice is twice as dark. The window's own
@@ -1588,10 +1637,39 @@ static void render_windows(void) {
     int ext[MAX_NODES][4];
     for (int i = 0; i < nv; i++) window_extent(vis[i], ext[i]);
 
+    // A window whose top alone changed (a button lit) or whose program's
+    // picture alone did (a key typed) and that nothing above covers there is
+    // painted in just that part. Everything else as before: the lowest window
+    // that changed, and every window above it.
+    int kind[MAX_NODES], small[MAX_NODES];
+    for (int i = 0; i < nv; i++) {
+        kind[i] = change_kind(vis[i]);
+        small[i] = 0;
+        if (kind[i] == CH_CHROME || kind[i] == CH_CONTENT) {
+            const struct wm_node *nd = &nodes[vis[i]];
+            int r[4];
+            if (kind[i] == CH_CHROME) {
+                r[0] = (int)nd->x; r[1] = (int)nd->y;
+                r[2] = (int)(nd->x + nd->w); r[3] = (int)nd->y + TITLE_H;
+            } else {
+                uint32_t cx, cy, cw, ch;
+                content_rect(vis[i], &cx, &cy, &cw, &ch);
+                r[0] = (int)cx - BODY_R; r[1] = (int)cy - BODY_R;
+                r[2] = (int)(cx + cw) + BODY_R; r[3] = (int)(cy + ch) + BODY_R;
+            }
+            small[i] = 1;
+            for (int j = i + 1; j < nv; j++) if (boxes_meet(ext[j], r)) { small[i] = 0; break; }
+        }
+    }
     int L = nv;
     for (int i = 0; i < nv; i++) {
-        if (pane_changed(vis[i])) { L = i; break; }
+        if (kind[i] != CH_NONE && !small[i]) { L = i; break; }
         pf_skipped++;
+    }
+    for (int i = 0; i < L; i++) {
+        if (!small[i]) continue;
+        if (kind[i] == CH_CHROME) paint_strip_only(vis[i]);
+        else paint_content_only(vis[i]);
     }
     if (L == nv) return;
     for (;;) {
@@ -3282,6 +3360,9 @@ static int dnd;                     // "do not disturb": notices are not shown
 static int cc_vol_drag;             // the volume knob is held
 
 static int popup_open(void) { return start_open || cc_open || am_open; }
+
+// A popup was opened or closed: what the next frame has to do about it.
+static void wp_dirty_on_popup(void) { wp_dirty = 1; dirty = 1; }
 
 static void cc_geom(int *x, int *y, int *w, int *h) {
     int W = (int)fb_get_width(), H = (int)fb_get_height();
@@ -6435,12 +6516,73 @@ static void bench_phase(const char *name, int mode, unsigned ticks) {
             wp_dirty = 1;
             render_all();
             break;
+        case 5:                                  // the pointer on and off a button
+            if (f >= 0 && nodes[f].used) {
+                hover_to((frames & 1) ? KEY_CAP(f, WB_CLOSE) : -1);
+                hov_ms = now_ms() - FADE_MS;      // lit at once: every frame differs
+                hov_old_ms = hov_ms;
+            }
+            render_all();
+            break;
+        case 6: {                                // typing into a terminal
+            int tn = -1;
+            for (int i = 0; i < MAX_NODES; i++)
+                if (nodes[i].used && !nodes[i].tab_hidden && !panes[nodes[i].pane_idx].gfx_on) tn = i;
+            if (tn >= 0) {
+                struct pane *tp = &panes[nodes[tn].pane_idx];
+                pane_putc(tp, (char)('a' + (frames % 26)));
+                if ((frames % 60) == 59) pane_putc(tp, '\n');
+            }
+            render_all();
+            break;
+        }
+        case 7:                                  // the control panel opened and closed
+            cc_open = !cc_open;
+            pop_t0 = now_ms() - SPRING_MS - 50;  // no spring: the open and close themselves
+            pop_glass_fresh = 0;
+            wp_dirty_on_popup();
+            render_all();
+            break;
+        case 8: {                                // focus to and fro between two windows
+            int win[MAX_NODES], n = collect_windows(cur_ws, win, MAX_NODES);
+            if (n >= 2) restore_window(win[0]);
+            render_all();
+            break;
+        }
+        case 12:                                 // the launcher springing up, mid-way
+            if (!start_open) { start_toggle(); render_all(); }
+            pop_t0 = now_ms() - 120;                // in the middle of its spring
+            menu_dirty = 1;
+            pop_glass_fresh = 0;
+            render_all();
+            break;
+        case 13:                                 // a window opening: one frame of it
+            if (f >= 0 && nodes[f].used) {
+                if (!anim.active) anim_appear(AN_OPEN, f);
+                anim.t0 = now_ms() - 100;            // mid-way, every frame
+                anim.frames = 1;
+            }
+            render_all();
+            break;
         case 2:                                  // a window moved, as an outline
             cursor_restore();
             outline_hide();
             ol_x = save_ol + (int)(frames & 1);
             outline_show();
             cursor_draw();
+            fb_present();
+            break;
+        case 9:                                  // every pixel changed, out to the screen
+            fb_fill_rect(0, 0, fb_get_width(), fb_get_height(),
+                         (frames & 1) ? 0x00203040 : 0x00304050);
+            fb_present();
+            break;
+        case 10:                                 // a 1-pixel column, top to bottom
+            fb_fill_rect(700, 0, 1, fb_get_height(), (frames & 1) ? 0x00203040 : 0x00304050);
+            fb_present();
+            break;
+        case 11:                                 // a 600-pixel row band, 40 rows
+            fb_fill_rect(300, 500, 600, 40, (frames & 1) ? 0x00203040 : 0x00304050);
             fb_present();
             break;
         case 3:                                  // pure screen bandwidth
@@ -6488,7 +6630,19 @@ static void wm_benchmark(void) {
         bench_phase("outline drag", 2, 100);
         outline_off();
     }
+    bench_phase("hover", 5, 100);
+    bench_phase("typing", 6, 100);
+    bench_phase("panel open/close", 7, 100);
+    cc_open = 0; wp_dirty = 1; render_all();
+    bench_phase("focus switch", 8, 100);
+    bench_phase("launcher spring", 12, 100);
+    if (start_open) start_toggle();
+    bench_phase("window opening", 13, 100);
+    anim_stop();
     bench_phase("screen push", 3, 100);
+    bench_phase("screen write", 9, 100);
+    bench_phase("column 1x1080", 10, 100);
+    bench_phase("band 600x40", 11, 100);
     bench_phase("ram fill", 4, 100);
     wp_dirty = 1;
     dirty = 1;
