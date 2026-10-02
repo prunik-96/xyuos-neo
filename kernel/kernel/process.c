@@ -22,6 +22,7 @@
 #include "../wm/wm.h"
 #include "../arch/x86_64/pit.h"
 #include "../arch/x86_64/smp.h"
+#include "../drivers/xhci.h"
 #include <stddef.h>
 
 extern uint64_t kctx_save(uint64_t ctx[8]);
@@ -1066,6 +1067,10 @@ static void cpu_loop(void) {
         // No process on this core from here until one is picked.
         current = NULL;
         this_cpu()->kstack_top = 0;
+
+        // A USB device plugged in or pulled out: set up, or let go of. Here,
+        // because that waits on the device, which the timer must not.
+        if (bsp) usb_service();
 
         // Something on the desktop is moving: its frame first, then whatever
         // is runnable (wm_wants_frame lets this happen once per frame, not on

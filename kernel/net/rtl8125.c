@@ -71,19 +71,9 @@ static inline void  w32(uint32_t r, uint32_t v){ *(volatile uint32_t *)(mmio + r
 static inline uint8_t  r8(uint32_t r)  { return *(volatile uint8_t  *)(mmio + r); }
 static inline uint32_t r32(uint32_t r) { return *(volatile uint32_t *)(mmio + r); }
 
+// One unbroken, zeroed run of pages: the card walks its rings by address.
 static void *alloc_contig(uint32_t bytes) {
-    uint32_t pages = (bytes + 4095) / 4096;
-    uint64_t start = pmm_alloc_frame();
-    if (!start) return NULL;
-    uint64_t expect = start + PAGE_SIZE;
-    for (uint32_t i = 1; i < pages; i++) {
-        uint64_t f = pmm_alloc_frame();
-        if (f != expect) return NULL;
-        expect += PAGE_SIZE;
-    }
-    uint8_t *p = (uint8_t *)(uintptr_t)start;
-    for (uint32_t i = 0; i < pages * 4096; i++) p[i] = 0;
-    return p;
+    return (void *)(uintptr_t)pmm_alloc_contig((bytes + 4095) / 4096);
 }
 
 // Pick the first memory BAR (RTL8125 keeps its MMIO on BAR2, but scan so a

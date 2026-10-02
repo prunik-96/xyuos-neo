@@ -6,6 +6,7 @@
 #include "../drivers/audio.h"
 #include "../drivers/mouse.h"
 #include "../drivers/framebuffer.h"
+#include "../drivers/virtio_gpu.h"
 #include "../mm/pmm.h"
 #include "../net/nic.h"
 #include "../arch/x86_64/smp.h"
@@ -192,6 +193,10 @@ static const char *pci_driver_for(const pci_device_t *d, const char **status) {
         *status = audio_ready() ? "running" : "not initialised";
         return "hda";
     }
+    if (d->class_code == 0x03 && d->vendor_id == 0x1AF4 && vgpu_active()) {
+        *status = "running";
+        return "virtio-gpu";
+    }
     if (d->class_code == 0x03) {
         *status = "in use (firmware)";
         return "vesa";
@@ -267,28 +272,41 @@ int device_list(struct si_dev *out, int max) {
         scopy(d->status, be ? "mounted" : "absent", sizeof d->status);
     }
 
-    // --- input ---
-    if ((d = slot(out, max, &n))) {
+    // --- input that is not on USB ---
+    if (xhci_keyboard_count() == 0 && (d = slot(out, max, &n))) {
         d->cat = DEVC_INPUT;
-        int nk = xhci_keyboard_count();
-        if (nk > 0) {
-            scopy(d->name, "USB keyboard", sizeof d->name);
-            scopy(d->driver, "xhci-hid", sizeof d->driver);
-            if (nk > 1) { d->status[0] = 0; uapp(d->status, (unsigned)nk, sizeof d->status);
-                          sapp(d->status, " attached", sizeof d->status); }
-            else scopy(d->status, "running", sizeof d->status);
-        } else {
-            scopy(d->name, "PS/2 keyboard", sizeof d->name);
-            scopy(d->driver, "i8042", sizeof d->driver);
-            scopy(d->status, "running", sizeof d->status);
-        }
+        scopy(d->name, "PS/2 keyboard", sizeof d->name);
+        scopy(d->driver, "i8042", sizeof d->driver);
+        scopy(d->status, "running", sizeof d->status);
     }
-    if ((d = slot(out, max, &n))) {
+    if (!xhci_mouse_present() && (d = slot(out, max, &n))) {
         d->cat = DEVC_INPUT;
-        int usb = xhci_mouse_present();
-        scopy(d->name, usb ? "USB mouse" : "PS/2 mouse", sizeof d->name);
-        scopy(d->driver, usb ? "xhci-hid" : "i8042-aux", sizeof d->driver);
+        scopy(d->name, "PS/2 mouse", sizeof d->name);
+        scopy(d->driver, "i8042-aux", sizeof d->driver);
         scopy(d->status, mouse_present() ? "running" : "not detected", sizeof d->status);
+    }
+
+    // --- everything on USB, as it is plugged in now ---
+    {
+        static struct usb_info u[32];
+        int nu = usb_list(u, 32);
+        for (int i = 0; i < nu; i++) {
+            if ((d = slot(out, max, &n)) == 0) break;
+            static const char *what[7] = { "USB device", "USB hub", "USB keyboard", "USB mouse",
+                                           "USB keyboard and mouse", "USB drive",
+                                           "USB network (tethering)" };
+            static const char *drv[7] = { "", "usb-hub", "usb-hid", "usb-hid", "usb-hid",
+                                          "usb-storage", "rndis" };
+            static const unsigned char cat[7] = { DEVC_USB, DEVC_USB, DEVC_INPUT, DEVC_INPUT,
+                                                  DEVC_INPUT, DEVC_STORAGE, DEVC_NETWORK };
+            int k = u[i].kind >= 0 && u[i].kind < 7 ? u[i].kind : 0;
+            d->cat = cat[k];
+            d->vendor = u[i].vid;
+            d->device = u[i].pid;
+            scopy(d->name, u[i].name[0] ? u[i].name : what[k], sizeof d->name);
+            scopy(d->driver, drv[k], sizeof d->driver);
+            scopy(d->status, k ? "running" : "no driver", sizeof d->status);
+        }
     }
 
     // --- audio, when there is no PCI controller to speak for it ---

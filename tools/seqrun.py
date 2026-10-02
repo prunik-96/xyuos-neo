@@ -35,6 +35,12 @@ file -- what the system actually sent to the speakers, to be checked.
 
 SEQRUN_PUT="host:guest,host2:guest2" copies files onto the run's copy of the
 disk first (never onto disk.img itself): test material that should not ship.
+
+SEQRUN_NOHID=1 leaves out the keyboard and mouse on the controller's own
+ports, and SEQRUN_USBX adds QEMU arguments (split at spaces) -- together they
+put the keyboard behind a hub: SEQRUN_USBX="-device usb-hub,bus=xhci.0,port=1
+-device usb-kbd,bus=xhci.0,port=1.1". Steps starting with ! can plug devices
+in and out while it runs (drive_add / device_add / device_del).
 """
 import os, shutil, socket, subprocess, sys, time
 
@@ -90,8 +96,10 @@ proc = subprocess.Popen(
      "-smp", SMP] + DISK +
     ["-device", "qemu-xhci,id=xhci"] +
     (["-device", "usb-storage,bus=xhci.0,drive=stick,bootindex=0"] if STICK else []) +
-    ["-device", "usb-kbd,bus=xhci.0", "-device", "usb-mouse,bus=xhci.0",
-     "-monitor", "unix:%s,server,nowait" % MON] + NET + AUDIO + VGA,
+    ([] if os.environ.get("SEQRUN_NOHID") == "1" else
+     ["-device", "usb-kbd,bus=xhci.0", "-device", "usb-mouse,bus=xhci.0"]) +
+    os.environ.get("SEQRUN_USBX", "").split() +
+    ["-monitor", "unix:%s,server,nowait" % MON] + NET + AUDIO + VGA,
     stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
 
 

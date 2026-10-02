@@ -1605,8 +1605,23 @@ int net_parse_ip(const char *s, uint32_t *out) {
     return 1;
 }
 
+// The card the network was up on is gone (a phone pulled out): the network
+// is down, and the next net_up chooses a card again.
+static void check_nic(void) {
+    if (have_nic && nic_gone()) {
+        kprintf("net: %s went away\n", nic_name() ? nic_name() : "the card");
+        up = 0;
+        have_nic = 0;
+        nic_unbind();
+    }
+}
+
 int net_up(void) {
+    check_nic();
     if (up) return 1;
+    // A card chosen earlier that still has no link (the wired one, no cable)
+    // is not kept: something plugged in since -- a phone -- may have one.
+    if (have_nic && !nic_link()) { have_nic = 0; nic_unbind(); }
     if (!have_nic) {
         if (!nic_init()) { kprintf("net: no NIC\n"); return 0; }
         nmemcpy(our_mac, nic_mac(), 6);
@@ -1643,7 +1658,7 @@ int net_up(void) {
     return 0;
 }
 
-int net_is_up(void) { return up; }
+int net_is_up(void) { check_nic(); return up; }
 
 void net_config(uint32_t *ip, uint32_t *gw, uint32_t *mask, uint32_t *dns) {
     if (ip) *ip = our_ip;

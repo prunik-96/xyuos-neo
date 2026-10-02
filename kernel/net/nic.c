@@ -49,6 +49,10 @@ const uint8_t *nic_mac(void)                 { return bound ? bound->mac() : NUL
 const char *nic_name(void)                   { return bound ? bound->name : NULL; }
 int  nic_send(const void *f, uint16_t len)   { return bound ? bound->send(f, len) : -1; }
 void nic_poll(void)                          { if (bound) bound->poll(); }
+// Only the USB adapter can go: the others are soldered to the board.
+int  nic_gone(void) { return bound == &usbnet_driver && !usbnet_driver.link(); }
+void nic_unbind(void) { bound = NULL; }
+
 int  nic_link(void) {
     if (!bound) return 0;
     if (!bound->link) return 1;              // driver reports no link state -> assume up

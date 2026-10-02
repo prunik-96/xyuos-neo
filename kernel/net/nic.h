@@ -24,4 +24,10 @@ int  nic_send(const void *frame, uint16_t len);
 void nic_poll(void);
 int  nic_link(void);                          // 1 if link up (or driver has no link check)
 
+// The card bound went away -- a phone pulled out takes its adapter with it.
+int  nic_gone(void);
+// Forget the card bound, so the next nic_init() chooses again: a phone
+// plugged in after a cable-less wired card was chosen gets its turn.
+void nic_unbind(void);
+
 #endif

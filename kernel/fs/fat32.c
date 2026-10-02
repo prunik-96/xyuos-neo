@@ -15,6 +15,7 @@
 
 static int      mounted;
 static int      fat_dev = -1;      // which USB disk we are mounted on
+static uint32_t fat_id;            // ... and which plugging-in of it (usb_disk_id)
 static uint32_t bytes_per_sec, sec_per_clus, reserved_sec, num_fats, fat_size, root_clus;
 static uint32_t first_fat_sec, first_data_sec;
 static uint32_t tot_sec, count_clus, fsinfo_sec;   // for the write path
@@ -38,7 +39,12 @@ static void wr32(uint8_t *p, uint32_t v) {
 
 static char upper(char c) { return (c >= 'a' && c <= 'z') ? (char)(c - 32) : c; }
 
-int fat32_mounted(void) { return mounted; }
+// Mounted -- on a disk that is still the one it was mounted on. A stick
+// pulled out unmounts it; the next look mounts whatever is there then.
+int fat32_mounted(void) {
+    if (mounted && usb_disk_id(fat_dev) != fat_id) mounted = 0;
+    return mounted;
+}
 
 int fat32_mount(int dev) {
     mounted = 0;
@@ -66,6 +72,7 @@ int fat32_mount(int dev) {
     fsinfo_sec = rd16(dbuf + 48);          // BPB_FSInfo
     count_clus = (tot_sec - first_data_sec) / sec_per_clus;  // #data clusters
     alloc_hint = 2;
+    fat_id = usb_disk_id(dev);
     mounted = 1;
     return 1;
 }

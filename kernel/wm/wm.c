@@ -1486,6 +1486,65 @@ static int change_kind(int n) {
 
 static void busy_end(int pane);
 
+static void note_push(const char *title, const char *body, int glyph, uint32_t color);
+
+// What a USB device that came or went is, in a word, and the line under it.
+static void usb_note(const struct usb_news *n) {
+    static char body[96];
+    const char *title;
+    int in = n->attached;
+    switch (n->kind) {
+    case USB_KIND_KBD:
+        title = in ? L("Клавиатура подключена", "Keyboard connected")
+                   : L("Клавиатура отключена", "Keyboard removed");
+        break;
+    case USB_KIND_MOUSE:
+        title = in ? L("Мышь подключена", "Mouse connected") : L("Мышь отключена", "Mouse removed");
+        break;
+    case USB_KIND_COMBO:
+        title = in ? L("Приёмник клавиатуры и мыши подключён", "Keyboard and mouse receiver connected")
+                   : L("Приёмник клавиатуры и мыши отключён", "Keyboard and mouse receiver removed");
+        break;
+    case USB_KIND_DISK:
+        title = in ? L("Флешка подключена", "USB drive connected") : L("Флешка отключена", "USB drive removed");
+        break;
+    case USB_KIND_NET:
+        title = in ? L("Интернет через телефон", "Internet through the phone")
+                   : L("Телефон отключён", "Phone disconnected");
+        break;
+    case USB_KIND_HUB:
+        title = in ? L("USB-разветвитель подключён", "USB hub connected")
+                   : L("USB-разветвитель отключён", "USB hub removed");
+        break;
+    default:
+        title = in ? L("USB-устройство подключено", "USB device connected")
+                   : L("USB-устройство отключено", "USB device removed");
+        break;
+    }
+    // The line under it: its own name, a drive's size, or what is missing.
+    int k = 0;
+    const char *name = n->name[0] ? n->name : "";
+    for (int i = 0; name[i] && k < 60; i++) body[k++] = name[i];
+    if (in && n->kind == USB_KIND_DISK && n->mib) {
+        char num[16];
+        uint32_t v = n->mib >= 1024 ? (n->mib + 512) / 1024 : n->mib;
+        int m = 0;
+        do { num[m++] = (char)('0' + v % 10); v /= 10; } while (v);
+        if (k) { body[k++] = ','; body[k++] = ' '; }
+        while (m) body[k++] = num[--m];
+        const char *unit = n->mib >= 1024 ? L(" ГБ", " GB") : L(" МБ", " MB");
+        for (int i = 0; unit[i]; i++) body[k++] = unit[i];
+    }
+    if (in && n->kind == USB_KIND_OTHER) {
+        const char *t = L("Для него в системе нет драйвера.", "The system has no driver for it.");
+        if (k) body[k++] = ' ', body[k++] = '-', body[k++] = ' ';
+        for (int i = 0; t[i] && k < 94; i++) body[k++] = t[i];
+    }
+    body[k] = 0;
+    sound_play(in ? SND_USB_IN : SND_USB_OUT);
+    note_push(title, body, G_CHIP, in ? TH->accent : 0x006B7480);
+}
+
 static void pane_painted(int n) {
     struct wm_node *nd = &nodes[n];
     struct pane *p = &panes[nd->pane_idx];
@@ -6955,21 +7014,10 @@ void wm_poll(void) {
     if (anim.active) dirty = 1;                 // the next step of a window's way
     if (note_animating()) dirty = 1;            // a notice coming or going
 
-    // A USB device plugged in or pulled out. Not in the first seconds: the
-    // ports' own news from boot arrives then, and is not news.
+    // A USB device plugged in or pulled out: said once, with what it is.
     {
-        static uint64_t since;
-        if (!since) since = now_ms();
-        int usb = xhci_port_news();
-        if (usb && now_ms() - since > 5000) {
-            sound_play(usb > 0 ? SND_USB_IN : SND_USB_OUT);
-            note_push(usb > 0 ? L("USB-устройство подключено", "USB device connected")
-                              : L("USB-устройство отключено", "USB device removed"),
-                      usb > 0 ? L("Новые устройства пока подключаются при запуске.",
-                                  "New devices are set up at start-up for now.")
-                              : L("Его можно было вынимать.", "It was safe to remove."),
-                      G_CHIP, usb > 0 ? TH->accent : 0x006B7480);
-        }
+        struct usb_news un;
+        while (xhci_news(&un)) usb_note(&un);
     }
     if (pop_animating()) {                      // a popup springing into place
         dirty = 1;

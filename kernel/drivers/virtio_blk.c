@@ -58,16 +58,12 @@ static uint32_t align_up32(uint32_t v, uint32_t a) {
     return (v + a - 1) & ~(a - 1);
 }
 
+// The queue is one unbroken run of pages: the device walks it by address.
+// Taking frames one at a time and hoping they came out adjacent worked only
+// while nothing had freed a page before -- the USB driver does, and then the
+// disk was not found at all.
 static void *alloc_contig_pages(uint32_t count) {
-    uint64_t start = pmm_alloc_frame();
-    if (start == 0) return NULL;
-    uint64_t expect = start + PAGE_SIZE;
-    for (uint32_t i = 1; i < count; i++) {
-        uint64_t f = pmm_alloc_frame();
-        if (f != expect) return NULL; // not contiguous; simple driver gives up
-        expect += PAGE_SIZE;
-    }
-    return (void *)(uintptr_t)start;
+    return (void *)(uintptr_t)pmm_alloc_contig(count);
 }
 
 int virtio_blk_init(void) {
