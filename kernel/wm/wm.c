@@ -921,10 +921,14 @@ static int pane_changed(int n) {
            pc->look != win_look(n);
 }
 
+static void busy_end(int pane);
+
 static void pane_painted(int n) {
     struct wm_node *nd = &nodes[n];
     struct pane *p = &panes[nd->pane_idx];
     struct pane_cache *pc = &pcache[nd->pane_idx];
+    // A text program is up once it has printed something.
+    if (!p->gfx_on && (p->cursor_row || p->cursor_col)) busy_end(nd->pane_idx);
     pc->valid = 1;
     pc->gfx = p->gfx_on;
     pc->gen = gfx_gen[nd->pane_idx];
@@ -2866,6 +2870,7 @@ static void sm_restore_under(void) {
 
 static int  new_window_run(const char *path, const char *arg);
 static void new_window(void);
+static void cursor_restore(void);
 
 static const struct {
     const char *name, *path, *arg, *icon;
@@ -3108,6 +3113,11 @@ static void desk_refresh(int i) {
         if (boxes_meet(e, cell)) covered = 1;
     }
     if (covered) { wp_dirty = 1; dirty = 1; return; }
+    // The pointer is very likely standing on this very cell, holding a copy
+    // of what was under it. Lift it first: otherwise the next frame puts that
+    // stale copy back over the fresh cell -- the 32-pixel squares of old
+    // highlight that were left beside the icons.
+    cursor_restore();
     restore_wall(x, y, DI_W, DI_H);
     dirty = 1;
 }
@@ -4077,10 +4087,8 @@ static void close_focused(void) {
         }
     }
 
-    int win[MAX_NODES];
-    if (collect_windows(cur_ws, win, MAX_NODES) <= 1) return;  // keep one open
-
-    // The window really is going. Kill what it was running, or the process
+    // The window really is going -- the last one too: an empty desktop is
+    // allowed. Kill what it was running, or the process
     // survives with nowhere left to draw: an orphan that keeps being
     // scheduled and that only the task manager can even see.
     anim_vanish(AN_CLOSE, focused);
@@ -4266,7 +4274,7 @@ static int cursor_pick(int mx, int my) {
     return CUR_ARROW;
 }
 
-// Switch to workspace `n`, giving it a shell on first visit.
+// Switch to workspace `n`. An empty one stays empty, like any desktop.
 static void switch_ws(int n) {
     if (n < 0 || n >= MAX_WS || n == cur_ws) return;
     ws_focused[cur_ws] = focused;
@@ -4275,7 +4283,7 @@ static void switch_ws(int n) {
     int top = topmost_window(cur_ws);
     if (top < 0) {
         focused = -1;
-        new_window();                 // empty workspace: open one
+        relayout();
     } else {
         int want = ws_focused[n];
         focused = (want >= 0 && nodes[want].used && nodes[want].ws == n) ? want : top;
@@ -4563,33 +4571,22 @@ void wm_notify_exit(int pid) {
         // Release any graphics surface the program held.
         if (panes[i].gfx) { kfree(panes[i].gfx); panes[i].gfx = 0; }
         panes[i].gfx_on = 0; panes[i].gfx_w = panes[i].gfx_h = 0;
-        // A pane whose program died is useless; give it a fresh shell rather
-        // than leaving a dead rectangle on screen.
-        if (panes[i].app_pane) {
-            panes[i].app_pane = 0;
-            int win[MAX_NODES];
-            int nwin = collect_windows(cur_ws, win, MAX_NODES);
-            for (int k = 0; k < MAX_NODES; k++) {
-                if (!nodes[k].used || nodes[k].pane_idx != i) continue;
-                if (nwin > 1) {                 // never leave the desktop bare
-                    if (nodes[k].ws == cur_ws && nodes[k].state != WIN_MIN)
-                        anim_vanish(AN_CLOSE, k);
-                    panes[i].alive = 0;
-                    free_node(k);
-                    if (focused == k) focused = topmost_window(cur_ws);
-                    relayout();
-                } else {
-                    pane_clear(&panes[i]);
-                    spawn_shell_in(i);
-                }
-                break;
-            }
-            wp_dirty = 1;
-            dirty = 1;
-            continue;
+        // The program the window was for has ended -- a program that
+        // exited, a shell somebody typed `exit` in -- so the window goes too.
+        // The desktop may be left with no window at all: that is a desktop,
+        // not an error, and the menu opens the next thing.
+        panes[i].app_pane = 0;
+        for (int k = 0; k < MAX_NODES; k++) {
+            if (!nodes[k].used || nodes[k].pane_idx != i) continue;
+            if (nodes[k].ws == cur_ws && nodes[k].state != WIN_MIN)
+                anim_vanish(AN_CLOSE, k);
+            free_node(k);
+            if (focused == k) focused = topmost_window(cur_ws);
+            relayout();
+            break;
         }
-        pane_clear(&panes[i]);
-        spawn_shell_in(i);
+        panes[i].alive = 0;
+        wp_dirty = 1;
         dirty = 1;
     }
 }
@@ -5314,6 +5311,8 @@ static void do_binding(int b) {
 static volatile int screen_asleep = 0;
 
 void wm_set_asleep(int on) { screen_asleep = on; }
+
+int wm_running(void) { return started; }
 
 void wm_poll(void) {
     if (screen_asleep) return;

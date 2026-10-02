@@ -1078,7 +1078,11 @@ static void cpu_loop(void) {
             if (!bsp) smp_set_busy(1);
             resume_process(next);           // never returns
         }
-        if (bsp && !any_alive()) return;
+        // With nothing alive the boot core used to give up here -- which,
+        // with the desktop up, froze it the moment the last window closed.
+        // The desktop is something to run in its own right: while the window
+        // manager is up, keep going, and let a tick or a key wake it.
+        if (bsp && !any_alive() && !wm_running()) return;
 
         // Nothing to run. Before sleeping, out of the last process's page
         // tables: it may exit on another core while this one sleeps, and its
