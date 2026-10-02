@@ -240,6 +240,14 @@ void lapic_send_sipi(uint8_t apic_id, uint8_t vector) {
     icr_wait();
 }
 
+// Fixed IPI to one core, by its APIC id.
+void lapic_send_ipi(uint8_t apic_id, uint8_t vector) {
+    if (!active) return;
+    lapic_write(LAPIC_ICR_HIGH, (uint32_t)apic_id << 24);
+    lapic_write(LAPIC_ICR_LOW, 0x00004000 | vector);  // fixed | assert | vector
+    icr_wait();
+}
+
 // Fixed IPI to every other core (dest shorthand "all excluding self"). Used to
 // wake the application processors out of their idle hlt.
 void lapic_broadcast_ipi(uint8_t vector) {

@@ -1107,9 +1107,10 @@ static void cpu_loop(void) {
 
         // Let go of the kernel and sleep until an interrupt -- a key, a
         // tick, a wake-up -- gives a reason to look again.
-        if (bsp) g_cpu_idle = 1; else smp_set_busy(0);
+        if (bsp) g_cpu_idle = 1; else { smp_set_busy(0); smp_set_halted(1); }
         bkl_exit();
         __asm__ volatile ("sti; hlt; cli");
+        if (!bsp) smp_set_halted(0);
 
         // Back for the lock. An idle application processor is also the
         // compute pool, and shares need no lock -- so it keeps looking for

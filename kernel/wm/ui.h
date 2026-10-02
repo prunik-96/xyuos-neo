@@ -16,6 +16,15 @@
 /* --- colour ---------------------------------------------------------------- */
 
 /* a and b mixed, t of b in 256ths. */
+// Work spread over the cores: fn(y0, y1, share, ctx) for bands of the rows
+// y0..y1, each band on whichever core is free (share says which one, for a
+// scratch buffer of its own). Small jobs, under ~20000 pixels by px_per_row,
+// are simply done here. A band must touch nothing but its own rows: no
+// allocating, no reporting to the screen, no calling ui_bands again.
+typedef void (*ui_band_fn)(int y0, int y1, int share, void *ctx);
+void ui_bands(ui_band_fn fn, void *ctx, int y0, int y1, int px_per_row);
+int  ui_band_count(void);        // how many shares there can be at most
+
 static inline uint32_t ui_mix(uint32_t a, uint32_t b, int t) {
     uint32_t u = (uint32_t)t, v = 256 - u;
     uint32_t rb = (((a & 0xFF00FF) * v + (b & 0xFF00FF) * u) >> 8) & 0xFF00FF;

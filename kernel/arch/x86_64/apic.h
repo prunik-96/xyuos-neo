@@ -33,5 +33,6 @@ uint32_t apic_bsp_id(void);
 void lapic_send_init(uint8_t apic_id);
 void lapic_send_sipi(uint8_t apic_id, uint8_t vector);
 void lapic_broadcast_ipi(uint8_t vector);
+void lapic_send_ipi(uint8_t apic_id, uint8_t vector);   // to one core
 
 #endif

@@ -538,6 +538,64 @@ static void raise_window(int n) {
 
 // --- rendering ---
 
+// --- moving pixels, on every core ------------------------------------------------
+//
+// Copying and mixing blocks of pixels is most of what is left once the
+// drawing is spread over the cores (ui.c): the wallpaper put back, a floating
+// thing's keeper, an animation's pictures. Each is rows of their own, and
+// ui_bands hands them out the same way. Strides are in pixels.
+struct px_ctx { uint32_t *dst; const uint32_t *src; int ds, ss, w, a; };
+
+static void px_copy_band(int y0, int y1, int share, void *cv) {
+    (void)share;
+    const struct px_ctx *c = (const struct px_ctx *)cv;
+    for (int j = y0; j < y1; j++) {
+        uint32_t *d = c->dst + (size_t)j * c->ds;
+        const uint32_t *src = c->src + (size_t)j * c->ss;
+        int i = 0, w = c->w;
+        // Two pixels a store where both sides allow it: the compiler will
+        // not widen a 32-bit copy by itself without SSE.
+        if (!(((uintptr_t)d ^ (uintptr_t)src) & 7)) {
+            if (((uintptr_t)d & 7) && w) { d[0] = src[0]; i = 1; }
+            uint64_t *d8 = (uint64_t *)(d + i);
+            const uint64_t *s8 = (const uint64_t *)(src + i);
+            int pairs = (w - i) / 2;
+            for (int k = 0; k < pairs; k++) d8[k] = s8[k];
+            i += pairs * 2;
+        }
+        for (; i < w; i++) d[i] = src[i];
+    }
+}
+
+// dst = src mixed toward dst by a (256 = all dst).
+static void px_mix_band(int y0, int y1, int share, void *cv) {
+    (void)share;
+    const struct px_ctx *c = (const struct px_ctx *)cv;
+    for (int j = y0; j < y1; j++) {
+        uint32_t *d = c->dst + (size_t)j * c->ds;
+        const uint32_t *src = c->src + (size_t)j * c->ss;
+        for (int i = 0; i < c->w; i++) d[i] = ui_mix(src[i], d[i], c->a);
+    }
+}
+
+static void px_copy(uint32_t *dst, int ds, const uint32_t *src, int ss, int w, int h) {
+    if (w <= 0 || h <= 0) return;
+    struct px_ctx c = { dst, src, ds, ss, w, 0 };
+    ui_bands(px_copy_band, &c, 0, h, w);
+}
+
+static void px_mix(uint32_t *dst, int ds, const uint32_t *src, int ss, int w, int h, int a) {
+    if (w <= 0 || h <= 0) return;
+    struct px_ctx c = { dst, src, ds, ss, w, a };
+    ui_bands(px_mix_band, &c, 0, h, w * 3);
+}
+
+// The back buffer's pixel at (x, y), and its stride in pixels.
+static uint32_t *bb_at(int x, int y) {
+    return (uint32_t *)(fb_get_base() + (size_t)y * fb_get_pitch()) + x;
+}
+static int bb_stride(void) { return (int)(fb_get_pitch() / 4); }
+
 // Nearest-neighbour blit of an ARGB source (sw x sh) into the framebuffer
 // rectangle (dx,dy,dw,dh). Used for graphics-mode panes (DOOM).
 static void blit_scaled(uint32_t dx, uint32_t dy, uint32_t dw, uint32_t dh,
@@ -552,6 +610,10 @@ static void blit_scaled(uint32_t dx, uint32_t dy, uint32_t dw, uint32_t dh,
     // one-to-one -- worth its own loop, because the general path pays a
     // multiply and a divide for every pixel just to compute an index that
     // turns out to be the one next door.
+    if (sw == dw && sh == dh && dx + dw <= fbw && dy + dh <= fbh) {
+        px_copy(bb_at((int)dx, (int)dy), bb_stride(), src, (int)sw, (int)dw, (int)dh);
+        return;
+    }
     if (sw == dw && sh == dh) {
         for (uint32_t j = 0; j < dh; j++) {
             uint32_t py = dy + j;
@@ -638,14 +700,7 @@ static void restore_wall(int x, int y, int w, int h) {
         fb_fill_rect((uint32_t)x, (uint32_t)y, (uint32_t)w, (uint32_t)h, COLOR_DESKTOP);
         return;
     }
-    volatile uint8_t *base = fb_get_base();
-    uint32_t pitch = fb_get_pitch();
-    const uint32_t *src = wallpaper;
-    for (int j = 0; j < h; j++) {
-        uint32_t *d = (uint32_t *)(base + (size_t)(y + j) * pitch) + x;
-        const uint32_t *s = src + (size_t)(y + j) * wp_w + x;
-        for (int i = 0; i < w; i++) d[i] = s[i];
-    }
+    px_copy(bb_at(x, y), bb_stride(), wallpaper + (size_t)y * wp_w + x, (int)wp_w, w, h);
     fb_mark_rect((uint32_t)x, (uint32_t)y, (uint32_t)w, (uint32_t)h);
 }
 
@@ -1074,6 +1129,7 @@ static void wglyph(int g, int x, int y, int s, uint32_t c) {
 
 // Each window's glass, with its memory of what lies under it.
 static ui_glass wglass[MAX_NODES];
+uint64_t pf_sh, pf_tk, pf_gl, pf_ch;     // a window's parts: shadow, glass memory, glass, frame
 
 // Bring a hidden tab to the front of its frame, in the place of the one there.
 static void tab_show(int n) {
@@ -1194,7 +1250,10 @@ static void paint_chrome(int n, int focus) {
     int maxed = nd->state == WIN_MAX;
     int R = maxed ? 0 : RAD_T;
 
+    uint64_t g0 = rdtsc();
     window_glass(n, focus);
+    uint64_t g1 = rdtsc();
+    pf_gl += g1 - g0;
 
     // Light on the glass: a sheen down the strip, a fine bright edge round
     // the whole window and a faint dark one just outside it, so a pale window
@@ -1429,24 +1488,12 @@ static void see_take(int x, int y, int w, int h) {
         see_cap = see_buf ? w * h : 0;
     }
     if (!see_buf) return;
-    volatile uint8_t *base = fb_get_base();
-    uint32_t pitch = fb_get_pitch();
-    for (int j = 0; j < h; j++) {
-        const uint32_t *s2 = (const uint32_t *)(base + (size_t)(y + j) * pitch) + x;
-        uint32_t *d = see_buf + (size_t)j * w;
-        for (int i = 0; i < w; i++) d[i] = s2[i];
-    }
+    px_copy(see_buf, w, bb_at(x, y), bb_stride(), w, h);
 }
 
 static void see_mix(int x, int y, int w, int h, int a) {
     if (!see_buf || w * h > see_cap) return;
-    volatile uint8_t *base = fb_get_base();
-    uint32_t pitch = fb_get_pitch();
-    for (int j = 0; j < h; j++) {
-        uint32_t *d = (uint32_t *)(base + (size_t)(y + j) * pitch) + x;
-        const uint32_t *u = see_buf + (size_t)j * w;
-        for (int i = 0; i < w; i++) d[i] = ui_mix(u[i], d[i], a);
-    }
+    px_mix(bb_at(x, y), bb_stride(), see_buf, w, w, h, a);
     fb_mark_rect((uint32_t)x, (uint32_t)y, (uint32_t)w, (uint32_t)h);
 }
 
@@ -1468,12 +1515,14 @@ static void paint_window(int n) {
     // The shadow first, under everything of the window's own; then what the
     // program shows; then the glass round it, whose rounded inner edge lies
     // over the corners of the picture. A window seen through casts less.
+    uint64_t s0 = rdtsc();
     if (nd->state != WIN_MAX) {
         ui_shadow((int)nd->x, (int)nd->y, (int)nd->w, (int)nd->h, RAD_T, SHADOW,
                   (focus ? 66 : 42) * alpha / 255, SHADOW_DY, 0);
         ui_shadow((int)nd->x, (int)nd->y, (int)nd->w, (int)nd->h, RAD_T, 4,
                   (focus ? 34 : 24) * alpha / 255, 1, 0);
     }
+    pf_sh += rdtsc() - s0;
     int bx, by, bw, bh;
     client_rect(n, &bx, &by, &bw, &bh);
     if (!p->gfx_on) ui_fill(bx, by, bw, bh, TH->content_bg);
@@ -1482,7 +1531,9 @@ static void paint_window(int n) {
     uint64_t c0 = rdtsc();
     draw_content(n, cx, cy, cw, ch, focus);
     pf_content += rdtsc() - c0;
+    uint64_t c1 = rdtsc(), g_before = pf_gl;
     paint_chrome(n, focus);
+    pf_ch += rdtsc() - c1 - (pf_gl - g_before);
     if (alpha < 255) see_mix(sx0, sy0, sw0, sh0, alpha);
     pf_paint += rdtsc() - p0;
     pf_painted++;
@@ -1555,8 +1606,10 @@ static void render_windows(void) {
     for (int k = L; k < nv; k++) {
         int m = vis[k];
         const struct wm_node *nd = &nodes[m];
+        uint64_t k0 = rdtsc();
         ui_glass_place(&wglass[m], (int)nd->x, (int)nd->y, (int)nd->w, (int)nd->h, 16);
         glass_catch_up(&wglass[m]);
+        pf_tk += rdtsc() - k0;
         paint_window(m);
         dmg_add(ext[k][0], ext[k][1], ext[k][2], ext[k][3]);
     }
@@ -2026,6 +2079,18 @@ static int      tb_valid = 0;
 // is drawn again.
 typedef struct { int x, y, w, h, cap, have; uint32_t *px; } ukeep;
 
+// Whether placing k at (x, y, w, h) would leave it where it is.
+static int uk_same(const ukeep *k, int x, int y, int w, int h) {
+    int W = (int)fb_get_width(), H = (int)fb_get_height();
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x + w > W) w = W - x;
+    if (y + h > H) h = H - y;
+    if (w < 0) w = 0;
+    if (h < 0) h = 0;
+    return k->x == x && k->y == y && k->w == w && k->h == h;
+}
+
 static void uk_place(ukeep *k, int x, int y, int w, int h) {
     int W = (int)fb_get_width(), H = (int)fb_get_height();
     if (x < 0) { w += x; x = 0; }
@@ -2049,13 +2114,9 @@ static void uk_copy_in(ukeep *k, int x0, int y0, int x1, int y1) {
     if (y0 < k->y) y0 = k->y;
     if (x1 > k->x + k->w) x1 = k->x + k->w;
     if (y1 > k->y + k->h) y1 = k->y + k->h;
-    volatile uint8_t *base = fb_get_base();
-    uint32_t pitch = fb_get_pitch();
-    for (int y = y0; y < y1; y++) {
-        const uint32_t *s = (const uint32_t *)(base + (size_t)y * pitch);
-        uint32_t *d = k->px + (size_t)(y - k->y) * k->w - k->x;
-        for (int x = x0; x < x1; x++) d[x] = s[x];
-    }
+    if (x1 <= x0 || y1 <= y0) return;
+    px_copy(k->px + (size_t)(y0 - k->y) * k->w + (x0 - k->x), k->w, bb_at(x0, y0), bb_stride(),
+            x1 - x0, y1 - y0);
 }
 
 // Take in what is under, wherever this frame painted it.
@@ -2073,25 +2134,13 @@ static void uk_take(ukeep *k) {
 // all the new picture, 0 none of it.
 static void uk_fade(ukeep *k, int a) {
     if (!k->cap || !k->have || a >= 256) return;
-    volatile uint8_t *base = fb_get_base();
-    uint32_t pitch = fb_get_pitch();
-    for (int y = 0; y < k->h; y++) {
-        uint32_t *d = (uint32_t *)(base + (size_t)(k->y + y) * pitch) + k->x;
-        const uint32_t *s2 = k->px + (size_t)y * k->w;
-        for (int x = 0; x < k->w; x++) d[x] = ui_mix(s2[x], d[x], a);
-    }
+    px_mix(bb_at(k->x, k->y), bb_stride(), k->px, k->w, k->w, k->h, a);
     fb_mark_rect((uint32_t)k->x, (uint32_t)k->y, (uint32_t)k->w, (uint32_t)k->h);
 }
 
 static void uk_restore(ukeep *k) {
     if (!k->cap || !k->have) return;
-    volatile uint8_t *base = fb_get_base();
-    uint32_t pitch = fb_get_pitch();
-    for (int y = 0; y < k->h; y++) {
-        uint32_t *d = (uint32_t *)(base + (size_t)(k->y + y) * pitch) + k->x;
-        const uint32_t *s = k->px + (size_t)y * k->w;
-        for (int x = 0; x < k->w; x++) d[x] = s[x];
-    }
+    px_copy(bb_at(k->x, k->y), bb_stride(), k->px, k->w, k->w, k->h);
     fb_mark_rect((uint32_t)k->x, (uint32_t)k->y, (uint32_t)k->w, (uint32_t)k->h);
 }
 
@@ -2282,6 +2331,14 @@ static int draw_taskbar(void) {
     tb_fp = fp;
     tb_valid = 1;
 
+    // Grown or shrunk -- a program came or went, a terminal is running
+    // something under another name -- or moved: what was under the old one
+    // goes back first, or its ends stay on the screen.
+    if (isl_keep.have && !uk_same(&isl_keep, rx, ry, rw, rh)) {
+        uk_take(&isl_keep);
+        uk_restore(&isl_keep);
+        dmg_add(isl_keep.x, isl_keep.y, isl_keep.x + isl_keep.w, isl_keep.y + isl_keep.h);
+    }
     uk_place(&isl_keep, rx, ry, rw, rh);
     uk_take(&isl_keep);
     uk_restore(&isl_keep);
@@ -4446,12 +4503,7 @@ static int anim_buffers(int w, int h) {
 }
 
 static void grab(uint32_t *dst) {
-    volatile uint8_t *base = fb_get_base();
-    uint32_t pitch = fb_get_pitch();
-    for (int j = 0; j < anim.h; j++) {
-        const uint32_t *s = (const uint32_t *)(base + (size_t)(anim.y + j) * pitch) + anim.x;
-        for (int i = 0; i < anim.w; i++) dst[j * anim.w + i] = s[i];
-    }
+    px_copy(dst, anim.w, bb_at(anim.x, anim.y), bb_stride(), anim.w, anim.h);
 }
 
 // Where window n's button on the taskbar is, for minimising into it.
@@ -4534,6 +4586,34 @@ static void anim_vanish(int kind, int n) {
     dirty = 1;
 }
 
+// The parts of a frame of it that every row needs, for the bands.
+struct anim_ctx { int64_t inv, fx0; int wcy, cy, alpha; };
+
+static void anim_band(int j0, int j1, int share, void *cv) {
+    (void)share;
+    const struct anim_ctx *c = (const struct anim_ctx *)cv;
+    for (int j = j0; j < j1; j++) {
+        uint32_t *d = bb_at(anim.x, anim.y + j);
+        const uint32_t *ra = anim.a + j * anim.w;
+        int sy = c->wcy + (int)(((int64_t)(j - c->cy) * c->inv) >> 16);
+        if (c->alpha <= 0 || sy < 0 || sy >= anim.h) {
+            // A row the window does not reach: the picture without it.
+            for (int i = 0; i < anim.w; i++) d[i] = ra[i];
+            continue;
+        }
+        const uint32_t *sa = anim.a + sy * anim.w;
+        const uint32_t *sb = anim.b + sy * anim.w;
+        int64_t fx = c->fx0;
+        for (int i = 0; i < anim.w; i++, fx += c->inv) {
+            int sx = (int)(fx >> 16);
+            uint32_t out = ra[i];
+            if ((unsigned)sx < (unsigned)anim.w && sb[sx] != sa[sx])
+                out = c->alpha >= 256 ? sb[sx] : ui_mix(out, sb[sx], c->alpha);
+            d[i] = out;
+        }
+    }
+}
+
 // One frame of it, over what render_all() has just drawn.
 static void anim_frame(void) {
     if (!anim.active) return;
@@ -4566,28 +4646,8 @@ static void anim_frame(void) {
     // The source column for the first one, in 16.16; each next is `inv` on.
     int64_t fx0 = ((int64_t)wcx << 16) - (int64_t)cx * inv;
 
-    volatile uint8_t *base = fb_get_base();
-    uint32_t pitch = fb_get_pitch();
-    for (int j = 0; j < anim.h; j++) {
-        uint32_t *d = (uint32_t *)(base + (size_t)(anim.y + j) * pitch) + anim.x;
-        const uint32_t *ra = anim.a + j * anim.w;
-        int sy = wcy + (int)(((int64_t)(j - cy) * inv) >> 16);
-        if (alpha <= 0 || sy < 0 || sy >= anim.h) {
-            // A row the window does not reach: the picture without it.
-            for (int i = 0; i < anim.w; i++) d[i] = ra[i];
-            continue;
-        }
-        const uint32_t *sa = anim.a + sy * anim.w;
-        const uint32_t *sb = anim.b + sy * anim.w;
-        int64_t fx = fx0;
-        for (int i = 0; i < anim.w; i++, fx += inv) {
-            int sx = (int)(fx >> 16);
-            uint32_t out = ra[i];
-            if ((unsigned)sx < (unsigned)anim.w && sb[sx] != sa[sx])
-                out = alpha >= 256 ? sb[sx] : ui_mix(out, sb[sx], alpha);
-            d[i] = out;
-        }
-    }
+    struct anim_ctx ac = { inv, fx0, wcy, cy, alpha };
+    ui_bands(anim_band, &ac, 0, anim.h, anim.w * 2);
     fb_mark_rect((uint32_t)anim.x, (uint32_t)anim.y, (uint32_t)anim.w, (uint32_t)anim.h);
     if (t >= 256) anim_stop();
 }
@@ -4768,6 +4828,10 @@ static void pf_report(void) {
                 (unsigned)(pf_fp / pf_frames / 1000),
                 (unsigned)(pf_paint / pf_frames / 1000),
                 (unsigned)(pf_content / pf_frames / 1000));
+        kprintf("gfx: window parts kcyc shadow=%u glass-memory=%u glass=%u frame=%u\n",
+                (unsigned)(pf_sh / pf_frames / 1000), (unsigned)(pf_tk / pf_frames / 1000),
+                (unsigned)(pf_gl / pf_frames / 1000), (unsigned)(pf_ch / pf_frames / 1000));
+        pf_sh = pf_tk = pf_gl = pf_ch = 0;
         if (pf_blits)
             kprintf("gfx: app blits=%u avg %u kcyc\n",
                     (unsigned)pf_blits, (unsigned)(pf_blit / pf_blits / 1000));
@@ -6404,7 +6468,10 @@ static void bench_phase(const char *name, int mode, unsigned ticks) {
 }
 
 static void wm_benchmark(void) {
-    kprintf("fps: measuring frames DELIVERED, one second per phase\n");
+    // The timer has to keep ticking for any of this to be measured, and the
+    // scheduler loop that runs the desktop does so with interrupts off.
+    __asm__ volatile ("sti");
+    kprintf("fps: measuring frames DELIVERED, one second per phase (%d cores)\n", smp_cpu_count());
     bench_phase("full desktop", 0, 100);
     bench_phase("window drag", 1, 100);
 
@@ -6423,6 +6490,7 @@ static void wm_benchmark(void) {
     wp_dirty = 1;
     dirty = 1;
     kprintf("fps: done\n");
+    __asm__ volatile ("cli");
 }
 
 void wm_route_input(void) {

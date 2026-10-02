@@ -90,6 +90,11 @@ void smp_run(void (*fn)(int share, int nshares, void *arg), void *arg);
 // from the idle loop, without the kernel lock, with interrupts off.
 void smp_idle_work(void);
 
+// An application processor about to sleep in hlt (1) and awake again (0).
+// smp_run wakes only the sleeping ones: a core waiting for the kernel lock
+// looks for shares anyway, and one running a program is better left alone.
+void smp_set_halted(int halted);
+
 // Start the application processors on processes. Called once, by the
 // bootstrap core, when its own scheduler starts.
 void smp_start_scheduling(void);

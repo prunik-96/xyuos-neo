@@ -124,6 +124,13 @@ void smp_tlb_shootdown(void) {
 // and the caller would wait for the share. With claiming, a busy core simply
 // never takes one, and the caller does whatever nobody else picked up. The
 // worst case is the caller doing all of it: slow, and correct.
+static volatile uint8_t core_halted[MAX_CPUS];   // asleep in hlt: needs waking
+
+void smp_set_halted(int halted) {
+    int i = (int)this_cpu()->cpu_index;
+    if (i > 0 && i < MAX_CPUS) __atomic_store_n(&core_halted[i], (uint8_t)(halted ? 1 : 0), __ATOMIC_SEQ_CST);
+}
+
 static void (* volatile job_fn)(int share, int nshares, void *arg);
 static void * volatile job_arg;
 static volatile int job_n;         // shares in this job
@@ -153,7 +160,12 @@ void smp_run(void (*fn)(int, int, void *), void *arg) {
     job_done = 0;
     __atomic_store_n(&job_next, 0, __ATOMIC_SEQ_CST);
     __atomic_store_n(&job_active, 1, __ATOMIC_SEQ_CST);
-    lapic_broadcast_ipi(SMP_WAKE_VECTOR);   // idle cores out of hlt
+    // Out of hlt, the cores asleep there -- and only those. One waiting for
+    // the kernel lock is already looking; one running a program would only
+    // be interrupted for nothing, many times a frame.
+    for (int i = 1; i < ncpu; i++)
+        if (__atomic_load_n(&core_halted[i], __ATOMIC_SEQ_CST))
+            lapic_send_ipi((uint8_t)cpus[i].apic_id, SMP_WAKE_VECTOR);
     run_shares();                           // the caller takes shares too
     while (__atomic_load_n(&job_done, __ATOMIC_ACQUIRE) < job_n)
         __asm__ volatile ("pause");         // the ones others claimed
@@ -224,7 +236,9 @@ void ap_entry(void) {
         __asm__ volatile ("cli");
         smp_idle_work();
         if (scheduling) break;
+        smp_set_halted(1);
         __asm__ volatile ("sti; hlt");
+        smp_set_halted(0);
     }
     process_ap_run();
 }

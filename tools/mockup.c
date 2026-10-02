@@ -61,6 +61,9 @@ int vfs_open(const char *path) {
 int32_t vfs_read(int fd, void *buf, uint32_t len) { return (int32_t)fread(buf, 1, len, files[fd]); }
 void vfs_close(int fd) { fclose(files[fd]); files[fd] = 0; }
 
+// On the host there is one core, and the pool just runs the job here.
+int  smp_cpu_count(void) { return 1; }
+void smp_run(void (*fn)(int, int, void *), void *arg) { fn(0, 1, arg); }
 #include "../kernel/wm/ui.c"
 #include "../kernel/wm/wall.c"
 #include "../kernel/gfx/uifont.c"

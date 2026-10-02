@@ -27,6 +27,9 @@ void fb_mark_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
 }
 const uint32_t *icon_get(const char *name, int size) { (void)name; (void)size; return 0; }
 
+// On the host there is one core, and the pool just runs the job here.
+int  smp_cpu_count(void) { return 1; }
+void smp_run(void (*fn)(int, int, void *), void *arg) { fn(0, 1, arg); }
 #include "../kernel/wm/ui.c"
 #include "../kernel/wm/wall.c"
 

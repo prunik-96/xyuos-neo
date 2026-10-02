@@ -4,6 +4,7 @@
 #include "../drivers/framebuffer.h"
 #include "../gfx/icons.h"
 #include "../mm/heap.h"
+#include "../arch/x86_64/smp.h"
 
 static int cx0, cy0, cx1, cy1, clip_ok;
 
@@ -22,6 +23,44 @@ void ui_target(uint32_t *px, int w, int h) {
 void ui_target_screen(void) {
     tg_px = 0;
     ui_noclip();
+}
+
+// --- many cores ----------------------------------------------------------------------
+//
+// Almost everything here walks rows, and every row is its own business. A big
+// enough piece of work is cut into bands of rows and every idle core takes one
+// (smp_run); a small one is simply done, since waking the other cores costs
+// more than a few thousand pixels. A band never reports to the screen and
+// never allocates: the caller does both, before and after.
+#define PAR_MIN_PX 20000
+
+struct band_job { ui_band_fn fn; void *ctx; int y0, y1; };
+static volatile int bands_busy;      // a job is out: anything inside it runs inline
+
+static void band_share(int share, int n, void *arg) {
+    const struct band_job *j = (const struct band_job *)arg;
+    int rows = j->y1 - j->y0;
+    int a = j->y0 + (int)((int64_t)rows * share / n);
+    int b = j->y0 + (int)((int64_t)rows * (share + 1) / n);
+    if (b > a) j->fn(a, b, share, j->ctx);
+}
+
+void ui_bands(ui_band_fn fn, void *ctx, int y0, int y1, int px_per_row) {
+    if (y1 <= y0) return;
+    if (bands_busy || smp_cpu_count() <= 1 ||
+        (int64_t)(y1 - y0) * px_per_row < PAR_MIN_PX) {
+        fn(y0, y1, 0, ctx);
+        return;
+    }
+    struct band_job j = { fn, ctx, y0, y1 };
+    bands_busy = 1;
+    smp_run(band_share, &j);
+    bands_busy = 0;
+}
+
+int ui_band_count(void) {
+    int n = smp_cpu_count();
+    return n < 1 ? 1 : n;
 }
 
 // Only what lands on the screen has to be reported to it.
@@ -80,12 +119,22 @@ static inline uint32_t over(uint32_t dst, uint32_t src, uint32_t a) {
     return ui_mix(dst, src, (int)(a + (a >> 7)));
 }
 
+struct fill_ctx { int x, w, t; uint32_t rgb; };
+
+static void fill_band(int y0, int y1, int share, void *cv) {
+    (void)share;
+    const struct fill_ctx *c = (const struct fill_ctx *)cv;
+    for (int y = y0; y < y1; y++) {
+        uint32_t *d = row_at(y) + c->x;
+        if (c->t < 0) for (int i = 0; i < c->w; i++) d[i] = c->rgb;
+        else          for (int i = 0; i < c->w; i++) d[i] = ui_mix(d[i], c->rgb, c->t);
+    }
+}
+
 void ui_fill(int x, int y, int w, int h, uint32_t rgb) {
     if (!cut(&x, &y, &w, &h)) return;
-    for (int j = 0; j < h; j++) {
-        uint32_t *d = row_at(y + j) + x;
-        for (int i = 0; i < w; i++) d[i] = rgb;
-    }
+    struct fill_ctx c = { x, w, -1, rgb };
+    ui_bands(fill_band, &c, y, y + h, w);
     mark(x, y, w, h);
 }
 
@@ -93,11 +142,8 @@ void ui_blend(int x, int y, int w, int h, uint32_t rgb, int alpha) {
     if (alpha <= 0) return;
     if (alpha >= 255) { ui_fill(x, y, w, h, rgb); return; }
     if (!cut(&x, &y, &w, &h)) return;
-    int t = alpha + (alpha >> 7);
-    for (int j = 0; j < h; j++) {
-        uint32_t *d = row_at(y + j) + x;
-        for (int i = 0; i < w; i++) d[i] = ui_mix(d[i], rgb, t);
-    }
+    struct fill_ctx c = { x, w, alpha + (alpha >> 7), rgb };
+    ui_bands(fill_band, &c, y, y + h, w);
     mark(x, y, w, h);
 }
 
@@ -198,56 +244,69 @@ void ui_set_backdrop(const uint32_t *px, int w, int h) {
 
 // --- rounded rectangles ----------------------------------------------------------
 
-static void rr_fill(int x, int y, int w, int h, int rt, int rb, int corners,
-                    const ui_mat *m) {
-    if (w <= 0 || h <= 0) return;
+struct rr_ctx {
     shape s;
-    shape_init(&s, w, h, rt, rb, corners);
-    int vx = x, vy = y, vw = w, vh = h;
-    if (!cut(&vx, &vy, &vw, &vh)) return;
+    const ui_mat *m;
+    int x, y, w, vx, vw, gy0, gspan;
+};
 
-    int gy0 = m->gy0, gy1 = m->gy1;
-    if (gy0 == 0 && gy1 == 0) { gy0 = y; gy1 = y + h; }
-    int gspan = gy1 - gy0 > 0 ? gy1 - gy0 : 1;
-
-    for (int py = vy; py < vy + vh; py++) {
+static void rr_band(int y0, int y1, int share, void *cv) {
+    (void)share;
+    const struct rr_ctx *c = (const struct rr_ctx *)cv;
+    const ui_mat *m = c->m;
+    int x = c->x, y = c->y, w = c->w;
+    for (int py = y0; py < y1; py++) {
         int j = py - y;
         uint32_t col = m->c0;
         int a = m->a0;
         if (m->kind == UI_GRAD) {
-            int k = (py - gy0) * 256 / gspan;
+            int k = (py - c->gy0) * 256 / c->gspan;
             if (k < 0) k = 0;
             if (k > 256) k = 256;
             col = ui_mix(m->c0, m->c1, k);
             a = m->a0 + (m->a1 - m->a0) * k / 256;
             if (a <= 0) continue;
         }
-        int band = shape_band(&s, j);
+        int band = shape_band(&c->s, j);
         uint32_t *d = row_at(py);
         const uint32_t *b = 0;
         if (m->kind == UI_GLASS && bd && py < bd_h) b = bd + (uint64_t)py * bd_w;
         int tint = m->a0 + (m->a0 >> 7);
-        for (int px = vx; px < vx + vw; px++) {
+        for (int px = c->vx; px < c->vx + c->vw; px++) {
             int i = px - x;
-            int cv = 255;
+            int cvg = 255;
             if (band && (i < band || i >= w - band)) {
-                cv = shape_cov(&s, i, j);
-                if (!cv) continue;
+                cvg = shape_cov(&c->s, i, j);
+                if (!cvg) continue;
             }
-            uint32_t c;
+            uint32_t col2;
             int aa;
             if (m->kind == UI_GLASS) {
                 uint32_t under = (b && px < bd_w) ? b[px] : m->c0;
-                c = ui_mix(under, m->c0, tint);
-                aa = cv;
+                col2 = ui_mix(under, m->c0, tint);
+                aa = cvg;
             } else {
-                c = col;
-                aa = a * cv / 255;
+                col2 = col;
+                aa = a * cvg / 255;
             }
             if (aa <= 0) continue;
-            d[px] = over(d[px], c, (uint32_t)aa);
+            d[px] = over(d[px], col2, (uint32_t)aa);
         }
     }
+}
+
+static void rr_fill(int x, int y, int w, int h, int rt, int rb, int corners,
+                    const ui_mat *m) {
+    if (w <= 0 || h <= 0) return;
+    struct rr_ctx c;
+    shape_init(&c.s, w, h, rt, rb, corners);
+    int vx = x, vy = y, vw = w, vh = h;
+    if (!cut(&vx, &vy, &vw, &vh)) return;
+    int gy0 = m->gy0, gy1 = m->gy1;
+    if (gy0 == 0 && gy1 == 0) { gy0 = y; gy1 = y + h; }
+    c.m = m; c.x = x; c.y = y; c.w = w; c.vx = vx; c.vw = vw;
+    c.gy0 = gy0; c.gspan = gy1 - gy0 > 0 ? gy1 - gy0 : 1;
+    ui_bands(rr_band, &c, vy, vy + vh, vw);
     mark(vx, vy, vw, vh);
 }
 
@@ -312,6 +371,52 @@ static inline uint32_t grain_at(int x, int y) {
     return (n >> 24) & 7;                      // 0..7
 }
 
+struct live_ctx {
+    shape s;
+    const uint32_t *tmp;
+    int x, y, w, sx, sy, sw, vx, vw, t;
+    uint32_t tint;
+};
+
+static void live_copy_band(int y0, int y1, int share, void *cv) {
+    (void)share;
+    const struct live_ctx *c = (const struct live_ctx *)cv;
+    uint32_t *tmp = (uint32_t *)c->tmp;
+    for (int j = y0; j < y1; j++) {
+        const uint32_t *src = row_at(c->sy + j) + c->sx;
+        for (int i = 0; i < c->sw; i++) tmp[j * c->sw + i] = src[i];
+    }
+}
+
+static void live_band(int y0, int y1, int share, void *cv) {
+    (void)share;
+    const struct live_ctx *c = (const struct live_ctx *)cv;
+    for (int py = y0; py < y1; py++) {
+        int j = py - c->y;
+        int band = shape_band(&c->s, j);
+        uint32_t *d = row_at(py);
+        const uint32_t *b = c->tmp + (py - c->sy) * c->sw;
+        for (int px = c->vx; px < c->vx + c->vw; px++) {
+            int i = px - c->x;
+            int cvg = 255;
+            if (band && (i < band || i >= c->w - band)) {
+                cvg = shape_cov(&c->s, i, j);
+                if (!cvg) continue;
+            }
+            uint32_t col = ui_mix(b[px - c->sx], c->tint, c->t);
+            // Grain: a few levels of noise, so the glass reads as a
+            // material and wide flat areas do not band.
+            uint32_t g = grain_at(px, py);
+            uint32_t rr = ((col >> 16) & 255) + g, gg = ((col >> 8) & 255) + g, bb = (col & 255) + g;
+            rr = rr > 258 ? 255 : (rr < 4 ? 0 : rr - 3);
+            gg = gg > 258 ? 255 : (gg < 4 ? 0 : gg - 3);
+            bb = bb > 258 ? 255 : (bb < 4 ? 0 : bb - 3);
+            col = (rr << 16) | (gg << 8) | bb;
+            d[px] = over(d[px], col, (uint32_t)cvg);
+        }
+    }
+}
+
 void ui_glass_live(int x, int y, int w, int h, int r, uint32_t tint, int tint_a, int blur) {
     if (w <= 0 || h <= 0) return;
     // Take a margin round the rectangle, so the blur at its edge sees what
@@ -326,41 +431,18 @@ void ui_glass_live(int x, int y, int w, int h, int r, uint32_t tint, int tint_a,
     if (sw <= 0 || sh <= 0) return;
     uint32_t *tmp = (uint32_t *)kmalloc((size_t)sw * sh * 4);
     if (!tmp) return;
-    for (int j = 0; j < sh; j++) {
-        const uint32_t *s = row_at(sy + j) + sx;
-        for (int i = 0; i < sw; i++) tmp[j * sw + i] = s[i];
-    }
+    struct live_ctx c;
+    c.tmp = tmp; c.sx = sx; c.sy = sy; c.sw = sw;
+    ui_bands(live_copy_band, &c, 0, sh, sw);
     if (blur > 0) ui_blur(tmp, sw, sh, blur);
 
-    shape s;
-    shape_init(&s, w, h, r, r, UI_ALL);
+    shape_init(&c.s, w, h, r, r, UI_ALL);
     int vx = x, vy = y, vw = w, vh = h;
     if (cut(&vx, &vy, &vw, &vh)) {
-        int t = tint_a + (tint_a >> 7);
-        for (int py = vy; py < vy + vh; py++) {
-            int j = py - y;
-            int band = shape_band(&s, j);
-            uint32_t *d = row_at(py);
-            const uint32_t *b = tmp + (py - sy) * sw;
-            for (int px = vx; px < vx + vw; px++) {
-                int i = px - x;
-                int cv = 255;
-                if (band && (i < band || i >= w - band)) {
-                    cv = shape_cov(&s, i, j);
-                    if (!cv) continue;
-                }
-                uint32_t c = ui_mix(b[px - sx], tint, t);
-                // Grain: a few levels of noise, so the glass reads as a
-                // material and wide flat areas do not band.
-                uint32_t g = grain_at(px, py);
-                uint32_t rr = ((c >> 16) & 255) + g, gg = ((c >> 8) & 255) + g, bb = (c & 255) + g;
-                rr = rr > 258 ? 255 : (rr < 4 ? 0 : rr - 3);
-                gg = gg > 258 ? 255 : (gg < 4 ? 0 : gg - 3);
-                bb = bb > 258 ? 255 : (bb < 4 ? 0 : bb - 3);
-                c = (rr << 16) | (gg << 8) | bb;
-                d[px] = over(d[px], c, (uint32_t)cv);
-            }
-        }
+        c.x = x; c.y = y; c.w = w; c.vx = vx; c.vw = vw;
+        c.t = tint_a + (tint_a >> 7);
+        c.tint = tint;
+        ui_bands(live_band, &c, vy, vy + vh, vw);
         mark(vx, vy, vw, vh);
     }
     kfree(tmp);
@@ -429,12 +511,21 @@ static uint32_t block_avg(const ui_glass *g, int bx, int by) {
     return ((r >> 4) << 16) | ((gg >> 4) << 8) | (b >> 4);
 }
 
+struct take_ctx { ui_glass *g; int bx0, bx1; };
+
+static void take_band(int by0, int by1, int share, void *cv) {
+    (void)share;
+    const struct take_ctx *c = (const struct take_ctx *)cv;
+    for (int by = by0; by < by1; by++)
+        for (int bx = c->bx0; bx < c->bx1; bx++)
+            c->g->small[by * c->g->sw + bx] = block_avg(c->g, bx, by);
+}
+
 void ui_glass_take(ui_glass *g, const int (*dmg)[4], int n) {
     if (!g->cap) return;
     if (!g->have) {
-        for (int by = 0; by < g->sh; by++)
-            for (int bx = 0; bx < g->sw; bx++)
-                g->small[by * g->sw + bx] = block_avg(g, bx, by);
+        struct take_ctx c = { g, 0, g->sw };
+        ui_bands(take_band, &c, 0, g->sh, g->sw * 16);
         g->have = 1;
         g->soft_ok = 0;
         return;
@@ -447,9 +538,8 @@ void ui_glass_take(ui_glass *g, const int (*dmg)[4], int n) {
         if (x1 <= x0 || y1 <= y0) continue;
         int bx0 = (x0 - g->ux) / 4, by0 = (y0 - g->uy) / 4;
         int bx1 = (x1 - g->ux + 3) / 4, by1 = (y1 - g->uy + 3) / 4;
-        for (int by = by0; by < by1; by++)
-            for (int bx = bx0; bx < bx1; bx++)
-                g->small[by * g->sw + bx] = block_avg(g, bx, by);
+        struct take_ctx c = { g, bx0, bx1 };
+        ui_bands(take_band, &c, by0, by1, (bx1 - bx0) * 16);
         g->soft_ok = 0;
     }
 }
@@ -478,24 +568,24 @@ static inline uint32_t glass_sample(const ui_glass *g, int px, int py) {
     return ui_mix(top, bot, ay);
 }
 
-void ui_glass_draw(ui_glass *g, int x, int y, int w, int h, int r,
-                   int bx, int by, int bw, int bh, int br, int bcorners,
-                   uint32_t tint, int tint_a) {
-    if (w <= 0 || h <= 0 || !g->cap || !g->have) return;
-    glass_soften(g);
+struct gd_ctx {
     shape so, si;
-    shape_init(&so, w, h, r, r, UI_ALL);
-    if (bw > 0 && bh > 0) shape_init(&si, bw, bh, br, br, bcorners);
-    int vx = x, vy = y, vw = w, vh = h;
-    if (!cut(&vx, &vy, &vw, &vh)) return;
-    int t = tint_a + (tint_a >> 7);
-    for (int py = vy; py < vy + vh; py++) {
+    const ui_glass *g;
+    int x, y, w, bx, by, bw, bh, vx, vw, t;
+    uint32_t tint;
+};
+
+static void gd_band(int y0, int y1, int share, void *cv) {
+    (void)share;
+    const struct gd_ctx *c = (const struct gd_ctx *)cv;
+    int x = c->x, y = c->y, w = c->w, bx = c->bx, by = c->by, bw = c->bw, bh = c->bh;
+    for (int py = y0; py < y1; py++) {
         int j = py - y;
-        int band = shape_band(&so, j);
+        int band = shape_band(&c->so, j);
         int in_body_rows = bw > 0 && py >= by && py < by + bh;
-        int ibandv = in_body_rows ? shape_band(&si, py - by) : 0;
+        int ibandv = in_body_rows ? shape_band(&c->si, py - by) : 0;
         uint32_t *d = row_at(py);
-        for (int px = vx; px < vx + vw; px++) {
+        for (int px = c->vx; px < c->vx + c->vw; px++) {
             int i = px - x;
             // The body's middle is not glass: skip across it. Only its
             // rounded corners share pixels with the frame.
@@ -503,24 +593,53 @@ void ui_glass_draw(ui_glass *g, int x, int y, int w, int h, int r,
                 px = bx + bw - ibandv - 1;
                 continue;
             }
-            int cv = 255;
+            int cvg = 255;
             if (band && (i < band || i >= w - band)) {
-                cv = shape_cov(&so, i, j);
-                if (!cv) continue;
+                cvg = shape_cov(&c->so, i, j);
+                if (!cvg) continue;
             }
             if (in_body_rows && px >= bx && px < bx + bw) {
-                int ci = shape_cov(&si, px - bx, py - by);
-                cv = cv - ci;
-                if (cv <= 0) continue;
+                int ci = shape_cov(&c->si, px - bx, py - by);
+                cvg = cvg - ci;
+                if (cvg <= 0) continue;
             }
-            uint32_t c = ui_mix(glass_sample(g, px, py), tint, t);
+            uint32_t col = ui_mix(glass_sample(c->g, px, py), c->tint, c->t);
             uint32_t gr = grain_at(px, py);
-            uint32_t rr = ((c >> 16) & 255) + gr, gg = ((c >> 8) & 255) + gr, bb = (c & 255) + gr;
+            uint32_t rr = ((col >> 16) & 255) + gr, gg = ((col >> 8) & 255) + gr, bb = (col & 255) + gr;
             rr = rr > 258 ? 255 : (rr < 4 ? 0 : rr - 3);
             gg = gg > 258 ? 255 : (gg < 4 ? 0 : gg - 3);
             bb = bb > 258 ? 255 : (bb < 4 ? 0 : bb - 3);
-            d[px] = over(d[px], (rr << 16) | (gg << 8) | bb, (uint32_t)cv);
+            d[px] = over(d[px], (rr << 16) | (gg << 8) | bb, (uint32_t)cvg);
         }
+    }
+}
+
+void ui_glass_draw(ui_glass *g, int x, int y, int w, int h, int r,
+                   int bx, int by, int bw, int bh, int br, int bcorners,
+                   uint32_t tint, int tint_a) {
+    if (w <= 0 || h <= 0 || !g->cap || !g->have) return;
+    glass_soften(g);
+    struct gd_ctx c;
+    shape_init(&c.so, w, h, r, r, UI_ALL);
+    if (bw > 0 && bh > 0) shape_init(&c.si, bw, bh, br, br, bcorners);
+    int vx = x, vy = y, vw = w, vh = h;
+    if (!cut(&vx, &vy, &vw, &vh)) return;
+    c.g = g; c.x = x; c.y = y; c.w = w;
+    c.bx = bx; c.by = by; c.bw = bw; c.bh = bh;
+    c.vx = vx; c.vw = vw;
+    c.t = tint_a + (tint_a >> 7);
+    c.tint = tint;
+    // Rows through the body are glass only at its two sides, the strip above
+    // it and the edge below are glass all the way across: dealt separately,
+    // or one core would get the strip and the others almost nothing.
+    if (bw > 0 && bh > 0) {
+        int m0 = by < vy ? vy : (by > vy + vh ? vy + vh : by);
+        int m1 = by + bh < m0 ? m0 : (by + bh > vy + vh ? vy + vh : by + bh);
+        ui_bands(gd_band, &c, vy, m0, vw);
+        ui_bands(gd_band, &c, m0, m1, 64);
+        ui_bands(gd_band, &c, m1, vy + vh, vw);
+    } else {
+        ui_bands(gd_band, &c, vy, vy + vh, vw);
     }
     mark(vx, vy, vw, vh);
 }
@@ -579,6 +698,40 @@ static uint32_t isqrt32(uint32_t v) {
     return r;
 }
 
+struct sh_ctx {
+    const uint16_t *prof;
+    int x, y, w, r, n, alpha, cy0, cy1, ix0, iy0, ix1, iy1, vx, vw;
+};
+
+static void sh_band(int y0, int y1, int share, void *cv) {
+    (void)share;
+    const struct sh_ctx *c = (const struct sh_ctx *)cv;
+    int x = c->x, w = c->w, r = c->r;
+    for (int py = y0; py < y1; py++) {
+        uint32_t *d = row_at(py);
+        int ddy = py < c->iy0 ? c->iy0 - py : (py > c->iy1 ? py - c->iy1 : 0);
+        int caster_rows = (py >= c->cy0 + r && py < c->cy1 - r);
+        for (int px = c->vx; px < c->vx + c->vw; px++) {
+            // The caster's own middle: skip straight across it.
+            if (caster_rows && px >= x + r && px < x + w - r) {
+                px = x + w - r - 1;
+                continue;
+            }
+            int ddx = px < c->ix0 ? c->ix0 - px : (px > c->ix1 ? px - c->ix1 : 0);
+            int dist16;
+            if (!ddx) dist16 = ddy * 16;
+            else if (!ddy) dist16 = ddx * 16;
+            else dist16 = (int)isqrt32((uint32_t)(ddx * ddx + ddy * ddy) * 256);
+            dist16 -= r * 16;
+            if (dist16 < 0) dist16 = 0;          // inside the shadow: at its darkest
+            if (dist16 >= c->n) continue;
+            int a = c->alpha * c->prof[dist16] >> 8;
+            if (a <= 0) continue;
+            d[px] = ui_mix(d[px], 0, a + (a >> 7));
+        }
+    }
+}
+
 void ui_shadow(int x, int y, int w, int h, int r, int size, int alpha, int dy,
                const int limit[4]) {
     if (size <= 0 || alpha <= 0 || w <= 0 || h <= 0) return;
@@ -617,31 +770,19 @@ void ui_shadow(int x, int y, int w, int h, int r, int size, int alpha, int dy,
     if (!cut(&vx, &vy, &vw, &vh)) { ui_clip_set(saved); return; }
 
     // Distance from the rounded rectangle: from the rectangle shrunk by r,
-    // less r.
-    int ix0 = x + r, iy0 = y + r, ix1 = x + w - 1 - r, iy1 = y + h - 1 - r;
-    for (int py = vy; py < vy + vh; py++) {
-        uint32_t *d = row_at(py);
-        int ddy = py < iy0 ? iy0 - py : (py > iy1 ? py - iy1 : 0);
-        int caster_rows = (py >= cy0 + r && py < cy1 - r);
-        for (int px = vx; px < vx + vw; px++) {
-            // The caster's own middle: skip straight across it.
-            if (caster_rows && px >= x + r && px < x + w - r) {
-                px = x + w - r - 1;
-                continue;
-            }
-            int ddx = px < ix0 ? ix0 - px : (px > ix1 ? px - ix1 : 0);
-            int dist16;
-            if (!ddx) dist16 = ddy * 16;
-            else if (!ddy) dist16 = ddx * 16;
-            else dist16 = (int)isqrt32((uint32_t)(ddx * ddx + ddy * ddy) * 256);
-            dist16 -= r * 16;
-            if (dist16 < 0) dist16 = 0;          // inside the shadow: at its darkest
-            if (dist16 >= n) continue;
-            int a = alpha * prof[dist16] >> 8;
-            if (a <= 0) continue;
-            d[px] = ui_mix(d[px], 0, a + (a >> 7));
-        }
-    }
+    // less r. The rows beside the caster have only its two edges to do.
+    struct sh_ctx c = { prof, x, y, w, r, n, alpha, cy0, cy1,
+                        x + r, y + r, x + w - 1 - r, y + h - 1 - r, vx, vw };
+    // Above and below the caster the shadow is the whole width; beside it,
+    // two narrow edges. Dealt separately, so the cores share evenly.
+    int m0 = cy0 + r, m1 = cy1 - r;
+    if (m0 < vy) m0 = vy;
+    if (m0 > vy + vh) m0 = vy + vh;
+    if (m1 < m0) m1 = m0;
+    if (m1 > vy + vh) m1 = vy + vh;
+    ui_bands(sh_band, &c, vy, m0, vw);
+    ui_bands(sh_band, &c, m0, m1, 4 * size + 2 * r);
+    ui_bands(sh_band, &c, m1, vy + vh, vw);
     mark(vx, vy, vw, vh);
     ui_clip_set(saved);
 }
@@ -925,16 +1066,21 @@ int ui_text_glow(int x, int y, const char *s, int face, uint32_t rgb,
 // walks the rows top to bottom, so both read memory in order -- a column at a
 // time would touch a new cache line on every pixel of a 1080-row image.
 
-static void hpass(uint32_t *px, int w, int h, int r, uint32_t *line) {
+struct blur_ctx { uint32_t *px, *lines, *sums, *ring; int w, h, r, stride; };
+
+static void hpass_band(int y0, int y1, int share, void *cv) {
+    const struct blur_ctx *c = (const struct blur_ctx *)cv;
+    int w = c->w, r = c->r;
+    uint32_t *line = c->lines + (uint64_t)share * c->stride;
     int n = 2 * r + 1;
     uint32_t inv = (65536u + (uint32_t)n / 2) / (uint32_t)n;
-    for (int y = 0; y < h; y++) {
-        uint32_t *row = px + (uint64_t)y * w;
+    for (int y = y0; y < y1; y++) {
+        uint32_t *row = c->px + (uint64_t)y * w;
         for (int x = 0; x < w; x++) line[x] = row[x];
         uint32_t sr = 0, sg = 0, sb = 0;
         for (int k = -r; k <= r; k++) {
-            uint32_t c = line[k < 0 ? 0 : (k >= w ? w - 1 : k)];
-            sr += (c >> 16) & 255; sg += (c >> 8) & 255; sb += c & 255;
+            uint32_t col = line[k < 0 ? 0 : (k >= w ? w - 1 : k)];
+            sr += (col >> 16) & 255; sg += (col >> 8) & 255; sb += col & 255;
         }
         for (int x = 0; x < w; x++) {
             uint32_t R = (sr * inv) >> 16, G = (sg * inv) >> 16, B = (sb * inv) >> 16;
@@ -949,24 +1095,31 @@ static void hpass(uint32_t *px, int w, int h, int r, uint32_t *line) {
     }
 }
 
-static void vpass(uint32_t *px, int w, int h, int r, uint32_t *sums, uint32_t *ring) {
+// Columns x0..x1 only: every column keeps its own sums and its own place in
+// the ring, so bands of columns never meet.
+static void vpass_band(int x0, int x1, int share, void *cv) {
+    (void)share;
+    const struct blur_ctx *c = (const struct blur_ctx *)cv;
+    uint32_t *px = c->px;
+    int w = c->w, h = c->h, r = c->r;
     // ring holds the original rows still inside the window: 2r+2 of them.
     int n = 2 * r + 1, cap = 2 * r + 2;
     uint32_t inv = (65536u + (uint32_t)n / 2) / (uint32_t)n;
-    uint32_t *sr = sums, *sg = sums + w, *sb = sums + 2 * w;
-    for (int x = 0; x < w; x++) sr[x] = sg[x] = sb[x] = 0;
+    uint32_t *sr = c->sums, *sg = c->sums + w, *sb = c->sums + 2 * w;
+    uint32_t *ring = c->ring;
+    for (int x = x0; x < x1; x++) sr[x] = sg[x] = sb[x] = 0;
     // Prime with rows -r..r, the ones above the top standing in as row 0.
     for (int k = -r; k <= r; k++) {
         const uint32_t *row = px + (uint64_t)(k < 0 ? 0 : (k >= h ? h - 1 : k)) * w;
-        for (int x = 0; x < w; x++) {
-            uint32_t c = row[x];
-            sr[x] += (c >> 16) & 255; sg[x] += (c >> 8) & 255; sb[x] += c & 255;
+        for (int x = x0; x < x1; x++) {
+            uint32_t col = row[x];
+            sr[x] += (col >> 16) & 255; sg[x] += (col >> 8) & 255; sb[x] += col & 255;
         }
     }
     for (int k = 0; k <= r && k < h; k++) {
         uint32_t *slot = ring + (uint64_t)(k % cap) * w;
         const uint32_t *row = px + (uint64_t)k * w;
-        for (int x = 0; x < w; x++) slot[x] = row[x];
+        for (int x = x0; x < x1; x++) slot[x] = row[x];
     }
     for (int y = 0; y < h; y++) {
         uint32_t *row = px + (uint64_t)y * w;
@@ -976,15 +1129,15 @@ static void vpass(uint32_t *px, int w, int h, int r, uint32_t *sums, uint32_t *r
         if (add < h) {
             uint32_t *slot = ring + (uint64_t)(add % cap) * w;
             const uint32_t *src = px + (uint64_t)add * w;
-            for (int x = 0; x < w; x++) slot[x] = src[x];
+            for (int x = x0; x < x1; x++) slot[x] = src[x];
         }
-        for (int x = 0; x < w; x++) {
+        for (int x = x0; x < x1; x++) {
             uint32_t R = (sr[x] * inv) >> 16, G = (sg[x] * inv) >> 16, B = (sb[x] * inv) >> 16;
             row[x] = ((R > 255 ? 255 : R) << 16) | ((G > 255 ? 255 : G) << 8) | (B > 255 ? 255 : B);
         }
         const uint32_t *ra = ring + (uint64_t)((add < h ? add : h - 1) % cap) * w;
         const uint32_t *rs = ring + (uint64_t)((sub < 0 ? 0 : sub) % cap) * w;
-        for (int x = 0; x < w; x++) {
+        for (int x = x0; x < x1; x++) {
             uint32_t ca = ra[x], cs = rs[x];
             sr[x] += ((ca >> 16) & 255) - ((cs >> 16) & 255);
             sg[x] += ((ca >> 8) & 255) - ((cs >> 8) & 255);
@@ -995,16 +1148,20 @@ static void vpass(uint32_t *px, int w, int h, int r, uint32_t *sums, uint32_t *r
 
 void ui_blur(uint32_t *px, int w, int h, int r) {
     if (!px || w <= 0 || h <= 0 || r <= 0) return;
-    uint32_t *line = (uint32_t *)kmalloc((size_t)(w > h ? w : h) * 4);
-    uint32_t *sums = (uint32_t *)kmalloc((size_t)w * 3 * 4);
-    uint32_t *ring = (uint32_t *)kmalloc((size_t)w * (2 * r + 2) * 4);
-    if (line && sums && ring) {
+    int bands = ui_band_count();
+    struct blur_ctx c;
+    c.px = px; c.w = w; c.h = h; c.r = r;
+    c.stride = w;
+    c.lines = (uint32_t *)kmalloc((size_t)w * bands * 4);       // one row each
+    c.sums = (uint32_t *)kmalloc((size_t)w * 3 * 4);
+    c.ring = (uint32_t *)kmalloc((size_t)w * (2 * r + 2) * 4);
+    if (c.lines && c.sums && c.ring) {
         for (int pass = 0; pass < 3; pass++) {
-            hpass(px, w, h, r, line);
-            vpass(px, w, h, r, sums, ring);
+            ui_bands(hpass_band, &c, 0, h, w);
+            ui_bands(vpass_band, &c, 0, w, h);
         }
     }
-    if (line) kfree(line);
-    if (sums) kfree(sums);
-    if (ring) kfree(ring);
+    if (c.lines) kfree(c.lines);
+    if (c.sums) kfree(c.sums);
+    if (c.ring) kfree(c.ring);
 }
