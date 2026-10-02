@@ -22,6 +22,10 @@ void wm_poll(void);
 // process is left: a desktop with every window closed is still a desktop.
 int wm_running(void);
 
+// The language the desktop speaks: 0 Russian, 1 English. For text the
+// kernel puts on the screen itself, such as a program's crash.
+int wm_lang(void);
+
 // A notice in the corner of the screen, for a few seconds: a title and a
 // line of text, with one of the glyphs of glyphs.h on a square of `col`.
 // Not shown while "do not disturb" is on.

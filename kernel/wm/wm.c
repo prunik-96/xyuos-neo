@@ -2334,19 +2334,9 @@ static void draw_snap_preview(void) {
     const theme_t *T = TH;
     uint32_t x, y, w, h;
     snap_rect(snap_hint, &x, &y, &w, &h);
-
-    volatile uint8_t *base = fb_get_base();
-    uint32_t pitch = fb_get_pitch();
-    for (uint32_t yy = y; yy < y + h && yy < fb_get_height(); yy++) {
-        volatile uint32_t *row = (volatile uint32_t *)(base + (size_t)yy * pitch);
-        for (uint32_t xx = x; xx < x + w && xx < fb_get_width(); xx++)
-            row[xx] = mix(row[xx], T->glow, 90);
-    }
-    fb_fill_rect(x, y, w, 3, T->glow);
-    fb_fill_rect(x, y + h - 3, w, 3, T->glow);
-    fb_fill_rect(x, y, 3, h, T->glow);
-    fb_fill_rect(x + w - 3, y, 3, h, T->glow);
-    fb_mark_rows(y, h);
+    // Where the window will land: a soft plate of the accent, inset a little.
+    ui_round_fill((int)x + 8, (int)y + 8, (int)w - 16, (int)h - 16, 22, T->accent, 60);
+    ui_rrect_line((int)x + 8, (int)y + 8, (int)w - 16, (int)h - 16, 22, UI_ALL, T->accent, 200);
 }
 
 // The Alt+Tab list, shown for as long as Alt is held down.
@@ -2415,32 +2405,17 @@ static void draw_drag_ghost(void) {
     if (!udrag_active) return;
     int32_t mx, my;
     mouse_position(&mx, &my);
+    const theme_t *T = TH;
 
-    int len = 0;
-    while (udrag_label[len]) len++;
-    int w = len * (int)GW + 18, h = (int)GH + 12;
+    int w = ui_text_w(udrag_label, UI_F13) + 28, h = 32;
     int x = mx + 16, y = my + 16;
     if (x + w > (int)fb_get_width())  x = (int)fb_get_width() - w;
     if (y + h > (int)fb_get_height()) y = (int)fb_get_height() - h;
     if (x < 0) x = 0;
     if (y < 0) y = 0;
-
-    volatile uint8_t *base = fb_get_base();
-    uint32_t pitch = fb_get_pitch();
-    for (int yy = y; yy < y + h; yy++) {
-        if (yy < 0 || (uint32_t)yy >= fb_get_height()) continue;
-        volatile uint32_t *row = (volatile uint32_t *)(base + (size_t)yy * pitch);
-        for (int xx = x; xx < x + w; xx++) {
-            if (xx < 0 || (uint32_t)xx >= fb_get_width()) continue;
-            row[xx] = mix(row[xx], TH->menu_bg, 190);
-        }
-    }
-    fb_mark_rows(y, h);
-    fb_fill_rect(x, y, w, 1, TH->glow);
-    fb_fill_rect(x, y + h - 1, w, 1, TH->glow);
-    fb_fill_rect(x, y, 1, h, TH->glow);
-    fb_fill_rect(x + w - 1, y, 1, h, TH->glow);
-    draw_text_t(x + 9, y + 6, udrag_label, 0x00FFFFFF);
+    ui_shadow(x, y, w, h, 16, 12, 60, 4, 0);
+    ui_round_fill(x, y, w, h, 16, T->plate, 240);
+    ui_text(x + 14, y + (h - ui_line_h(UI_F13)) / 2, udrag_label, UI_F13, T->title_text);
 }
 
 // --- message boxes --------------------------------------------------------
@@ -2450,13 +2425,13 @@ static void draw_drag_ghost(void) {
 // first one before anybody has read it.
 
 #define MBOX_QUEUE  4
-#define MBOX_TEXT   96
+#define MBOX_TEXT   160         // UTF-8: a Russian letter is two bytes
 #define MBOX_CODE   24
 
 struct mbox {
     int  used, kind;
     char code[MBOX_CODE];
-    char title[40];
+    char title[96];
     char text[MBOX_TEXT];
     char detail[MBOX_TEXT];
 };
@@ -2467,6 +2442,13 @@ static int mbox_head;              // the one being shown
 static void mb_copy(char *d, const char *s2, int max) {
     int i = 0;
     if (s2) while (s2[i] && i < max - 1) { d[i] = s2[i]; i++; }
+    // Cut short, never in the middle of a letter: back off a partial UTF-8
+    // sequence rather than show half of one as a box.
+    if (s2 && s2[i]) {
+        int j = i;
+        while (j > 0 && ((unsigned char)d[j - 1] & 0xC0) == 0x80) j--;
+        if (j > 0 && ((unsigned char)d[j - 1] & 0xC0) == 0xC0) i = j - 1;
+    }
     d[i] = 0;
 }
 
@@ -2501,24 +2483,19 @@ static void mbox_dismiss(void) {
     dirty = 1;
 }
 
-static int mb_len(const char *s2) {
-    int n = 0;
-    while (s2 && s2[n]) n++;
-    return n;
-}
-
 static void mbox_geom(int *x, int *y, int *w, int *h) {
-    // Size to the longest line rather than to a guess. A fixed width is fine
+    // Sized to the longest line rather than to a guess. A fixed width is fine
     // until the first message that does not fit, and then it is wrong in the
     // one situation where the text matters most.
     struct mbox *m = &mboxes[mbox_head];
-    int cols = mb_len(m->text);
-    int d = mb_len(m->detail);
-    if (d > cols) cols = d;
-    if (cols < 36) cols = 36;
-    *w = (cols + 8) * (int)GW + 60;
-    if (*w > (int)fb_get_width() - 60) *w = (int)fb_get_width() - 60;
-    *h = (int)GH * 4 + 96;
+    int tw = ui_text_w(m->title[0] ? m->title : "Error", UI_F15B);
+    int a = ui_text_w(m->text, UI_F13), d = ui_text_w(m->detail, UI_F12);
+    if (a > tw) tw = a;
+    if (d > tw) tw = d;
+    *w = tw + 92 + 36;
+    if (*w < 440) *w = 440;
+    if (*w > (int)fb_get_width() - 80) *w = (int)fb_get_width() - 80;
+    *h = 196;
     *x = ((int)fb_get_width() - *w) / 2;
     *y = ((int)fb_get_height() - *h) / 2 - 40;
     if (*y < 20) *y = 20;
@@ -2527,94 +2504,64 @@ static void mbox_geom(int *x, int *y, int *w, int *h) {
 static void mbox_ok_rect(int *x, int *y, int *w, int *h) {
     int dx, dy, dw, dh;
     mbox_geom(&dx, &dy, &dw, &dh);
-    *w = (int)GW * 10;
-    *h = (int)GH + 14;
-    *x = dx + dw - *w - 16;
-    *y = dy + dh - *h - 14;
+    *w = 104;
+    *h = 38;
+    *x = dx + dw - *w - 22;
+    *y = dy + dh - *h - 20;
 }
 
 // The icon carries the severity before a single word is read, which is the
 // entire reason message boxes have one.
-static void draw_mbox_icon(int cx, int cy, int r, int kind) {
-    uint32_t body = kind == MB_ERROR ? 0x00C0392B :
-                    kind == MB_WARN  ? 0x00E0A030 : 0x002A6FD6;
-    for (int y = -r; y <= r; y++) {
-        for (int x = -r; x <= r; x++) {
-            if (x * x + y * y > r * r) continue;
-            int px = cx + x, py = cy + y;
-            if (px < 0 || py < 0 || (uint32_t)px >= fb_get_width() ||
-                (uint32_t)py >= fb_get_height()) continue;
-            fb_fill_rect(px, py, 1, 1, y < 0 ? mix(body, 0x00FFFFFF, 40) : body);
-        }
-    }
-    if (kind == MB_ERROR) {                      // an X
-        for (int i = -r / 2; i <= r / 2; i++) {
-            fb_fill_rect(cx + i - 1, cy + i - 1, 3, 3, 0x00FFFFFF);
-            fb_fill_rect(cx + i - 1, cy - i - 1, 3, 3, 0x00FFFFFF);
-        }
-    } else {                                     // an exclamation / i bar
-        int top = kind == MB_WARN ? -r / 2 : -r / 4;
-        fb_fill_rect(cx - 2, cy + top, 4, r - 2, 0x00FFFFFF);
-        fb_fill_rect(cx - 2, cy + r / 2 + 1, 4, 4, 0x00FFFFFF);
-    }
+// The sign of a message: a soft square in its colour, with a mark in it.
+static uint32_t mbox_colour(int kind) {
+    return kind == MB_ERROR ? 0x00D9534F : kind == MB_WARN ? 0x00E0A030 : TH->accent;
 }
 
 static void draw_message_box(void) {
     struct mbox *m = &mboxes[mbox_head];
     if (!m->used) return;
-
+    const theme_t *T = TH;
 
     int x, y, w, h;
     mbox_geom(&x, &y, &w, &h);
 
-    // Dim the whole desktop: this is modal, and it should look modal.
+    // The desktop goes quiet behind it: this is modal, and it should look it.
     volatile uint8_t *base = fb_get_base();
     uint32_t pitch = fb_get_pitch();
     for (uint32_t yy = 0; yy < fb_get_height(); yy++) {
         volatile uint32_t *row = (volatile uint32_t *)(base + (size_t)yy * pitch);
         for (uint32_t xx = 0; xx < fb_get_width(); xx++)
-            row[xx] = mix(row[xx], 0x00000000, 90);
+            row[xx] = mix(row[xx], 0x00000000, 70);
     }
     fb_mark_rows(0, fb_get_height());
 
-    fb_fill_rect(x, y, w, h, 0x00F2F3F5);
-    uint32_t bar = m->kind == MB_ERROR ? 0x00B03428 :
-                   m->kind == MB_WARN  ? 0x00B8860B : 0x001B4F9C;
-    fill_vgrad(x, y, w, (int)GH + 14, mix(bar, 0x00FFFFFF, 40), bar);
-    fb_fill_rect(x, y, w, 1, 0x00FFFFFF);
-    draw_text_t(x + 12, y + 7, m->title[0] ? m->title : "Error", 0x00FFFFFF);
+    ui_shadow(x, y, w, h, 24, 40, 90, 16, 0);
+    ui_glass_live(x, y, w, h, 24, ui_mix(T->frost, T->accent, 30), 215 + T->frost_a / 2, 12);
+    ui_glass_rim(x, y, w, h, 24);
 
-    int ix = x + 34, iy = y + (int)GH + 58;
-    draw_mbox_icon(ix, iy, 20, m->kind);
-
-    int tx = x + 70, ty = y + (int)GH + 34;
-    draw_text_t(tx, ty, m->text, 0x001B1B1F);
-    if (m->detail[0])
-        draw_text_t(tx, ty + (int)GH + 6, m->detail, 0x006B7280);
+    uint32_t ink = T->title_text, dim = T->title_text_dim;
+    glyph_app(x + 26, y + 28, 50, mbox_colour(m->kind), m->kind == MB_ERROR ? G_CLOSE : G_BELL);
+    int tx = x + 96, tw = w - 96 - 24;
+    ui_text_fit(tx, y + 24, tw, m->title[0] ? m->title : L("Ошибка", "Error"), UI_F15B, ink);
+    ui_text_fit(tx, y + 54, tw, m->text, UI_F13, ink);
+    if (m->detail[0]) ui_text_fit(tx, y + 80, tw, m->detail, UI_F12, dim);
     if (m->code[0]) {
-        char line[MBOX_CODE + 8];
+        char line[MBOX_CODE + 16];
         int n = 0;
-        const char *pre = "code ";
+        const char *pre = L("код ", "code ");
         while (pre[n]) { line[n] = pre[n]; n++; }
         int k = 0;
         while (m->code[k] && n < (int)sizeof line - 1) line[n++] = m->code[k++];
         line[n] = 0;
-        draw_text_t(tx, ty + 2 * ((int)GH + 6), line, 0x006B7280);
+        ui_text_fit(tx, y + 104, tw, line, UI_F11, dim);
     }
 
     int bx, by, bw, bh;
     mbox_ok_rect(&bx, &by, &bw, &bh);
-    fill_vgrad(bx, by, bw, bh, 0x00FFFFFF, 0x00E4E8EC);
-    fb_fill_rect(bx, by, bw, 1, 0x002A6FD6);
-    fb_fill_rect(bx, by + bh - 1, bw, 1, 0x002A6FD6);
-    fb_fill_rect(bx, by, 1, bh, 0x002A6FD6);
-    fb_fill_rect(bx + bw - 1, by, 1, bh, 0x002A6FD6);
-    draw_text_t(bx + (bw - 2 * (int)GW) / 2, by + 7, "OK", 0x001B1B1F);
-
-    fb_fill_rect(x, y, w, 1, 0x00FFFFFF);
-    fb_fill_rect(x, y + h - 1, w, 1, 0x00A8B0B8);
-    fb_fill_rect(x, y, 1, h, 0x00D0D6DC);
-    fb_fill_rect(x + w - 1, y, 1, h, 0x00A8B0B8);
+    ui_round_fill(bx, by, bw, bh, bh / 2, T->accent, 255);
+    const char *ok = L("Понятно", "OK");
+    ui_text(bx + (bw - ui_text_w(ok, UI_F13B)) / 2, by + (bh - ui_line_h(UI_F13B)) / 2, ok, UI_F13B,
+            0x00FFFFFF);
 }
 
 // --- the start menu -------------------------------------------------------
@@ -3809,37 +3756,33 @@ static void draw_alttab(void) {
     int n = collect_windows(cur_ws, win, MAX_NODES);
     if (n <= 1) return;
 
-    int rowh = (int)GH + 10;
-    int bw = 380, bh = n * rowh + 24;
-    int bx = ((int)fb_get_width() - bw) / 2;
-    int by = ((int)fb_get_height() - bh) / 2;
+    // A card of programs, one cell each: its icon and its name, the one
+    // that Alt will let go on lit.
+    int W = (int)fb_get_width(), H = (int)fb_get_height();
+    int cw = 112, chh = 112;
+    if (n * cw + 32 > W - 80) cw = (W - 80 - 32) / n;
+    int bw = n * cw + 32, bh = chh + 32;
+    int bx = (W - bw) / 2, by = (H - bh) / 2;
 
-    volatile uint8_t *base = fb_get_base();
-    uint32_t pitch = fb_get_pitch();
-    for (int yy = by; yy < by + bh; yy++) {
-        if (yy < 0 || (uint32_t)yy >= fb_get_height()) continue;
-        volatile uint32_t *row = (volatile uint32_t *)(base + (size_t)yy * pitch);
-        for (int xx = bx; xx < bx + bw; xx++) {
-            if (xx < 0 || (uint32_t)xx >= fb_get_width()) continue;
-            row[xx] = mix(row[xx], 0x00000000, 150);
-        }
-    }
-    fb_fill_rect(bx, by, bw, 2, T->glow);
-    fb_fill_rect(bx, by + bh - 2, bw, 2, T->glow);
-    fb_fill_rect(bx, by, 2, bh, T->glow);
-    fb_fill_rect(bx + bw - 2, by, 2, bh, T->glow);
-
+    ui_shadow(bx, by, bw, bh, 26, 34, 80, 14, 0);
+    ui_glass_live(bx, by, bw, bh, 26, ui_mix(T->frost, T->accent, 40), 170 + T->frost_a, 12);
+    ui_glass_rim(bx, by, bw, bh, 26);
     for (int i = 0; i < n; i++) {
-        int ry = by + 12 + i * rowh;
-        int sel = (win[i] == focused);
-        if (sel) fill_vgrad(bx + 6, ry - 3, bw - 12, rowh,
-                            mix(T->glow, 0x00FFFFFF, 60), T->glow);
-        const char *t = pane_title(&panes[nodes[win[i]].pane_idx]);
-        draw_text_t(bx + 18, ry, t, sel ? 0x00FFFFFF : T->bar_text);
-        if (nodes[win[i]].state == WIN_MIN)
-            draw_text_t(bx + bw - 110, ry, "minimised", T->bar_dim);
+        int cx = bx + 16 + i * cw, cy = by + 16;
+        int sel = win[i] == focused;
+        if (sel) {
+            ui_round_fill(cx + 4, cy, cw - 8, chh, 18, T->plate, 220);
+            ui_rrect_line(cx + 4, cy, cw - 8, chh, 18, UI_ALL, T->accent, 255);
+        }
+        const char *file = pane_title(&panes[nodes[win[i]].pane_idx]);
+        int is = cw >= 80 ? 52 : cw - 28;
+        prog_icon(file, cx + (cw - is) / 2, cy + 14, is);
+        const char *lbl = program_label(file);
+        uint32_t c = nodes[win[i]].state == WIN_MIN ? T->title_text_dim : T->title_text;
+        int lw = ui_text_w(lbl, UI_F12);
+        if (lw > cw - 16) ui_text_fit(cx + 8, cy + 78, cw - 16, lbl, UI_F12, c);
+        else ui_text(cx + (cw - lw) / 2, cy + 78, lbl, UI_F12, c);
     }
-    fb_mark_rows((uint32_t)(by < 0 ? 0 : by), (uint32_t)bh);
 }
 
 // The desktop underneath the arrow, saved before it is stamped on. Restoring
@@ -6267,6 +6210,7 @@ static volatile int screen_asleep = 0;
 void wm_set_asleep(int on) { screen_asleep = on; }
 
 int wm_running(void) { return started; }
+int wm_lang(void) { return lang; }
 
 void wm_poll(void) {
     if (screen_asleep) return;

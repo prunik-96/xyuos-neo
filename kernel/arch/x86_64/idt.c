@@ -149,14 +149,19 @@ void idt_load(void) {
 // what the manual calls it; "the program tried to do something only the
 // kernel may do" is what actually happened.
 static const char *fault_reason(uint32_t n) {
+    int en = wm_lang();
     switch (n) {
-        case 0:  return "The program divided by zero.";
-        case 6:  return "The program ran into an instruction that does not exist.";
-        case 13: return "The program tried to do something only the kernel may do.";
-        case 14: return "The program touched memory that does not belong to it.";
+        case 0:  return en ? "The program divided by zero." : "Программа разделила на ноль.";
+        case 6:  return en ? "The program ran into an instruction that does not exist."
+                           : "Программа наткнулась на несуществующую инструкцию.";
+        case 13: return en ? "The program tried to do something only the kernel may do."
+                           : "Программа попыталась сделать то, что можно только ядру.";
+        case 14: return en ? "The program touched memory that does not belong to it."
+                           : "Программа обратилась к чужой памяти.";
         case 16:
-        case 19: return "A floating-point operation failed.";
-        default: return "The program hit a processor fault and was stopped.";
+        case 19: return en ? "A floating-point operation failed." : "Ошибка в вычислении с плавающей точкой.";
+        default: return en ? "The program hit a processor fault and was stopped."
+                           : "Процессор остановил программу из-за сбоя.";
     }
 }
 
@@ -251,7 +256,8 @@ void isr_handler(struct interrupt_frame *frame) {
             char code[24], det[96];
             fmt_fault_code(code, sizeof code, frame->int_no);
             fmt_fault_detail(det, sizeof det, p->name, p->pid, frame->rip, cr2);
-            wm_message_box(MB_ERROR, code, "Program stopped working",
+            wm_message_box(MB_ERROR, code, wm_lang() ? "Program stopped working"
+                                                     : "Программа перестала работать",
                            fault_reason(frame->int_no), det);
 
             process_notify_exit(139);   // noreturn: wakes the parent, switches away
