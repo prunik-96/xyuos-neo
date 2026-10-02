@@ -15,6 +15,7 @@
 #include "../kernel/kio.h"
 #include "../drivers/mouse.h"
 #include "../drivers/audio.h"
+#include "../drivers/xhci.h"
 #include "../drivers/power.h"
 #include "../net/net.h"
 #include "ui.h"
@@ -3801,7 +3802,16 @@ static int note_drawn;              // a notice was on the screen last frame
 static ukeep note_keep;
 static ui_glass note_glass;
 
+static void note_push(const char *title, const char *text, int g, uint32_t col);
+
 void wm_notify_glyph(const char *title, const char *text, int g, uint32_t col) {
+    if (dnd) return;
+    note_push(title, text, g, col);
+    sound_play(SND_NOTIFY);
+}
+
+// A notice into the queue, without a sound (the caller has its own).
+static void note_push(const char *title, const char *text, int g, uint32_t col) {
     if (dnd) return;
     if (note_n >= NOTE_MAX) return;
     str_put(notes[note_n].title, title, sizeof notes[0].title);
@@ -6745,6 +6755,18 @@ void wm_poll(void) {
     }
     if (!started) return;
 
+    // The start-up sound, once the desktop is really running: from here the
+    // timer ticks, and the sound is looked after as it plays.
+    // And after its first frame: drawing that one (the wallpaper is made
+    // then) holds the processor longer than the sound ring lasts.
+    {
+        static int greeted;
+        if (!greeted && last_frame_ms && now_ms() - last_frame_ms > 100) {
+            greeted = 1;
+            sound_play(SND_STARTUP);
+        }
+    }
+
     // Tick the clock ~once a second (PIT is 100 Hz) and repaint so it stays live
     // even when nothing else is happening.
     // Refresh the clock + monitor history ~once a second and repaint so the
@@ -6768,6 +6790,23 @@ void wm_poll(void) {
     if (hover_animating()) dirty = 1;
     if (anim.active) dirty = 1;                 // the next step of a window's way
     if (note_animating()) dirty = 1;            // a notice coming or going
+
+    // A USB device plugged in or pulled out. Not in the first seconds: the
+    // ports' own news from boot arrives then, and is not news.
+    {
+        static uint64_t since;
+        if (!since) since = now_ms();
+        int usb = xhci_port_news();
+        if (usb && now_ms() - since > 5000) {
+            sound_play(usb > 0 ? SND_USB_IN : SND_USB_OUT);
+            note_push(usb > 0 ? L("USB-устройство подключено", "USB device connected")
+                              : L("USB-устройство отключено", "USB device removed"),
+                      usb > 0 ? L("Новые устройства пока подключаются при запуске.",
+                                  "New devices are set up at start-up for now.")
+                              : L("Его можно было вынимать.", "It was safe to remove."),
+                      G_CHIP, usb > 0 ? TH->accent : 0x006B7480);
+        }
+    }
     if (pop_animating()) {                      // a popup springing into place
         dirty = 1;
         menu_dirty = 1;

@@ -106,6 +106,12 @@ static int               codec_addr = -1;
 static int               dac_nid, pin_nid;
 static int               have_hda;
 static int               wpos;            /* our write cursor into buf */
+/* The same two places, counted in bytes since the stream started rather than
+ * round the ring: what has been written, and what the codec has played. With
+ * those a system sound can be given a place in time, and mixed in wherever
+ * that place is -- over music already queued, or under music still to come. */
+static uint64_t          w_abs, p_abs;
+static int               last_lp;
 static int               cleared;         /* played bytes are silenced up to here */
 static int               volume = 80;
 
@@ -122,8 +128,15 @@ static void spin(int n) {
 }
 
 static void *alloc_contig(uint32_t bytes) {
-    uint64_t start = pmm_alloc_contig((bytes + 4095) / 4096);
-    return start ? (void *)(uintptr_t)start : NULL;
+    uint32_t pages = (bytes + 4095) / 4096;
+    uint64_t start = pmm_alloc_contig(pages);
+    if (!start) return NULL;
+    // Frames come back as whoever had them left them. For the sound ring
+    // that was audible: whatever lay there played twice at start-up, a click
+    // a lap (340 ms) apart, before the first tick began silencing it.
+    uint8_t *p = (uint8_t *)(uintptr_t)start;
+    for (uint32_t i = 0; i < pages * 4096; i++) p[i] = 0;
+    return p;
 }
 
 /* --- the verb ring -------------------------------------------------------
@@ -314,7 +327,7 @@ static void stream_start(void) {
  * PC speaker fallback
  * ========================================================================== */
 
-static struct { uint16_t hz; uint16_t ms; } melody[6];
+static struct { uint16_t hz; uint16_t ms; } melody[8];
 static int melody_len, melody_at;
 static uint64_t melody_until;
 static int speaker_on;
@@ -344,6 +357,29 @@ static void speaker_tone(uint16_t hz) {
  * is nothing but silence. Called every tick, under the kernel lock, as
  * audio_write is. */
 static int play_pos(void);
+
+/* Bring p_abs up to where the codec is. Called at least every tick: the ring
+ * is a third of a second, so nothing is missed. */
+static uint64_t last_update_ms;
+static void play_update(void) {
+    int lp = play_pos();
+    int d = lp - last_lp;
+    if (d < 0) d += BUF_BYTES;
+    // The ring position alone cannot tell one lap from three. If nobody
+    // looked for longer than a lap -- interrupts off through a long piece of
+    // start-up -- the clock says how many went by.
+    uint64_t now = pit_get_ticks() * 10;
+    if (last_update_ms) {
+        uint64_t expect = (now - last_update_ms) * (uint64_t)(AUDIO_RATE / 1000 * 2 * AUDIO_CH);
+        while ((uint64_t)d + BUF_BYTES / 2 < expect && d + BUF_BYTES > d) d += BUF_BYTES;
+    }
+    last_update_ms = now;
+    p_abs += (uint64_t)d;
+    last_lp = lp;
+}
+
+static void fx_fill(void);
+
 static void silence_played(void) {
     int lp = play_pos();
     int n = lp - cleared;
@@ -353,7 +389,7 @@ static void silence_played(void) {
 }
 
 void audio_tick(void) {
-    if (have_hda) silence_played();
+    if (have_hda) { silence_played(); fx_fill(); }
     if (!melody_len) return;
     if (pit_get_ticks() * 10 < melody_until) return;
     if (melody_at >= melody_len) {
@@ -475,6 +511,8 @@ int audio_init(void) {
     have_hda = 1;
     wpos = 0;
     cleared = 0;
+    w_abs = p_abs = 0;
+    last_lp = play_pos();
     kprintf("hda: ready, 48 kHz stereo\n");
     return 1;
 }
@@ -485,18 +523,25 @@ static int play_pos(void) {
 
 int audio_queued(void) {
     if (!have_hda) return 0;
-    int lp = play_pos();
-    int d = wpos - lp;
-    if (d < 0) d += BUF_BYTES;
-    return d / (2 * AUDIO_CH);
+    play_update();
+    return w_abs > p_abs ? (int)((w_abs - p_abs) / (2 * AUDIO_CH)) : 0;
 }
+
+static void fx_mix(uint64_t a, uint64_t b);
 
 int audio_write(const int16_t *frames, int nframes) {
     if (!have_hda || nframes <= 0) return 0;
 
-    int lp = play_pos();
-    int used = wpos - lp;
-    if (used < 0) used += BUF_BYTES;
+    play_update();
+    // Fallen behind -- the codec has played past what was written: go on
+    // from just ahead of it, not from where it will come round to in a lap.
+    if (w_abs < p_abs + 4 * AUDIO_CH * 48) {
+        if (w_abs < p_abs) {
+            w_abs = p_abs + 4 * AUDIO_CH * 48;      // 1 ms ahead
+            wpos = (int)(w_abs % BUF_BYTES);
+        }
+    }
+    int used = (int)(w_abs - p_abs);
     int free_bytes = BUF_BYTES - used - GUARD;
     if (free_bytes <= 0) return 0;
 
@@ -513,7 +558,10 @@ int audio_write(const int16_t *frames, int nframes) {
         buf[at] = (uint8_t)(scaled & 0xFF);
         buf[(at + 1) % BUF_BYTES] = (uint8_t)((scaled >> 8) & 0xFF);
     }
-    wpos = (wpos + want) % BUF_BYTES;
+    uint64_t from = w_abs;
+    w_abs += (uint64_t)want;
+    wpos = (int)(w_abs % BUF_BYTES);
+    fx_mix(from, w_abs);                 /* a system sound over this stretch */
 
     /* Leave silence in front of the writer. Without this, an underrun replays
      * whatever was in the ring last time round, which is far more alarming
@@ -527,49 +575,228 @@ int audio_write(const int16_t *frames, int nframes) {
 void audio_stop(void) {
     if (!have_hda) return;
     for (int i = 0; i < BUF_BYTES; i++) buf[i] = 0;
+    play_update();
+    w_abs = p_abs;
     wpos = play_pos();
     cleared = wpos;
 }
 
 /* --- system sounds --------------------------------------------------------
- * Synthesised on the spot. A square wave through a linear decay is crude, but
- * it is two dozen lines and needs no file on a disk that may be the thing
- * that just failed. */
-static void tone_into(int16_t *out, int frames, int hz, int amp_from, int amp_to) {
-    int period = AUDIO_RATE / (hz ? hz : 440);
-    for (int i = 0; i < frames; i++) {
-        int amp = amp_from + (amp_to - amp_from) * i / (frames ? frames : 1);
-        int sq = ((i % period) < period / 2) ? amp : -amp;
-        out[i * 2 + 0] = (int16_t)sq;
-        out[i * 2 + 1] = (int16_t)sq;
+ * Soft bells, synthesised when asked for: a few notes, each a sine with two
+ * overtones, a quick rise and an exponential fall -- the higher overtones
+ * falling faster, as a struck bar's do. Integer arithmetic only: this runs
+ * wherever the sound is asked for, inside the kernel.
+ *
+ * A sound is rendered whole into fx_pcm (mono), given a place a little ahead
+ * of what the codec is playing, and mixed into the ring: at once over music
+ * already queued, by audio_write over music still to come, and by fx_fill on
+ * the tick when nothing is playing. */
+
+static const int16_t sine_tab[1024] = {
+    0, 201, 402, 603, 804, 1005, 1206, 1407, 1608, 1809, 2009, 2210, 2410, 2611, 2811, 3012,
+    3212, 3412, 3612, 3811, 4011, 4210, 4410, 4609, 4808, 5007, 5205, 5404, 5602, 5800, 5998, 6195,
+    6393, 6590, 6786, 6983, 7179, 7375, 7571, 7767, 7962, 8157, 8351, 8545, 8739, 8933, 9126, 9319,
+    9512, 9704, 9896, 10087, 10278, 10469, 10659, 10849, 11039, 11228, 11417, 11605, 11793, 11980, 12167, 12353,
+    12539, 12725, 12910, 13094, 13279, 13462, 13645, 13828, 14010, 14191, 14372, 14553, 14732, 14912, 15090, 15269,
+    15446, 15623, 15800, 15976, 16151, 16325, 16499, 16673, 16846, 17018, 17189, 17360, 17530, 17700, 17869, 18037,
+    18204, 18371, 18537, 18703, 18868, 19032, 19195, 19357, 19519, 19680, 19841, 20000, 20159, 20317, 20475, 20631,
+    20787, 20942, 21096, 21250, 21403, 21554, 21705, 21856, 22005, 22154, 22301, 22448, 22594, 22739, 22884, 23027,
+    23170, 23311, 23452, 23592, 23731, 23870, 24007, 24143, 24279, 24413, 24547, 24680, 24811, 24942, 25072, 25201,
+    25329, 25456, 25582, 25708, 25832, 25955, 26077, 26198, 26319, 26438, 26556, 26674, 26790, 26905, 27019, 27133,
+    27245, 27356, 27466, 27575, 27683, 27790, 27896, 28001, 28105, 28208, 28310, 28411, 28510, 28609, 28706, 28803,
+    28898, 28992, 29085, 29177, 29268, 29358, 29447, 29534, 29621, 29706, 29791, 29874, 29956, 30037, 30117, 30195,
+    30273, 30349, 30424, 30498, 30571, 30643, 30714, 30783, 30852, 30919, 30985, 31050, 31113, 31176, 31237, 31297,
+    31356, 31414, 31470, 31526, 31580, 31633, 31685, 31736, 31785, 31833, 31880, 31926, 31971, 32014, 32057, 32098,
+    32137, 32176, 32213, 32250, 32285, 32318, 32351, 32382, 32412, 32441, 32469, 32495, 32521, 32545, 32567, 32589,
+    32609, 32628, 32646, 32663, 32678, 32692, 32705, 32717, 32728, 32737, 32745, 32752, 32757, 32761, 32765, 32766,
+    32767, 32766, 32765, 32761, 32757, 32752, 32745, 32737, 32728, 32717, 32705, 32692, 32678, 32663, 32646, 32628,
+    32609, 32589, 32567, 32545, 32521, 32495, 32469, 32441, 32412, 32382, 32351, 32318, 32285, 32250, 32213, 32176,
+    32137, 32098, 32057, 32014, 31971, 31926, 31880, 31833, 31785, 31736, 31685, 31633, 31580, 31526, 31470, 31414,
+    31356, 31297, 31237, 31176, 31113, 31050, 30985, 30919, 30852, 30783, 30714, 30643, 30571, 30498, 30424, 30349,
+    30273, 30195, 30117, 30037, 29956, 29874, 29791, 29706, 29621, 29534, 29447, 29358, 29268, 29177, 29085, 28992,
+    28898, 28803, 28706, 28609, 28510, 28411, 28310, 28208, 28105, 28001, 27896, 27790, 27683, 27575, 27466, 27356,
+    27245, 27133, 27019, 26905, 26790, 26674, 26556, 26438, 26319, 26198, 26077, 25955, 25832, 25708, 25582, 25456,
+    25329, 25201, 25072, 24942, 24811, 24680, 24547, 24413, 24279, 24143, 24007, 23870, 23731, 23592, 23452, 23311,
+    23170, 23027, 22884, 22739, 22594, 22448, 22301, 22154, 22005, 21856, 21705, 21554, 21403, 21250, 21096, 20942,
+    20787, 20631, 20475, 20317, 20159, 20000, 19841, 19680, 19519, 19357, 19195, 19032, 18868, 18703, 18537, 18371,
+    18204, 18037, 17869, 17700, 17530, 17360, 17189, 17018, 16846, 16673, 16499, 16325, 16151, 15976, 15800, 15623,
+    15446, 15269, 15090, 14912, 14732, 14553, 14372, 14191, 14010, 13828, 13645, 13462, 13279, 13094, 12910, 12725,
+    12539, 12353, 12167, 11980, 11793, 11605, 11417, 11228, 11039, 10849, 10659, 10469, 10278, 10087, 9896, 9704,
+    9512, 9319, 9126, 8933, 8739, 8545, 8351, 8157, 7962, 7767, 7571, 7375, 7179, 6983, 6786, 6590,
+    6393, 6195, 5998, 5800, 5602, 5404, 5205, 5007, 4808, 4609, 4410, 4210, 4011, 3811, 3612, 3412,
+    3212, 3012, 2811, 2611, 2410, 2210, 2009, 1809, 1608, 1407, 1206, 1005, 804, 603, 402, 201,
+    0, -201, -402, -603, -804, -1005, -1206, -1407, -1608, -1809, -2009, -2210, -2410, -2611, -2811, -3012,
+    -3212, -3412, -3612, -3811, -4011, -4210, -4410, -4609, -4808, -5007, -5205, -5404, -5602, -5800, -5998, -6195,
+    -6393, -6590, -6786, -6983, -7179, -7375, -7571, -7767, -7962, -8157, -8351, -8545, -8739, -8933, -9126, -9319,
+    -9512, -9704, -9896, -10087, -10278, -10469, -10659, -10849, -11039, -11228, -11417, -11605, -11793, -11980, -12167, -12353,
+    -12539, -12725, -12910, -13094, -13279, -13462, -13645, -13828, -14010, -14191, -14372, -14553, -14732, -14912, -15090, -15269,
+    -15446, -15623, -15800, -15976, -16151, -16325, -16499, -16673, -16846, -17018, -17189, -17360, -17530, -17700, -17869, -18037,
+    -18204, -18371, -18537, -18703, -18868, -19032, -19195, -19357, -19519, -19680, -19841, -20000, -20159, -20317, -20475, -20631,
+    -20787, -20942, -21096, -21250, -21403, -21554, -21705, -21856, -22005, -22154, -22301, -22448, -22594, -22739, -22884, -23027,
+    -23170, -23311, -23452, -23592, -23731, -23870, -24007, -24143, -24279, -24413, -24547, -24680, -24811, -24942, -25072, -25201,
+    -25329, -25456, -25582, -25708, -25832, -25955, -26077, -26198, -26319, -26438, -26556, -26674, -26790, -26905, -27019, -27133,
+    -27245, -27356, -27466, -27575, -27683, -27790, -27896, -28001, -28105, -28208, -28310, -28411, -28510, -28609, -28706, -28803,
+    -28898, -28992, -29085, -29177, -29268, -29358, -29447, -29534, -29621, -29706, -29791, -29874, -29956, -30037, -30117, -30195,
+    -30273, -30349, -30424, -30498, -30571, -30643, -30714, -30783, -30852, -30919, -30985, -31050, -31113, -31176, -31237, -31297,
+    -31356, -31414, -31470, -31526, -31580, -31633, -31685, -31736, -31785, -31833, -31880, -31926, -31971, -32014, -32057, -32098,
+    -32137, -32176, -32213, -32250, -32285, -32318, -32351, -32382, -32412, -32441, -32469, -32495, -32521, -32545, -32567, -32589,
+    -32609, -32628, -32646, -32663, -32678, -32692, -32705, -32717, -32728, -32737, -32745, -32752, -32757, -32761, -32765, -32766,
+    -32767, -32766, -32765, -32761, -32757, -32752, -32745, -32737, -32728, -32717, -32705, -32692, -32678, -32663, -32646, -32628,
+    -32609, -32589, -32567, -32545, -32521, -32495, -32469, -32441, -32412, -32382, -32351, -32318, -32285, -32250, -32213, -32176,
+    -32137, -32098, -32057, -32014, -31971, -31926, -31880, -31833, -31785, -31736, -31685, -31633, -31580, -31526, -31470, -31414,
+    -31356, -31297, -31237, -31176, -31113, -31050, -30985, -30919, -30852, -30783, -30714, -30643, -30571, -30498, -30424, -30349,
+    -30273, -30195, -30117, -30037, -29956, -29874, -29791, -29706, -29621, -29534, -29447, -29358, -29268, -29177, -29085, -28992,
+    -28898, -28803, -28706, -28609, -28510, -28411, -28310, -28208, -28105, -28001, -27896, -27790, -27683, -27575, -27466, -27356,
+    -27245, -27133, -27019, -26905, -26790, -26674, -26556, -26438, -26319, -26198, -26077, -25955, -25832, -25708, -25582, -25456,
+    -25329, -25201, -25072, -24942, -24811, -24680, -24547, -24413, -24279, -24143, -24007, -23870, -23731, -23592, -23452, -23311,
+    -23170, -23027, -22884, -22739, -22594, -22448, -22301, -22154, -22005, -21856, -21705, -21554, -21403, -21250, -21096, -20942,
+    -20787, -20631, -20475, -20317, -20159, -20000, -19841, -19680, -19519, -19357, -19195, -19032, -18868, -18703, -18537, -18371,
+    -18204, -18037, -17869, -17700, -17530, -17360, -17189, -17018, -16846, -16673, -16499, -16325, -16151, -15976, -15800, -15623,
+    -15446, -15269, -15090, -14912, -14732, -14553, -14372, -14191, -14010, -13828, -13645, -13462, -13279, -13094, -12910, -12725,
+    -12539, -12353, -12167, -11980, -11793, -11605, -11417, -11228, -11039, -10849, -10659, -10469, -10278, -10087, -9896, -9704,
+    -9512, -9319, -9126, -8933, -8739, -8545, -8351, -8157, -7962, -7767, -7571, -7375, -7179, -6983, -6786, -6590,
+    -6393, -6195, -5998, -5800, -5602, -5404, -5205, -5007, -4808, -4609, -4410, -4210, -4011, -3811, -3612, -3412,
+    -3212, -3012, -2811, -2611, -2410, -2210, -2009, -1809, -1608, -1407, -1206, -1005, -804, -603, -402, -201,
+};
+
+#define FX_MAX     (AUDIO_RATE * 2)       /* two seconds */
+#define FX_LEAD    (AUDIO_RATE / 100 * 4) /* starts 10 ms ahead of the codec */
+#define FX_AHEAD   (AUDIO_RATE / 8 * 4)   /* written 125 ms ahead when alone */
+static int16_t fx_pcm[FX_MAX];
+static int32_t fx_acc[FX_MAX];
+static int fx_len;                        /* frames left to place, 0 = none */
+static uint64_t fx_abs0, fx_done;         /* where it starts; mixed up to */
+
+typedef struct { uint16_t at_ms, hz, tau_ms, amp; } note_t;
+
+/* One note, added into fx_acc. */
+static void bell(const note_t *n) {
+    int start = n->at_ms * (AUDIO_RATE / 1000);
+    int tau = n->tau_ms * (AUDIO_RATE / 1000);
+    if (tau < 64) tau = 64;
+    int len = tau * 6;                    /* by six time constants it is gone */
+    if (start + len > FX_MAX) len = FX_MAX - start;
+    if (len <= 0) return;
+    /* Three partials: the note, its octave, its twelfth, quieter and shorter. */
+    static const int rel[3] = { 1, 2, 3 }, gain[3] = { 1000, 280, 90 };
+    for (int k = 0; k < 3; k++) {
+        uint32_t step = (uint32_t)(((uint64_t)n->hz * rel[k] << 32) / AUDIO_RATE);
+        if (n->hz * rel[k] >= AUDIO_RATE / 2) continue;
+        int t = tau / rel[k];
+        if (t < 32) t = 32;
+        uint32_t keep = (1u << 24) - (1u << 24) / (uint32_t)t;   /* per frame */
+        uint32_t env = 1u << 24;
+        int attack = AUDIO_RATE / 250;    /* 4 ms */
+        uint32_t ph = 0;
+        int64_t amp = (int64_t)n->amp * gain[k] / 1000;
+        for (int i = 0; i < len; i++) {
+            int32_t sv = sine_tab[ph >> 22];
+            int64_t e = env;
+            if (i < attack) e = e * i / attack;
+            fx_acc[start + i] += (int32_t)((sv * amp >> 15) * e >> 24);
+            ph += step;
+            env = (uint32_t)(((uint64_t)env * keep) >> 24);
+        }
     }
 }
 
-#define ALERT_FRAMES (AUDIO_RATE / 8)          /* 125 ms per note */
-static int16_t alert_buf[ALERT_FRAMES * 2];
-
-void sound_alert(int kind) {
-    /* Falling pair for an error, rising for a warning, one soft note for
-     * information -- the shape carries the meaning even at low volume. */
-    static const struct { int a, b; } notes[3] = {
-        { 660, 440 },      /* error   */
-        { 520, 700 },      /* warning */
-        { 880, 880 },      /* info    */
-    };
-    if (kind < 0 || kind > 2) kind = 0;
-
-    if (have_hda) {
-        tone_into(alert_buf, ALERT_FRAMES, notes[kind].a, 7000, 5000);
-        audio_write(alert_buf, ALERT_FRAMES);
-        tone_into(alert_buf, ALERT_FRAMES, notes[kind].b, 6000, 0);
-        audio_write(alert_buf, ALERT_FRAMES);
-        return;
+static void render(const note_t *notes, int n) {
+    int end = 0;
+    for (int i = 0; i < FX_MAX; i++) fx_acc[i] = 0;
+    for (int i = 0; i < n; i++) {
+        bell(&notes[i]);
+        int e = (notes[i].at_ms + notes[i].tau_ms * 6) * (AUDIO_RATE / 1000);
+        if (e > end) end = e;
     }
+    if (end > FX_MAX) end = FX_MAX;
+    for (int i = 0; i < end; i++) {
+        int32_t v = fx_acc[i];
+        fx_pcm[i] = (int16_t)(v > 32767 ? 32767 : v < -32768 ? -32768 : v);
+    }
+    fx_len = end;
+}
 
+/* Add the sound into the ring over the stretch [a, b) of the stream. */
+static void fx_mix(uint64_t a, uint64_t b) {
+    if (!fx_len) return;
+    uint64_t end = fx_abs0 + (uint64_t)fx_len * 4;
+    if (a < fx_done) a = fx_done;
+    if (b > end) b = end;
+    if (b <= a) return;
+    int vol = volume;
+    for (uint64_t pos = a; pos < b; pos += 4) {
+        int k = (int)((pos - fx_abs0) / 4);
+        int add = fx_pcm[k] * vol / 100;
+        int o = (int)(pos % BUF_BYTES);
+        for (int c = 0; c < 2; c++) {
+            int16_t *sp = (int16_t *)(buf + o + c * 2);
+            int v = *sp + add;
+            *sp = (int16_t)(v > 32767 ? 32767 : v < -32768 ? -32768 : v);
+        }
+    }
+    fx_done = b;
+    if (fx_done >= end) fx_len = 0;
+    __asm__ volatile ("sfence" ::: "memory");
+}
+
+/* Nothing is writing far enough ahead -- no music, or not enough of it: the
+ * sound goes in on its own, a little ahead of the codec, onto silence. */
+static void fx_fill(void) {
+    if (!fx_len) return;
+    play_update();
+    if (w_abs < p_abs) w_abs = p_abs;
+    uint64_t want = p_abs + FX_AHEAD;
+    if (w_abs >= want) return;
+    for (uint64_t pos = w_abs; pos < want; pos++) buf[pos % BUF_BYTES] = 0;
+    uint64_t from = w_abs;
+    w_abs = want;
+    wpos = (int)(w_abs % BUF_BYTES);
+    fx_mix(from, w_abs);
+}
+
+/* The PC speaker plays one note at a time: the tune of each sound. */
+static void speaker_tune(const note_t *notes, int n) {
     melody_len = 0;
-    melody[melody_len].hz = (uint16_t)notes[kind].a; melody[melody_len].ms = 110; melody_len++;
-    melody[melody_len].hz = (uint16_t)notes[kind].b; melody[melody_len].ms = 140; melody_len++;
+    for (int i = 0; i < n && melody_len < 8; i++) {
+        int until = i + 1 < n ? notes[i + 1].at_ms - notes[i].at_ms : notes[i].tau_ms;
+        if (until < 40) until = 40;
+        melody[melody_len].hz = notes[i].hz;
+        melody[melody_len].ms = (uint16_t)until;
+        melody_len++;
+    }
     melody_at = 0;
     melody_until = 0;
     audio_tick();
+}
+
+void sound_play(int id) {
+    /* The notes: when (ms), pitch (Hz), how long it rings (ms), how loud. */
+    static const note_t startup[] = {      /* "Течение": a rising Cmaj7, then the octave */
+        {   0, 262, 700, 2600 }, {   0, 523, 380, 5200 }, { 120, 659, 380, 5000 },
+        { 240, 784, 400, 4800 }, { 360, 988, 420, 4200 }, { 520, 1047, 650, 4600 },
+    };
+    static const note_t error[]   = { { 0, 440, 160, 7000 }, { 130, 349, 220, 7000 } };
+    static const note_t warn[]    = { { 0, 659, 170, 6200 }, { 150, 659, 200, 5600 } };
+    static const note_t info[]    = { { 0, 1047, 240, 5600 } };
+    static const note_t notify[]  = { { 0, 784, 190, 5600 }, { 95, 1047, 280, 5600 } };
+    static const note_t usb_in[]  = { { 0, 523, 140, 6000 }, { 75, 784, 200, 6000 } };
+    static const note_t usb_out[] = { { 0, 784, 140, 6000 }, { 75, 523, 200, 6000 } };
+    static const struct { const note_t *n; int c; } all[] = {
+        { startup, 6 }, { error, 2 }, { warn, 2 }, { info, 1 },
+        { notify, 2 }, { usb_in, 2 }, { usb_out, 2 },
+    };
+    if (id < 0 || id > SND_USB_OUT) return;
+    if (!have_hda) { speaker_tune(all[id].n, all[id].c); return; }
+    if (!volume) return;
+
+    render(all[id].n, all[id].c);
+    play_update();
+    fx_abs0 = (p_abs + FX_LEAD) & ~3ULL;
+    fx_done = fx_abs0;
+    if (w_abs > fx_abs0) fx_mix(fx_abs0, w_abs);   /* over what is queued */
+    fx_fill();                                     /* and on from there */
+}
+
+void sound_alert(int kind) {
+    sound_play(kind == 1 ? SND_WARN : kind == 2 ? SND_INFO : SND_ERROR);
 }

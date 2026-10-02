@@ -44,9 +44,19 @@ void audio_set_title(const char *t);
 const char *audio_title(void);
 
 // --- system sounds ---------------------------------------------------------
-// Played for the message-box kinds in wm.h (MB_ERROR / MB_WARN / MB_INFO).
 // Synthesised, not loaded from disk: a sound the system needs in order to
-// report a failure must not itself depend on the filesystem.
+// report a failure must not itself depend on the filesystem. Soft bells,
+// mixed over whatever is playing -- music goes on under them.
+#define SND_STARTUP 0     // the desktop is up
+#define SND_ERROR   1
+#define SND_WARN    2
+#define SND_INFO    3
+#define SND_NOTIFY  4     // a notice in the corner
+#define SND_USB_IN  5     // a device plugged in
+#define SND_USB_OUT 6     // ... and pulled out
+void sound_play(int id);
+
+// The message-box kinds in wm.h (MB_ERROR / MB_WARN / MB_INFO).
 void sound_alert(int kind);
 
 // Called from the timer tick to advance the PC-speaker melody, if one is

@@ -20,6 +20,11 @@ int xhci_init(void);
 // presses into the keyboard event queue. Called from the timer tick.
 void xhci_poll(void);
 
+// Something was plugged into a root port (+1) or pulled out (-1) since the
+// last call; 0 if nothing. Devices are still only set up at boot -- this is
+// for the desktop to say so, and to make the sound.
+int xhci_port_news(void);
+
 // What the controller found, for the device list. xhci_present() is 1 once a
 // controller is up; the other two count the HID devices bound to it.
 int xhci_present(void);

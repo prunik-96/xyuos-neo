@@ -367,6 +367,25 @@ static int hid_event(uint32_t slot, uint32_t epid, uint32_t status);
 // again (hid_event). A disk transfer can take long enough for a key to be
 // pressed in the middle of it, and a report thrown away here used to leave
 // that keyboard with nothing armed -- silent for good.
+// A device came or went on a root port. Nothing is set up for it here, but
+// the change is acknowledged -- a port reports no further change until it is
+// -- and noted for the desktop.
+static volatile int port_news;
+
+static void port_event(uint32_t param_lo) {
+    int port = (int)((param_lo >> 24) & 0xFF);
+    if (port < 1 || !op) return;
+    uint32_t v = r32(op, OP_PORTSC(port - 1));
+    w32(op, OP_PORTSC(port - 1), (v & ~PORTSC_RW1C) | PORTSC_CSC);
+    if (v & PORTSC_CSC) port_news = (v & PORTSC_CCS) ? 1 : -1;
+}
+
+int xhci_port_news(void) {
+    int n = port_news;
+    port_news = 0;
+    return n;
+}
+
 static int wait_completion(uint64_t expect_trb, int ep_slot, int ep_dci,
                            uint32_t *out_slot) {
     for (uint32_t spin = 0; spin < 3000000; spin++) {
@@ -399,7 +418,7 @@ static int wait_completion(uint64_t expect_trb, int ep_slot, int ep_dci,
             // a completion for something else: a HID report is handled
             if (type == TRB_TRANSFER_EVENT) hid_event(slot, epid, status);
         }
-        // port status change etc. -> ignore, keep draining
+        if (type == TRB_PORT_STATUS_CHANGE) port_event(e[0]);
     }
     return -1;
 }
@@ -1450,6 +1469,7 @@ void xhci_poll(void) {
         if (evt_deq == RING_SIZE) { evt_deq = 0; evt_cycle ^= 1; }
         w64(rt, RT_ERDP, ((uint64_t)(uintptr_t)&evt_ring[evt_deq * 4]) | (1u << 3));
 
+        if (type == TRB_PORT_STATUS_CHANGE) { port_event(e[0]); continue; }
         if (type != TRB_TRANSFER_EVENT) continue;
         rndis_note_event(ctrl, status);   // don't drop a RNDIS RX completion
         hid_event(slot, (ctrl >> 16) & 0x1F, status);
@@ -1658,9 +1678,11 @@ int rndis_recv(void *buf, int max) {
         if ((ctrl & TRB_CYCLE ? 1 : 0) != evt_cycle) break;
         __asm__ volatile ("" ::: "memory");
         uint32_t status = e[2];
+        uint32_t param = e[0];
         evt_deq++;
         if (evt_deq == RING_SIZE) { evt_deq = 0; evt_cycle ^= 1; }
         w64(rt, RT_ERDP, ((uint64_t)(uintptr_t)&evt_ring[evt_deq * 4]) | (1u << 3));
+        if (TRB_TYPE_OF(ctrl) == TRB_PORT_STATUS_CHANGE) { port_event(param); continue; }
         if (!rndis_note_event(ctrl, status) && TRB_TYPE_OF(ctrl) == TRB_TRANSFER_EVENT)
             hid_event((ctrl >> 24) & 0xFF, (ctrl >> 16) & 0x1F, status);
     }
